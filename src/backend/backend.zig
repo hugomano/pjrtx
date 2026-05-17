@@ -39,6 +39,10 @@ pub const Backend = struct {
         broadcastInDim: *const fn (backend: Backend, src: BufferHandle, broadcast_dimensions: []const i64, output_dims: []const i64) Error!?BufferHandle,
         slice: *const fn (backend: Backend, src: BufferHandle, start_indices: []const i64, limit_indices: []const i64, strides: []const i64, output_dims: []const i64) Error!?BufferHandle,
         concatenate: *const fn (backend: Backend, lhs: BufferHandle, rhs: BufferHandle, dimension: i64, output_dims: []const i64) Error!?BufferHandle,
+        dotGeneral: *const fn (backend: Backend, lhs: BufferHandle, rhs: BufferHandle, lhs_batch_dimensions: []const i64, rhs_batch_dimensions: []const i64, lhs_contracting_dimensions: []const i64, rhs_contracting_dimensions: []const i64, output_dims: []const i64) Error!?BufferHandle,
+        reduce: *const fn (backend: Backend, src: BufferHandle, op: core.PlanInstructionKind, dimensions: []const i64, output_dims: []const i64) Error!?BufferHandle,
+        compare: *const fn (backend: Backend, lhs: BufferHandle, rhs: BufferHandle, direction: core.CompareOp, output_dims: []const i64) Error!?BufferHandle,
+        select: *const fn (backend: Backend, pred: BufferHandle, on_true: BufferHandle, on_false: BufferHandle, output_dims: []const i64) Error!?BufferHandle,
         copyToHost: *const fn (backend: Backend, src: BufferHandle, dst: []u8) Error!void,
         destroyBuffer: *const fn (backend: Backend, buffer: BufferHandle) void,
     };
@@ -93,6 +97,22 @@ pub const Backend = struct {
 
     pub fn concatenate(self: Backend, lhs: BufferHandle, rhs: BufferHandle, dimension: i64, output_dims: []const i64) Error!?BufferHandle {
         return self.vtable.concatenate(self, lhs, rhs, dimension, output_dims);
+    }
+
+    pub fn dotGeneral(self: Backend, lhs: BufferHandle, rhs: BufferHandle, lhs_batch_dimensions: []const i64, rhs_batch_dimensions: []const i64, lhs_contracting_dimensions: []const i64, rhs_contracting_dimensions: []const i64, output_dims: []const i64) Error!?BufferHandle {
+        return self.vtable.dotGeneral(self, lhs, rhs, lhs_batch_dimensions, rhs_batch_dimensions, lhs_contracting_dimensions, rhs_contracting_dimensions, output_dims);
+    }
+
+    pub fn reduce(self: Backend, src: BufferHandle, op: core.PlanInstructionKind, dimensions: []const i64, output_dims: []const i64) Error!?BufferHandle {
+        return self.vtable.reduce(self, src, op, dimensions, output_dims);
+    }
+
+    pub fn compare(self: Backend, lhs: BufferHandle, rhs: BufferHandle, direction: core.CompareOp, output_dims: []const i64) Error!?BufferHandle {
+        return self.vtable.compare(self, lhs, rhs, direction, output_dims);
+    }
+
+    pub fn select(self: Backend, pred: BufferHandle, on_true: BufferHandle, on_false: BufferHandle, output_dims: []const i64) Error!?BufferHandle {
+        return self.vtable.select(self, pred, on_true, on_false, output_dims);
     }
 
     pub fn copyToHost(self: Backend, src: BufferHandle, dst: []u8) Error!void {

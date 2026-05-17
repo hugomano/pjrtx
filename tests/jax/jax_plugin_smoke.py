@@ -8,6 +8,7 @@ import pathlib
 import sys
 from typing import Any
 
+import numpy as np
 
 PLUGIN_RUNFILE = "src/plugin/libpjrtx_metal_plugin.dylib"
 PLUGIN_NAME = "pjrtx"
@@ -99,8 +100,8 @@ def main() -> int:
     def add(x, y):
         return x + y
 
-    lhs = jnp.array([1.0, 2.0, 3.0, 4.0], dtype=jnp.float32)
-    rhs = jnp.array([10.0, 20.0, 30.0, 40.0], dtype=jnp.float32)
+    lhs = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    rhs = np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32)
     got = [float(v) for v in jax.device_get(add(lhs, rhs))]
     want = [11.0, 22.0, 33.0, 44.0]
     if got != want:

@@ -68,6 +68,8 @@ bool is_valid_unary_op(int op) {
 
 size_t dtype_size(int dtype) {
   switch (dtype) {
+    case PJRTX_MLX_METAL_DTYPE_PRED:
+      return sizeof(uint8_t);
     case PJRTX_MLX_METAL_DTYPE_U8:
       return sizeof(uint8_t);
     case PJRTX_MLX_METAL_DTYPE_F32:
@@ -237,6 +239,9 @@ std::unique_ptr<mlx::core::array> make_mlx_array(const std::vector<uint8_t>& hos
                                                  const std::vector<int64_t>& dims) {
   const auto shape = mlx_shape(dims);
   switch (dtype) {
+    case PJRTX_MLX_METAL_DTYPE_PRED:
+      return std::make_unique<mlx::core::array>(
+          host.begin(), shape, mlx::core::bool_);
     case PJRTX_MLX_METAL_DTYPE_U8:
       return std::make_unique<mlx::core::array>(
           host.begin(), shape, mlx::core::uint8);
@@ -337,6 +342,70 @@ void eval_on_device(mlx::core::array& array, const mlx::core::Device& device) {
   mlx::core::eval(array);
   mlx::core::synchronize(mlx::core::default_stream(device));
   array.wait();
+}
+
+std::vector<uint8_t> copy_array_bytes(mlx::core::array& array,
+                                      uint64_t byte_size,
+                                      const mlx::core::Device& device) {
+  eval_on_device(array, device);
+  std::vector<uint8_t> host(byte_size);
+  std::memcpy(host.data(), array.data<uint8_t>(), host.size());
+  return host;
+}
+
+bool dot_general_is_matmul_like(const std::vector<int64_t>& lhs_dims,
+                                const std::vector<int64_t>& rhs_dims,
+                                const std::vector<int64_t>& lhs_batch,
+                                const std::vector<int64_t>& rhs_batch,
+                                const std::vector<int64_t>& lhs_contract,
+                                const std::vector<int64_t>& rhs_contract,
+                                const std::vector<int64_t>& output_dims) {
+  if (lhs_contract.size() != 1 || rhs_contract.size() != 1 ||
+      lhs_batch.size() != rhs_batch.size() || lhs_dims.empty() ||
+      rhs_dims.size() < 2 || output_dims.empty()) {
+    return false;
+  }
+  const int64_t lhs_k = lhs_contract[0];
+  const int64_t rhs_k = rhs_contract[0];
+  if (lhs_k != static_cast<int64_t>(lhs_dims.size() - 1) ||
+      rhs_k != static_cast<int64_t>(rhs_dims.size() - 2)) {
+    return false;
+  }
+  if (lhs_dims[static_cast<size_t>(lhs_k)] !=
+      rhs_dims[static_cast<size_t>(rhs_k)]) {
+    return false;
+  }
+  for (size_t i = 0; i < lhs_batch.size(); ++i) {
+    if (lhs_batch[i] < 0 || rhs_batch[i] < 0 ||
+        static_cast<size_t>(lhs_batch[i]) >= lhs_dims.size() ||
+        static_cast<size_t>(rhs_batch[i]) >= rhs_dims.size() ||
+        lhs_dims[static_cast<size_t>(lhs_batch[i])] !=
+            rhs_dims[static_cast<size_t>(rhs_batch[i])]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+mlx::core::array mlx_compare_array(const mlx::core::array& lhs,
+                                   const mlx::core::array& rhs, int direction,
+                                   const mlx::core::Device& device) {
+  switch (direction) {
+    case PJRTX_MLX_METAL_COMPARE_EQ:
+      return mlx::core::equal(lhs, rhs, device);
+    case PJRTX_MLX_METAL_COMPARE_NE:
+      return mlx::core::not_equal(lhs, rhs, device);
+    case PJRTX_MLX_METAL_COMPARE_GE:
+      return mlx::core::greater_equal(lhs, rhs, device);
+    case PJRTX_MLX_METAL_COMPARE_GT:
+      return mlx::core::greater(lhs, rhs, device);
+    case PJRTX_MLX_METAL_COMPARE_LE:
+      return mlx::core::less_equal(lhs, rhs, device);
+    case PJRTX_MLX_METAL_COMPARE_LT:
+      return mlx::core::less(lhs, rhs, device);
+    default:
+      throw std::invalid_argument("unknown PjRTx MLX compare op");
+  }
 }
 
 }  // namespace
@@ -679,6 +748,172 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_concatenate(
     return new PjrtxMlxMetalBuffer(std::move(host), std::move(array), byte_size,
                                    lhs->dtype, std::move(out_dims),
                                    lhs->device_ordinal);
+  } catch (const std::exception&) {
+    return nullptr;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_dot_general(
+    PjrtxMlxMetalBuffer* lhs, PjrtxMlxMetalBuffer* rhs,
+    const int64_t* lhs_batch_dimensions, uint64_t lhs_batch_rank,
+    const int64_t* rhs_batch_dimensions, uint64_t rhs_batch_rank,
+    const int64_t* lhs_contracting_dimensions, uint64_t lhs_contracting_rank,
+    const int64_t* rhs_contracting_dimensions, uint64_t rhs_contracting_rank,
+    const int64_t* output_dims, uint64_t output_rank) {
+  if (lhs == nullptr || rhs == nullptr || output_dims == nullptr ||
+      lhs->dtype != PJRTX_MLX_METAL_DTYPE_F32 ||
+      rhs->dtype != PJRTX_MLX_METAL_DTYPE_F32 ||
+      lhs->device_ordinal != rhs->device_ordinal ||
+      lhs_batch_rank != rhs_batch_rank ||
+      (lhs_batch_rank > 0 && lhs_batch_dimensions == nullptr) ||
+      (rhs_batch_rank > 0 && rhs_batch_dimensions == nullptr) ||
+      lhs_contracting_dimensions == nullptr ||
+      rhs_contracting_dimensions == nullptr) {
+    return nullptr;
+  }
+  std::vector<int64_t> lhs_batch(lhs_batch_dimensions,
+                                 lhs_batch_dimensions + lhs_batch_rank);
+  std::vector<int64_t> rhs_batch(rhs_batch_dimensions,
+                                 rhs_batch_dimensions + rhs_batch_rank);
+  std::vector<int64_t> lhs_contract(lhs_contracting_dimensions,
+                                    lhs_contracting_dimensions +
+                                        lhs_contracting_rank);
+  std::vector<int64_t> rhs_contract(rhs_contracting_dimensions,
+                                    rhs_contracting_dimensions +
+                                        rhs_contracting_rank);
+  std::vector<int64_t> out_dims(output_dims, output_dims + output_rank);
+  const uint64_t byte_size = byte_size_for_shape(PJRTX_MLX_METAL_DTYPE_F32,
+                                                 out_dims);
+  if (byte_size == 0 ||
+      !dot_general_is_matmul_like(lhs->dims, rhs->dims, lhs_batch, rhs_batch,
+                                  lhs_contract, rhs_contract, out_dims)) {
+    return nullptr;
+  }
+  const mlx::core::Device device(mlx::core::Device::gpu, lhs->device_ordinal);
+  if (!mlx::core::is_available(device) || lhs->array == nullptr ||
+      rhs->array == nullptr) {
+    return nullptr;
+  }
+  try {
+    auto out = mlx::core::matmul(*lhs->array, *rhs->array, device);
+    auto host = copy_array_bytes(out, byte_size, device);
+    auto array = std::make_unique<mlx::core::array>(std::move(out));
+    return new PjrtxMlxMetalBuffer(std::move(host), std::move(array),
+                                   byte_size, PJRTX_MLX_METAL_DTYPE_F32,
+                                   std::move(out_dims), lhs->device_ordinal);
+  } catch (const std::exception&) {
+    return nullptr;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_reduce(
+    PjrtxMlxMetalBuffer* src, int op, const int64_t* dimensions,
+    uint64_t num_dimensions, const int64_t* output_dims, uint64_t output_rank) {
+  if (src == nullptr || output_dims == nullptr ||
+      (num_dimensions > 0 && dimensions == nullptr) ||
+      src->dtype != PJRTX_MLX_METAL_DTYPE_F32) {
+    return nullptr;
+  }
+  std::vector<int64_t> out_dims(output_dims, output_dims + output_rank);
+  const uint64_t byte_size = byte_size_for_shape(src->dtype, out_dims);
+  if (byte_size == 0) {
+    return nullptr;
+  }
+  std::vector<int> axes;
+  axes.reserve(num_dimensions);
+  for (uint64_t i = 0; i < num_dimensions; ++i) {
+    axes.push_back(static_cast<int>(dimensions[i]));
+  }
+  const mlx::core::Device device(mlx::core::Device::gpu, src->device_ordinal);
+  if (!mlx::core::is_available(device) || src->array == nullptr) {
+    return nullptr;
+  }
+  try {
+    mlx::core::array out =
+        op == PJRTX_MLX_METAL_REDUCE_SUM
+            ? mlx::core::sum(*src->array, axes, false, device)
+            : mlx::core::max(*src->array, axes, false, device);
+    auto host = copy_array_bytes(out, byte_size, device);
+    auto array = std::make_unique<mlx::core::array>(std::move(out));
+    return new PjrtxMlxMetalBuffer(std::move(host), std::move(array),
+                                   byte_size, src->dtype, std::move(out_dims),
+                                   src->device_ordinal);
+  } catch (const std::exception&) {
+    return nullptr;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_compare(
+    PjrtxMlxMetalBuffer* lhs, PjrtxMlxMetalBuffer* rhs, int direction,
+    const int64_t* output_dims, uint64_t output_rank) {
+  if (lhs == nullptr || rhs == nullptr || output_dims == nullptr ||
+      lhs->byte_size != rhs->byte_size || lhs->dtype != rhs->dtype ||
+      lhs->dims != rhs->dims || lhs->device_ordinal != rhs->device_ordinal ||
+      lhs->dtype != PJRTX_MLX_METAL_DTYPE_F32) {
+    return nullptr;
+  }
+  std::vector<int64_t> out_dims(output_dims, output_dims + output_rank);
+  const uint64_t byte_size = byte_size_for_shape(PJRTX_MLX_METAL_DTYPE_PRED,
+                                                 out_dims);
+  if (byte_size == 0 || out_dims != lhs->dims) {
+    return nullptr;
+  }
+  const mlx::core::Device device(mlx::core::Device::gpu, lhs->device_ordinal);
+  if (!mlx::core::is_available(device) || lhs->array == nullptr ||
+      rhs->array == nullptr) {
+    return nullptr;
+  }
+  try {
+    auto out = mlx_compare_array(*lhs->array, *rhs->array, direction, device);
+    auto host = copy_array_bytes(out, byte_size, device);
+    auto array = std::make_unique<mlx::core::array>(std::move(out));
+    return new PjrtxMlxMetalBuffer(std::move(host), std::move(array),
+                                   byte_size, PJRTX_MLX_METAL_DTYPE_PRED,
+                                   std::move(out_dims), lhs->device_ordinal);
+  } catch (const std::exception&) {
+    return nullptr;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_select(
+    PjrtxMlxMetalBuffer* pred, PjrtxMlxMetalBuffer* on_true,
+    PjrtxMlxMetalBuffer* on_false, const int64_t* output_dims,
+    uint64_t output_rank) {
+  if (pred == nullptr || on_true == nullptr || on_false == nullptr ||
+      output_dims == nullptr || pred->dtype != PJRTX_MLX_METAL_DTYPE_PRED ||
+      on_true->dtype != on_false->dtype || on_true->dims != on_false->dims ||
+      pred->dims != on_true->dims ||
+      pred->device_ordinal != on_true->device_ordinal ||
+      on_true->device_ordinal != on_false->device_ordinal) {
+    return nullptr;
+  }
+  std::vector<int64_t> out_dims(output_dims, output_dims + output_rank);
+  const uint64_t byte_size = byte_size_for_shape(on_true->dtype, out_dims);
+  if (byte_size == 0 || out_dims != on_true->dims) {
+    return nullptr;
+  }
+  const mlx::core::Device device(mlx::core::Device::gpu, on_true->device_ordinal);
+  if (!mlx::core::is_available(device) || pred->array == nullptr ||
+      on_true->array == nullptr || on_false->array == nullptr) {
+    return nullptr;
+  }
+  try {
+    auto out = mlx::core::where(*pred->array, *on_true->array, *on_false->array,
+                                device);
+    auto host = copy_array_bytes(out, byte_size, device);
+    auto array = std::make_unique<mlx::core::array>(std::move(out));
+    return new PjrtxMlxMetalBuffer(std::move(host), std::move(array),
+                                   byte_size, on_true->dtype,
+                                   std::move(out_dims),
+                                   on_true->device_ordinal);
   } catch (const std::exception&) {
     return nullptr;
   } catch (...) {

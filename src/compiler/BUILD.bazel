@@ -23,6 +23,7 @@ cc_library(
         "@llvm-project//mlir:ShapeDialect",
         "@shardy//shardy/integrations/c:sdy_capi",
         "@stablehlo//:chlo_capi",
+        "@stablehlo//:stablehlo_capi",
         "@stablehlo//:stablehlo_dialect_capi",
     ],
 )

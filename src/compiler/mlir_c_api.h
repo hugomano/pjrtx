@@ -15,6 +15,7 @@
 #include "stablehlo/integrations/c/ChloDialect.h"
 #include "stablehlo/integrations/c/StablehloDialect.h"
 #include "stablehlo/integrations/c/StablehloDialectApi.h"
+#include "stablehlo/integrations/c/StablehloAttributes.h"
 
 #ifdef __cplusplus
 extern "C" void mlirRegisterFuncExtensions(MlirDialectRegistry registry);

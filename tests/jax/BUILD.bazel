@@ -10,11 +10,35 @@ py_binary(
     deps = ["@jax_sandbox_deps//jax:pkg"],
 )
 
+py_binary(
+    name = "jax_llama_like_inference",
+    srcs = [
+        "jax_llama_like_inference.py",
+        "jax_plugin_smoke.py",
+    ],
+    data = ["//src/plugin:pjrtx_metal_plugin"],
+    main = "jax_llama_like_inference.py",
+    deps = ["@jax_sandbox_deps//jax:pkg"],
+)
+
 py_test(
     name = "jax_plugin_smoke_test",
     srcs = ["jax_plugin_smoke.py"],
     data = ["//src/plugin:pjrtx_metal_plugin"],
     main = "jax_plugin_smoke.py",
+    tags = ["manual"],
+    deps = ["@jax_sandbox_deps//jax:pkg"],
+)
+
+py_test(
+    name = "jax_llama_like_inference_test",
+    srcs = [
+        "jax_llama_like_inference.py",
+        "jax_plugin_smoke.py",
+    ],
+    data = ["//src/plugin:pjrtx_metal_plugin"],
+    env = {"PJRTX_BACKEND": "metal_mlx"},
+    main = "jax_llama_like_inference.py",
     tags = ["manual"],
     deps = ["@jax_sandbox_deps//jax:pkg"],
 )

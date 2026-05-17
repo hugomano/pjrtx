@@ -23,6 +23,7 @@ enum {
   PJRTX_MLX_METAL_DTYPE_INVALID = 0,
   PJRTX_MLX_METAL_DTYPE_U8 = 1,
   PJRTX_MLX_METAL_DTYPE_F32 = 2,
+  PJRTX_MLX_METAL_DTYPE_PRED = 3,
 };
 
 enum {
@@ -38,6 +39,20 @@ enum {
   PJRTX_MLX_METAL_UNARY_TANH = 2,
   PJRTX_MLX_METAL_UNARY_SQRT = 3,
   PJRTX_MLX_METAL_UNARY_RSQRT = 4,
+};
+
+enum {
+  PJRTX_MLX_METAL_REDUCE_SUM = 0,
+  PJRTX_MLX_METAL_REDUCE_MAX = 1,
+};
+
+enum {
+  PJRTX_MLX_METAL_COMPARE_EQ = 0,
+  PJRTX_MLX_METAL_COMPARE_NE = 1,
+  PJRTX_MLX_METAL_COMPARE_GE = 2,
+  PJRTX_MLX_METAL_COMPARE_GT = 3,
+  PJRTX_MLX_METAL_COMPARE_LE = 4,
+  PJRTX_MLX_METAL_COMPARE_LT = 5,
 };
 
 int pjrtx_mlx_metal_version_major(void);
@@ -76,6 +91,23 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_slice(
 PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_concatenate(
     PjrtxMlxMetalBuffer* lhs, PjrtxMlxMetalBuffer* rhs, int64_t dimension,
     const int64_t* output_dims, uint64_t output_rank);
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_dot_general(
+    PjrtxMlxMetalBuffer* lhs, PjrtxMlxMetalBuffer* rhs,
+    const int64_t* lhs_batch_dimensions, uint64_t lhs_batch_rank,
+    const int64_t* rhs_batch_dimensions, uint64_t rhs_batch_rank,
+    const int64_t* lhs_contracting_dimensions, uint64_t lhs_contracting_rank,
+    const int64_t* rhs_contracting_dimensions, uint64_t rhs_contracting_rank,
+    const int64_t* output_dims, uint64_t output_rank);
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_reduce(
+    PjrtxMlxMetalBuffer* src, int op, const int64_t* dimensions,
+    uint64_t num_dimensions, const int64_t* output_dims, uint64_t output_rank);
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_compare(
+    PjrtxMlxMetalBuffer* lhs, PjrtxMlxMetalBuffer* rhs, int direction,
+    const int64_t* output_dims, uint64_t output_rank);
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_select(
+    PjrtxMlxMetalBuffer* pred, PjrtxMlxMetalBuffer* on_true,
+    PjrtxMlxMetalBuffer* on_false, const int64_t* output_dims,
+    uint64_t output_rank);
 uint64_t pjrtx_mlx_metal_buffer_size(PjrtxMlxMetalBuffer* buffer);
 int pjrtx_mlx_metal_buffer_copy_to_host(PjrtxMlxMetalBuffer* buffer, void* dst,
                                         uint64_t dst_size);

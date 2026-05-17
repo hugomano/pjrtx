@@ -45,6 +45,8 @@ pub const Operation = struct {
     name: []const u8,
     line: usize,
     column: usize,
+    inputs: []const core.ValueId = &.{},
+    outputs: []const core.ValueId = &.{},
     dtype: []const u8 = "unknown",
     rank: ?usize = null,
     dims: []const i64 = &.{},
@@ -54,10 +56,19 @@ pub const Operation = struct {
     limit_indices: []const i64 = &.{},
     strides: []const i64 = &.{},
     dimension: ?i64 = null,
+    reduce_dimensions: []const i64 = &.{},
+    lhs_batch_dimensions: []const i64 = &.{},
+    rhs_batch_dimensions: []const i64 = &.{},
+    lhs_contracting_dimensions: []const i64 = &.{},
+    rhs_contracting_dimensions: []const i64 = &.{},
+    compare_direction: ?core.CompareOp = null,
+    literal: []const u8 = &.{},
     sharding: []const u8 = "unspecified",
 
     fn deinit(self: Operation, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
+        allocator.free(self.inputs);
+        allocator.free(self.outputs);
         allocator.free(self.dtype);
         allocator.free(self.dims);
         allocator.free(self.permutation);
@@ -65,6 +76,12 @@ pub const Operation = struct {
         allocator.free(self.start_indices);
         allocator.free(self.limit_indices);
         allocator.free(self.strides);
+        allocator.free(self.reduce_dimensions);
+        allocator.free(self.lhs_batch_dimensions);
+        allocator.free(self.rhs_batch_dimensions);
+        allocator.free(self.lhs_contracting_dimensions);
+        allocator.free(self.rhs_contracting_dimensions);
+        allocator.free(self.literal);
         allocator.free(self.sharding);
     }
 };
@@ -77,6 +94,8 @@ pub const ModuleAnalysis = struct {
     source: []u8,
     dialects: []Dialect,
     ops: []Operation,
+    values: []core.Value,
+    output_ids: []const core.ValueId,
     parameter_descriptors: []core.BufferDescriptor,
     num_parameters: usize,
     num_outputs: usize,
@@ -87,7 +106,10 @@ pub const ModuleAnalysis = struct {
         for (self.output_shardings) |sharding| sharding.deinit(self.allocator);
         for (self.parameter_shardings) |sharding| sharding.deinit(self.allocator);
         for (self.parameter_descriptors) |descriptor| self.allocator.free(descriptor.dims);
+        for (self.values) |value| self.allocator.free(value.descriptor.dims);
         for (self.ops) |op| op.deinit(self.allocator);
+        self.allocator.free(self.output_ids);
+        self.allocator.free(self.values);
         self.allocator.free(self.output_shardings);
         self.allocator.free(self.parameter_shardings);
         self.allocator.free(self.parameter_descriptors);
@@ -104,6 +126,7 @@ pub const AnalyzeError = error{
     InvalidManualComputation,
     GspmdNotEnabled,
     UnsupportedOp,
+    UnsupportedElementType,
     UnsupportedSharding,
     OutOfMemory,
     ReadFailed,
@@ -465,6 +488,9 @@ pub fn makeReplicatedPlan(
     }
     const instructions = try makeCopyArg0Instructions(allocator, num_parameters);
     errdefer freeInstructions(allocator, instructions);
+    const output_ids = try allocator.alloc(ValueId, num_outputs);
+    errdefer allocator.free(output_ids);
+    for (output_ids, 0..) |*id, index| id.* = .{ .index = @intCast(num_parameters + @min(index, instructions.len - 1)) };
 
     var initialized_parameters: usize = 0;
     errdefer for (parameter_shardings[0..initialized_parameters]) |plan| {
@@ -492,6 +518,7 @@ pub fn makeReplicatedPlan(
         .values = values,
         .parameter_shardings = parameter_shardings,
         .output_shardings = output_shardings,
+        .output_ids = output_ids,
         .instructions = instructions,
     };
 }
@@ -552,13 +579,17 @@ pub fn makeExecutablePlan(
     freeInstructions(allocator, plan.instructions);
     plan.instructions = &.{};
     plan.instructions = try lowerAnalysisOpsToPlan(allocator, analysis.ops, analysis.num_parameters);
+    allocator.free(plan.output_ids);
+    plan.output_ids = try allocator.dupe(ValueId, analysis.output_ids);
+    for (plan.values) |value| allocator.free(value.descriptor.dims);
     allocator.free(plan.values);
     plan.values = &.{};
-    plan.values = try makeBootstrapValues(allocator, analysis.parameter_descriptors, analysis.ops, plan.instructions.len);
+    plan.values = try cloneValues(allocator, analysis.values);
     return plan;
 }
 
 fn instructionKindFromStablehlo(name: []const u8) PlanInstructionKind {
+    if (std.mem.eql(u8, name, "constant")) return .constant;
     if (std.mem.eql(u8, name, "add")) return .add;
     if (std.mem.eql(u8, name, "subtract")) return .subtract;
     if (std.mem.eql(u8, name, "multiply")) return .multiply;
@@ -573,6 +604,11 @@ fn instructionKindFromStablehlo(name: []const u8) PlanInstructionKind {
     if (std.mem.eql(u8, name, "broadcast_in_dim")) return .broadcast_in_dim;
     if (std.mem.eql(u8, name, "slice")) return .slice;
     if (std.mem.eql(u8, name, "concatenate")) return .concatenate;
+    if (std.mem.eql(u8, name, "dot_general")) return .dot_general;
+    if (std.mem.eql(u8, name, "reduce_sum")) return .reduce_sum;
+    if (std.mem.eql(u8, name, "reduce_max")) return .reduce_max;
+    if (std.mem.eql(u8, name, "compare")) return .compare;
+    if (std.mem.eql(u8, name, "select")) return .select;
     return .unsupported;
 }
 
@@ -653,13 +689,34 @@ fn makeBootstrapValues(
     return values;
 }
 
-fn instructionInputs(allocator: std.mem.Allocator, kind: PlanInstructionKind, previous_value: ValueId, second_parameter: ?ValueId) ![]const ValueId {
+fn cloneValues(allocator: std.mem.Allocator, source: []const Value) ![]Value {
+    const values = try allocator.alloc(Value, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (values[0..initialized]) |value| allocator.free(value.descriptor.dims);
+        allocator.free(values);
+    }
+    for (source, values) |src, *dst| {
+        dst.* = makeValue(
+            src.id.index,
+            src.role,
+            makeDescriptor(try allocator.dupe(i64, src.descriptor.dims), src.descriptor.element_type),
+        );
+        initialized += 1;
+    }
+    return values;
+}
+
+fn instructionInputs(allocator: std.mem.Allocator, kind: PlanInstructionKind, op: Operation) ![]const ValueId {
+    if ((kind == .reduce_sum or kind == .reduce_max) and op.inputs.len >= 1) {
+        return allocator.dupe(ValueId, op.inputs[0..1]);
+    }
+    if (op.inputs.len != 0 or kind == .constant) return allocator.dupe(ValueId, op.inputs);
     return switch (kind) {
-        .copy_arg0, .negate, .exp, .tanh, .sqrt, .rsqrt, .reshape, .transpose, .broadcast_in_dim, .slice => allocator.dupe(ValueId, &.{previous_value}),
-        .add, .subtract, .multiply, .divide, .concatenate => blk: {
-            const rhs = second_parameter orelse previous_value;
-            break :blk allocator.dupe(ValueId, &.{ previous_value, rhs });
-        },
+        .copy_arg0, .negate, .exp, .tanh, .sqrt, .rsqrt, .reshape, .transpose, .broadcast_in_dim, .slice, .reduce_sum, .reduce_max => allocator.dupe(ValueId, &.{.{ .index = 0 }}),
+        .add, .subtract, .multiply, .divide, .concatenate, .dot_general, .compare => allocator.dupe(ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+        .select => allocator.dupe(ValueId, &.{ .{ .index = 0 }, .{ .index = 1 }, .{ .index = 2 } }),
+        .constant => &.{},
         .unsupported => &.{},
     };
 }
@@ -687,6 +744,12 @@ fn freeInstructions(allocator: std.mem.Allocator, instructions: []PlanInstructio
         if (instruction.start_indices) |start_indices| allocator.free(start_indices);
         if (instruction.limit_indices) |limit_indices| allocator.free(limit_indices);
         if (instruction.strides) |strides| allocator.free(strides);
+        if (instruction.reduce_dimensions) |reduce_dimensions| allocator.free(reduce_dimensions);
+        if (instruction.lhs_batch_dimensions) |dims| allocator.free(dims);
+        if (instruction.rhs_batch_dimensions) |dims| allocator.free(dims);
+        if (instruction.lhs_contracting_dimensions) |dims| allocator.free(dims);
+        if (instruction.rhs_contracting_dimensions) |dims| allocator.free(dims);
+        if (instruction.literal) |literal| allocator.free(literal);
     }
     allocator.free(instructions);
 }
@@ -695,15 +758,12 @@ fn makePlanInstruction(
     allocator: std.mem.Allocator,
     op: Operation,
     kind: PlanInstructionKind,
-    previous_value: ValueId,
-    second_parameter: ?ValueId,
-    output: ValueId,
 ) !PlanInstruction {
-    const inputs = try instructionInputs(allocator, kind, previous_value, second_parameter);
+    const inputs = try instructionInputs(allocator, kind, op);
     errdefer if (inputs.len != 0) allocator.free(inputs);
-    const outputs = try allocator.dupe(ValueId, &.{output});
+    const outputs = try allocator.dupe(ValueId, op.outputs);
     errdefer allocator.free(outputs);
-    const dims = if (kind == .reshape or kind == .transpose or kind == .broadcast_in_dim or kind == .slice or kind == .concatenate) try allocator.dupe(i64, op.dims) else null;
+    const dims = if (kind == .reshape or kind == .transpose or kind == .broadcast_in_dim or kind == .slice or kind == .concatenate or kind == .dot_general or kind == .reduce_sum or kind == .reduce_max or kind == .compare or kind == .select) try allocator.dupe(i64, op.dims) else null;
     errdefer if (dims) |owned| allocator.free(owned);
     const permutation = if (kind == .transpose) try allocator.dupe(i64, op.permutation) else null;
     errdefer if (permutation) |owned| allocator.free(owned);
@@ -715,6 +775,18 @@ fn makePlanInstruction(
     errdefer if (limit_indices) |owned| allocator.free(owned);
     const strides = if (kind == .slice) try allocator.dupe(i64, op.strides) else null;
     errdefer if (strides) |owned| allocator.free(owned);
+    const reduce_dimensions = if (kind == .reduce_sum or kind == .reduce_max) try allocator.dupe(i64, op.reduce_dimensions) else null;
+    errdefer if (reduce_dimensions) |owned| allocator.free(owned);
+    const lhs_batch_dimensions = if (kind == .dot_general) try allocator.dupe(i64, op.lhs_batch_dimensions) else null;
+    errdefer if (lhs_batch_dimensions) |owned| allocator.free(owned);
+    const rhs_batch_dimensions = if (kind == .dot_general) try allocator.dupe(i64, op.rhs_batch_dimensions) else null;
+    errdefer if (rhs_batch_dimensions) |owned| allocator.free(owned);
+    const lhs_contracting_dimensions = if (kind == .dot_general) try allocator.dupe(i64, op.lhs_contracting_dimensions) else null;
+    errdefer if (lhs_contracting_dimensions) |owned| allocator.free(owned);
+    const rhs_contracting_dimensions = if (kind == .dot_general) try allocator.dupe(i64, op.rhs_contracting_dimensions) else null;
+    errdefer if (rhs_contracting_dimensions) |owned| allocator.free(owned);
+    const literal = if (kind == .constant) try allocator.dupe(u8, op.literal) else null;
+    errdefer if (literal) |owned| allocator.free(owned);
 
     return .{
         .kind = kind,
@@ -727,6 +799,13 @@ fn makePlanInstruction(
         .limit_indices = limit_indices,
         .strides = strides,
         .dimension = if (kind == .concatenate) op.dimension else null,
+        .reduce_dimensions = reduce_dimensions,
+        .lhs_batch_dimensions = lhs_batch_dimensions,
+        .rhs_batch_dimensions = rhs_batch_dimensions,
+        .lhs_contracting_dimensions = lhs_contracting_dimensions,
+        .rhs_contracting_dimensions = rhs_contracting_dimensions,
+        .compare_direction = if (kind == .compare) op.compare_direction else null,
+        .literal = literal,
     };
 }
 
@@ -737,21 +816,20 @@ fn lowerAnalysisOpsToPlan(allocator: std.mem.Allocator, ops: []const Operation, 
         freeInstructions(allocator, plan_instructions);
     }
     @memset(plan_instructions, .{ .kind = .unsupported });
-    var previous_value: ValueId = .{ .index = 0 };
-    const second_parameter: ?ValueId = if (num_parameters > 1) .{ .index = 1 } else null;
     for (ops, plan_instructions, 0..) |op, *plan_instruction, index| {
+        _ = index;
         const kind = instructionKindFromStablehlo(op.name);
-        const output: ValueId = .{ .index = @intCast(num_parameters + index) };
-        plan_instruction.* = try makePlanInstruction(allocator, op, kind, previous_value, second_parameter, output);
-        previous_value = output;
+        plan_instruction.* = try makePlanInstruction(allocator, op, kind);
     }
     return plan_instructions;
 }
 
 fn expectedInputCount(kind: PlanInstructionKind) ?usize {
     return switch (kind) {
-        .copy_arg0, .negate, .exp, .tanh, .sqrt, .rsqrt, .reshape, .transpose, .broadcast_in_dim, .slice => 1,
-        .add, .subtract, .multiply, .divide, .concatenate => 2,
+        .constant => 0,
+        .copy_arg0, .negate, .exp, .tanh, .sqrt, .rsqrt, .reshape, .transpose, .broadcast_in_dim, .slice, .reduce_sum, .reduce_max => 1,
+        .add, .subtract, .multiply, .divide, .concatenate, .dot_general, .compare => 2,
+        .select => 3,
         .unsupported => null,
     };
 }
@@ -791,7 +869,7 @@ fn sameTypeAndShape(lhs: core.BufferDescriptor, rhs: core.BufferDescriptor) bool
 
 fn instructionOutputDims(instruction: PlanInstruction) ?[]const i64 {
     return switch (instruction.kind) {
-        .reshape, .transpose, .broadcast_in_dim, .slice, .concatenate => instruction.dims,
+        .reshape, .transpose, .broadcast_in_dim, .slice, .concatenate, .dot_general, .reduce_sum, .reduce_max, .compare, .select => instruction.dims,
         else => null,
     };
 }
@@ -819,6 +897,11 @@ fn verifyInstructionDescriptors(
     }
 
     switch (instruction.kind) {
+        .constant => {
+            if (descriptorKnown(output) and instruction.literal == null) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "constant instruction must carry literal bytes", "constant");
+            }
+        },
         .copy_arg0, .negate, .exp, .tanh, .sqrt, .rsqrt => {
             if (!sameTypeAndShape(plan.values[instruction.inputs[0].index].descriptor, output)) {
                 return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "unary instruction must preserve input dtype and shape", "shape-type");
@@ -857,6 +940,40 @@ fn verifyInstructionDescriptors(
             }
             if (descriptorKnown(lhs) and descriptorKnown(output) and lhs.element_type != output.element_type) {
                 return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "concatenate output must match input dtype", "shape-type");
+            }
+        },
+        .dot_general => {
+            const lhs = plan.values[instruction.inputs[0].index].descriptor;
+            const rhs = plan.values[instruction.inputs[1].index].descriptor;
+            if (descriptorKnown(lhs) and descriptorKnown(rhs) and (lhs.element_type != .f32 or rhs.element_type != .f32 or output.element_type != .f32)) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "dot_general bootstrap lowering supports f32 tensors only", "dot-general");
+            }
+        },
+        .reduce_sum, .reduce_max => {
+            const input = plan.values[instruction.inputs[0].index].descriptor;
+            if (descriptorKnown(input) and descriptorKnown(output) and input.element_type != output.element_type) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "reduce output must preserve dtype", "shape-type");
+            }
+        },
+        .compare => {
+            const lhs = plan.values[instruction.inputs[0].index].descriptor;
+            const rhs = plan.values[instruction.inputs[1].index].descriptor;
+            if (!sameTypeAndShape(lhs, rhs)) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.inputs[1], "compare inputs must have matching dtype and shape", "shape-type");
+            }
+            if (descriptorKnown(output) and output.element_type != .pred) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "compare output must be pred", "shape-type");
+            }
+        },
+        .select => {
+            const pred = plan.values[instruction.inputs[0].index].descriptor;
+            const on_true = plan.values[instruction.inputs[1].index].descriptor;
+            const on_false = plan.values[instruction.inputs[2].index].descriptor;
+            if (descriptorKnown(pred) and pred.element_type != .pred) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.inputs[0], "select predicate must be pred", "shape-type");
+            }
+            if (!sameTypeAndShape(on_true, on_false) or !sameTypeAndShape(on_true, output)) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "select data inputs and output must match", "shape-type");
             }
         },
         .unsupported => {},
@@ -899,7 +1016,7 @@ pub fn verifyExecutablePlan(
                 parameter_count += 1;
                 defined[index] = true;
             },
-            .constant => defined[index] = true,
+            .constant => {},
             .instruction_result, .output => {},
         }
     }
@@ -937,12 +1054,20 @@ pub fn verifyExecutablePlan(
                 return failPlanVerification(writer, pass_name, instruction_index, output, "instruction output value is already defined", "value-graph");
             }
             const role = plan.values[output.index].role;
-            if (role != .instruction_result and role != .output) {
+            if (role != .instruction_result and role != .output and role != .constant) {
                 return failPlanVerification(writer, pass_name, instruction_index, output, "instruction output must target an instruction-result or output value", "value-role");
             }
             defined[output.index] = true;
         }
         try verifyInstructionDescriptors(plan, instruction, instruction_index, writer);
+    }
+    if (plan.output_ids.len != plan.output_shardings.len) {
+        return failPlanVerification(writer, pass_name, null, null, "output id count must match output sharding count", "value-graph");
+    }
+    for (plan.output_ids) |output_id| {
+        if (!valueInPlan(plan, output_id) or !defined[output_id.index]) {
+            return failPlanVerification(writer, pass_name, null, output_id, "plan output must reference a defined value", "value-graph");
+        }
     }
 }
 
@@ -1185,6 +1310,9 @@ const CapiAnalysisBuilder = struct {
     parameter_descriptors: std.ArrayList(core.BufferDescriptor) = .empty,
     parameter_shardings: std.ArrayList(ShardingMetadata) = .empty,
     output_shardings: std.ArrayList(ShardingMetadata) = .empty,
+    values: std.ArrayList(Value) = .empty,
+    value_map: std.ArrayList(ValueMapEntry) = .empty,
+    output_ids: std.ArrayList(ValueId) = .empty,
     num_parameters: usize = 0,
     num_outputs: usize = 0,
     saw_program_body: bool = false,
@@ -1198,7 +1326,11 @@ const CapiAnalysisBuilder = struct {
         for (self.output_shardings.items) |sharding| sharding.deinit(self.allocator);
         for (self.parameter_shardings.items) |sharding| sharding.deinit(self.allocator);
         for (self.parameter_descriptors.items) |descriptor| self.allocator.free(descriptor.dims);
+        for (self.values.items) |value| self.allocator.free(value.descriptor.dims);
         for (self.ops.items) |op| op.deinit(self.allocator);
+        self.output_ids.deinit(self.allocator);
+        self.value_map.deinit(self.allocator);
+        self.values.deinit(self.allocator);
         self.output_shardings.deinit(self.allocator);
         self.parameter_shardings.deinit(self.allocator);
         self.parameter_descriptors.deinit(self.allocator);
@@ -1227,17 +1359,155 @@ const CapiAnalysisBuilder = struct {
         self.allocator.free(self.parameter_descriptors.items[index].dims);
         self.parameter_descriptors.items[index] = descriptor;
     }
+
+    fn registerValue(self: *CapiAnalysisBuilder, value: mlir.MlirValue, role: ValueRole, descriptor: core.BufferDescriptor) !ValueId {
+        if (self.lookupValue(value)) |existing| {
+            self.allocator.free(descriptor.dims);
+            return existing;
+        }
+        const id: ValueId = .{ .index = @intCast(self.values.items.len) };
+        try self.values.append(self.allocator, makeValue(id.index, role, descriptor));
+        errdefer _ = self.values.pop();
+        try self.value_map.append(self.allocator, .{ .mlir_value = value, .id = id });
+        return id;
+    }
+
+    fn lookupValue(self: *CapiAnalysisBuilder, value: mlir.MlirValue) ?ValueId {
+        for (self.value_map.items) |entry| {
+            if (mlir.mlirValueEqual(entry.mlir_value, value)) return entry.id;
+        }
+        return null;
+    }
+};
+
+const ValueMapEntry = struct {
+    mlir_value: mlir.MlirValue,
+    id: ValueId,
 };
 
 fn operationHasAttributeNamed(op: mlir.MlirOperation, name: []const u8) bool {
     return !mlir.mlirAttributeIsNull(getOperationAttribute(op, name));
 }
 
+fn valueIdsForOperands(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation) ![]const ValueId {
+    const count: usize = @intCast(mlir.mlirOperationGetNumOperands(op));
+    const ids = try builder.allocator.alloc(ValueId, count);
+    errdefer builder.allocator.free(ids);
+    var index: isize = 0;
+    while (index < @as(isize, @intCast(count))) : (index += 1) {
+        const operand = mlir.mlirOperationGetOperand(op, index);
+        ids[@intCast(index)] = builder.lookupValue(operand) orelse return error.InvalidStablehloModule;
+    }
+    return ids;
+}
+
+fn registerResultValues(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation, role: ValueRole) ![]const ValueId {
+    const count: usize = @intCast(mlir.mlirOperationGetNumResults(op));
+    const ids = try builder.allocator.alloc(ValueId, count);
+    errdefer builder.allocator.free(ids);
+    var index: isize = 0;
+    while (index < @as(isize, @intCast(count))) : (index += 1) {
+        const result = mlir.mlirOperationGetResult(op, index);
+        ids[@intCast(index)] = try builder.registerValue(result, role, try descriptorFromType(builder.allocator, mlir.mlirValueGetType(result)));
+    }
+    return ids;
+}
+
+fn denseLiteralBytes(allocator: std.mem.Allocator, attr: mlir.MlirAttribute, element_type: core.BufferType, dims: []const i64) ![]const u8 {
+    if (mlir.mlirAttributeIsNull(attr) or !mlir.mlirAttributeIsADenseElements(attr)) return allocator.dupe(u8, &.{});
+    const byte_size = core.denseByteSize(element_type, dims);
+    const bytes = try allocator.alloc(u8, byte_size);
+    errdefer allocator.free(bytes);
+    const element_count: usize = @intCast(mlir.mlirElementsAttrGetNumElements(attr));
+    if (byte_size == 0 or element_count == 0) return bytes;
+    switch (element_type) {
+        .pred => {
+            for (0..element_count) |i| bytes[i] = if (mlir.mlirDenseElementsAttrGetBoolValue(attr, @intCast(i))) 1 else 0;
+        },
+        .u8 => {
+            for (0..element_count) |i| bytes[i] = mlir.mlirDenseElementsAttrGetUInt8Value(attr, @intCast(i));
+        },
+        .s8 => {
+            for (0..element_count) |i| bytes[i] = @bitCast(mlir.mlirDenseElementsAttrGetInt8Value(attr, @intCast(i)));
+        },
+        .f32 => {
+            for (0..element_count) |i| {
+                const value = mlir.mlirDenseElementsAttrGetFloatValue(attr, @intCast(i));
+                std.mem.writeInt(u32, bytes[i * 4 ..][0..4], @bitCast(value), .little);
+            }
+        },
+        .s32 => {
+            for (0..element_count) |i| {
+                const value: i32 = mlir.mlirDenseElementsAttrGetInt32Value(attr, @intCast(i));
+                std.mem.writeInt(u32, bytes[i * 4 ..][0..4], @bitCast(value), .little);
+            }
+        },
+        else => return error.UnsupportedElementType,
+    }
+    return bytes;
+}
+
+fn stablehloDotDims(allocator: std.mem.Allocator, attr: mlir.MlirAttribute, comptime which: []const u8) ![]const i64 {
+    if (mlir.mlirAttributeIsNull(attr) or !mlir.stablehloAttributeIsADotDimensionNumbers(attr)) return allocator.dupe(i64, &.{});
+    const count: isize = if (std.mem.eql(u8, which, "lhs_batch"))
+        mlir.stablehloDotDimensionNumbersGetLhsBatchingDimensionsSize(attr)
+    else if (std.mem.eql(u8, which, "rhs_batch"))
+        mlir.stablehloDotDimensionNumbersGetRhsBatchingDimensionsSize(attr)
+    else if (std.mem.eql(u8, which, "lhs_contract"))
+        mlir.stablehloDotDimensionNumbersGetLhsContractingDimensionsSize(attr)
+    else
+        mlir.stablehloDotDimensionNumbersGetRhsContractingDimensionsSize(attr);
+    const values = try allocator.alloc(i64, @intCast(count));
+    var index: isize = 0;
+    while (index < count) : (index += 1) {
+        values[@intCast(index)] = if (std.mem.eql(u8, which, "lhs_batch"))
+            mlir.stablehloDotDimensionNumbersGetLhsBatchingDimensionsElem(attr, index)
+        else if (std.mem.eql(u8, which, "rhs_batch"))
+            mlir.stablehloDotDimensionNumbersGetRhsBatchingDimensionsElem(attr, index)
+        else if (std.mem.eql(u8, which, "lhs_contract"))
+            mlir.stablehloDotDimensionNumbersGetLhsContractingDimensionsElem(attr, index)
+        else
+            mlir.stablehloDotDimensionNumbersGetRhsContractingDimensionsElem(attr, index);
+    }
+    return values;
+}
+
+fn compareDirectionFromAttr(attr: mlir.MlirAttribute) ?core.CompareOp {
+    if (mlir.mlirAttributeIsNull(attr) or !mlir.stablehloAttributeIsAComparisonDirectionAttr(attr)) return null;
+    const text = mlirStringSlice(mlir.stablehloComparisonDirectionAttrGetValue(attr));
+    if (std.mem.eql(u8, text, "EQ")) return .eq;
+    if (std.mem.eql(u8, text, "NE")) return .ne;
+    if (std.mem.eql(u8, text, "GE")) return .ge;
+    if (std.mem.eql(u8, text, "GT")) return .gt;
+    if (std.mem.eql(u8, text, "LE")) return .le;
+    if (std.mem.eql(u8, text, "LT")) return .lt;
+    return null;
+}
+
+fn reduceKindFromRegion(op: mlir.MlirOperation) []const u8 {
+    const n_regions = mlir.mlirOperationGetNumRegions(op);
+    var region_index: isize = 0;
+    while (region_index < n_regions) : (region_index += 1) {
+        var block = mlir.mlirRegionGetFirstBlock(mlir.mlirOperationGetRegion(op, region_index));
+        while (!mlir.mlirBlockIsNull(block)) : (block = mlir.mlirBlockGetNextInRegion(block)) {
+            var child = mlir.mlirBlockGetFirstOperation(block);
+            while (!mlir.mlirOperationIsNull(child)) : (child = mlir.mlirOperationGetNextInBlock(child)) {
+                const name = operationName(child);
+                if (std.mem.eql(u8, name, "stablehlo.add")) return "reduce_sum";
+                if (std.mem.eql(u8, name, "stablehlo.maximum")) return "reduce_max";
+            }
+        }
+    }
+    return "reduce";
+}
+
 fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation, op_name: []const u8) AnalyzeError!void {
     builder.saw_program_body = true;
     try addDialect(&builder.dialects, builder.allocator, .stablehlo);
 
-    const short_name = op_name["stablehlo.".len..];
+    const raw_short_name = op_name["stablehlo.".len..];
+    if (std.mem.eql(u8, raw_short_name, "return")) return;
+    const short_name = if (std.mem.eql(u8, raw_short_name, "reduce")) reduceKindFromRegion(op) else raw_short_name;
     const ty = resultOrOperandType(op);
     const dtype = if (mlir.mlirTypeIsNull(ty)) try builder.allocator.dupe(u8, "unknown") else try typeDtype(builder.allocator, ty);
     var owns_dtype = true;
@@ -1279,6 +1549,40 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
         intAttribute(getOperationAttribute(op, "dimension"))
     else
         null;
+    const reduce_dimensions = if (std.mem.startsWith(u8, short_name, "reduce_"))
+        try intListAttribute(builder.allocator, getOperationAttribute(op, "dimensions"))
+    else
+        try builder.allocator.dupe(i64, &.{});
+    var owns_reduce_dimensions = true;
+    errdefer if (owns_reduce_dimensions) builder.allocator.free(reduce_dimensions);
+    const dot_dimensions = getOperationAttribute(op, "dot_dimension_numbers");
+    const lhs_batch_dimensions = if (std.mem.eql(u8, short_name, "dot_general")) try stablehloDotDims(builder.allocator, dot_dimensions, "lhs_batch") else try builder.allocator.dupe(i64, &.{});
+    var owns_lhs_batch_dimensions = true;
+    errdefer if (owns_lhs_batch_dimensions) builder.allocator.free(lhs_batch_dimensions);
+    const rhs_batch_dimensions = if (std.mem.eql(u8, short_name, "dot_general")) try stablehloDotDims(builder.allocator, dot_dimensions, "rhs_batch") else try builder.allocator.dupe(i64, &.{});
+    var owns_rhs_batch_dimensions = true;
+    errdefer if (owns_rhs_batch_dimensions) builder.allocator.free(rhs_batch_dimensions);
+    const lhs_contracting_dimensions = if (std.mem.eql(u8, short_name, "dot_general")) try stablehloDotDims(builder.allocator, dot_dimensions, "lhs_contract") else try builder.allocator.dupe(i64, &.{});
+    var owns_lhs_contracting_dimensions = true;
+    errdefer if (owns_lhs_contracting_dimensions) builder.allocator.free(lhs_contracting_dimensions);
+    const rhs_contracting_dimensions = if (std.mem.eql(u8, short_name, "dot_general")) try stablehloDotDims(builder.allocator, dot_dimensions, "rhs_contract") else try builder.allocator.dupe(i64, &.{});
+    var owns_rhs_contracting_dimensions = true;
+    errdefer if (owns_rhs_contracting_dimensions) builder.allocator.free(rhs_contracting_dimensions);
+    const compare_direction = if (std.mem.eql(u8, short_name, "compare")) compareDirectionFromAttr(getOperationAttribute(op, "comparison_direction")) else null;
+    const inputs = try valueIdsForOperands(builder, op);
+    var owns_inputs = true;
+    errdefer if (owns_inputs) builder.allocator.free(inputs);
+    const value_role: ValueRole = if (std.mem.eql(u8, short_name, "constant")) .constant else .instruction_result;
+    const outputs = try registerResultValues(builder, op, value_role);
+    var owns_outputs = true;
+    errdefer if (owns_outputs) builder.allocator.free(outputs);
+    const element_type = bufferTypeFromDtype(dtype);
+    const literal = if (std.mem.eql(u8, short_name, "constant"))
+        try denseLiteralBytes(builder.allocator, getOperationAttribute(op, "value"), element_type, dims)
+    else
+        try builder.allocator.dupe(u8, &.{});
+    var owns_literal = true;
+    errdefer if (owns_literal) builder.allocator.free(literal);
     const sharding = try operationShardingLabel(builder.allocator, op);
     var owns_sharding = true;
     errdefer if (owns_sharding) builder.allocator.free(sharding);
@@ -1291,6 +1595,8 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
         .name = owned_name,
         .line = loc.line,
         .column = loc.column,
+        .inputs = inputs,
+        .outputs = outputs,
         .dtype = dtype,
         .rank = if (mlir.mlirTypeIsNull(ty)) null else typeRank(ty),
         .dims = dims,
@@ -1300,11 +1606,20 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
         .limit_indices = limit_indices,
         .strides = strides,
         .dimension = dimension,
+        .reduce_dimensions = reduce_dimensions,
+        .lhs_batch_dimensions = lhs_batch_dimensions,
+        .rhs_batch_dimensions = rhs_batch_dimensions,
+        .lhs_contracting_dimensions = lhs_contracting_dimensions,
+        .rhs_contracting_dimensions = rhs_contracting_dimensions,
+        .compare_direction = compare_direction,
+        .literal = literal,
         .sharding = sharding,
     };
-    if (!stablehloOpSupported(short_name)) {
+    if (!stablehloOpSupported(raw_short_name) or std.mem.eql(u8, short_name, "reduce")) {
         try writeOpDiagnostic(builder.diagnostic_writer, "unsupported op", analyzed, "stablehlo-op");
         analyzed.deinit(builder.allocator);
+        owns_inputs = false;
+        owns_outputs = false;
         owns_dtype = false;
         owns_dims = false;
         owns_permutation = false;
@@ -1312,11 +1627,19 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
         owns_start_indices = false;
         owns_limit_indices = false;
         owns_strides = false;
+        owns_reduce_dimensions = false;
+        owns_lhs_batch_dimensions = false;
+        owns_rhs_batch_dimensions = false;
+        owns_lhs_contracting_dimensions = false;
+        owns_rhs_contracting_dimensions = false;
+        owns_literal = false;
         owns_sharding = false;
         owns_name = false;
         return error.UnsupportedOp;
     }
     try builder.ops.append(builder.allocator, analyzed);
+    owns_inputs = false;
+    owns_outputs = false;
     owns_dtype = false;
     owns_dims = false;
     owns_permutation = false;
@@ -1324,6 +1647,12 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
     owns_start_indices = false;
     owns_limit_indices = false;
     owns_strides = false;
+    owns_reduce_dimensions = false;
+    owns_lhs_batch_dimensions = false;
+    owns_rhs_batch_dimensions = false;
+    owns_lhs_contracting_dimensions = false;
+    owns_rhs_contracting_dimensions = false;
+    owns_literal = false;
     owns_sharding = false;
     owns_name = false;
 }
@@ -1396,6 +1725,16 @@ fn analyzeFunctionFromCapi(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation
             while (arg_index_for_type < block_args) : (arg_index_for_type += 1) {
                 builder.replaceParameterDescriptor(arg_index_for_type, try descriptorFromType(builder.allocator, mlir.mlirValueGetType(mlir.mlirBlockGetArgument(entry, @intCast(arg_index_for_type)))));
             }
+            var arg_index_for_value: usize = 0;
+            while (arg_index_for_value < block_args) : (arg_index_for_value += 1) {
+                const block_arg = mlir.mlirBlockGetArgument(entry, @intCast(arg_index_for_value));
+                const descriptor = builder.parameter_descriptors.items[arg_index_for_value];
+                _ = try builder.registerValue(
+                    block_arg,
+                    .parameter,
+                    makeDescriptor(try builder.allocator.dupe(i64, descriptor.dims), descriptor.element_type),
+                );
+            }
         }
     }
 
@@ -1450,15 +1789,33 @@ fn inspectOperationAttributesFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Ml
     }
 }
 
+fn appendFunctionReturnIds(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation) AnalyzeError!void {
+    if (mlir.mlirOperationGetNumRegions(op) == 0) return;
+    const entry = mlir.mlirRegionGetFirstBlock(mlir.mlirOperationGetRegion(op, 0));
+    if (mlir.mlirBlockIsNull(entry)) return;
+    const terminator = mlir.mlirBlockGetTerminator(entry);
+    if (mlir.mlirOperationIsNull(terminator) or !std.mem.eql(u8, operationName(terminator), "func.return")) return;
+
+    const operand_count = mlir.mlirOperationGetNumOperands(terminator);
+    builder.output_ids.clearRetainingCapacity();
+    var operand_index: isize = 0;
+    while (operand_index < operand_count) : (operand_index += 1) {
+        const id = builder.lookupValue(mlir.mlirOperationGetOperand(terminator, operand_index)) orelse return error.InvalidStablehloModule;
+        try builder.output_ids.append(builder.allocator, id);
+    }
+}
+
 fn visitOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation) AnalyzeError!void {
     const name = operationName(op);
     const loc = mlirLocationLineColumn(mlir.mlirOperationGetLocation(op));
     try inspectOperationAttributesFromCapi(builder, op, loc);
 
+    var recurse_children = true;
     if (std.mem.eql(u8, name, "func.func")) {
         try analyzeFunctionFromCapi(builder, op);
     } else if (std.mem.startsWith(u8, name, "stablehlo.")) {
         try analyzeStablehloOperationFromCapi(builder, op, name);
+        recurse_children = false;
     } else if (std.mem.startsWith(u8, name, "chlo.")) {
         try writeSimpleDiagnostic(builder.diagnostic_writer, "unsupported op", loc.line, loc.column, "CHLO legalization is not wired yet", "chlo-legalization");
         return error.UnsupportedOp;
@@ -1485,16 +1842,19 @@ fn visitOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation)
     }
 
     const n_regions = mlir.mlirOperationGetNumRegions(op);
-    var region_index: isize = 0;
-    while (region_index < n_regions) : (region_index += 1) {
-        var block = mlir.mlirRegionGetFirstBlock(mlir.mlirOperationGetRegion(op, region_index));
-        while (!mlir.mlirBlockIsNull(block)) : (block = mlir.mlirBlockGetNextInRegion(block)) {
-            var child = mlir.mlirBlockGetFirstOperation(block);
-            while (!mlir.mlirOperationIsNull(child)) : (child = mlir.mlirOperationGetNextInBlock(child)) {
-                try visitOperationFromCapi(builder, child);
+    if (recurse_children) {
+        var region_index: isize = 0;
+        while (region_index < n_regions) : (region_index += 1) {
+            var block = mlir.mlirRegionGetFirstBlock(mlir.mlirOperationGetRegion(op, region_index));
+            while (!mlir.mlirBlockIsNull(block)) : (block = mlir.mlirBlockGetNextInRegion(block)) {
+                var child = mlir.mlirBlockGetFirstOperation(block);
+                while (!mlir.mlirOperationIsNull(child)) : (child = mlir.mlirOperationGetNextInBlock(child)) {
+                    try visitOperationFromCapi(builder, child);
+                }
             }
         }
     }
+    if (std.mem.eql(u8, name, "func.func")) try appendFunctionReturnIds(builder, op);
 }
 
 fn analyzeMlirSessionWithCapi(
@@ -1523,17 +1883,53 @@ fn analyzeMlirSessionWithCapi(
         builder.num_outputs = 1;
         try builder.ensureShardings(&builder.output_shardings, builder.num_outputs);
     }
+    if (builder.output_ids.items.len == 0 and builder.values.items.len != 0) {
+        try builder.output_ids.append(builder.allocator, builder.values.items[builder.values.items.len - 1].id);
+    }
+
+    const dialects = try builder.dialects.toOwnedSlice(allocator);
+    errdefer allocator.free(dialects);
+    const ops = try builder.ops.toOwnedSlice(allocator);
+    errdefer {
+        for (ops) |op| op.deinit(allocator);
+        allocator.free(ops);
+    }
+    const values = try builder.values.toOwnedSlice(allocator);
+    errdefer {
+        for (values) |value| allocator.free(value.descriptor.dims);
+        allocator.free(values);
+    }
+    const output_ids = try builder.output_ids.toOwnedSlice(allocator);
+    errdefer allocator.free(output_ids);
+    const parameter_descriptors = try builder.parameter_descriptors.toOwnedSlice(allocator);
+    errdefer {
+        for (parameter_descriptors) |descriptor| allocator.free(descriptor.dims);
+        allocator.free(parameter_descriptors);
+    }
+    const parameter_shardings = try builder.parameter_shardings.toOwnedSlice(allocator);
+    errdefer {
+        for (parameter_shardings) |sharding| sharding.deinit(allocator);
+        allocator.free(parameter_shardings);
+    }
+    const output_shardings = try builder.output_shardings.toOwnedSlice(allocator);
+    errdefer {
+        for (output_shardings) |sharding| sharding.deinit(allocator);
+        allocator.free(output_shardings);
+    }
+    builder.value_map.deinit(allocator);
 
     return .{
         .allocator = allocator,
         .source = source,
-        .dialects = try builder.dialects.toOwnedSlice(allocator),
-        .ops = try builder.ops.toOwnedSlice(allocator),
-        .parameter_descriptors = try builder.parameter_descriptors.toOwnedSlice(allocator),
+        .dialects = dialects,
+        .ops = ops,
+        .values = values,
+        .output_ids = output_ids,
+        .parameter_descriptors = parameter_descriptors,
         .num_parameters = builder.num_parameters,
         .num_outputs = builder.num_outputs,
-        .parameter_shardings = try builder.parameter_shardings.toOwnedSlice(allocator),
-        .output_shardings = try builder.output_shardings.toOwnedSlice(allocator),
+        .parameter_shardings = parameter_shardings,
+        .output_shardings = output_shardings,
     };
 }
 

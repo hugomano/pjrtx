@@ -885,94 +885,140 @@ fn destroyOwnedBuffer(buffer: *runtime.Buffer, owned: bool) void {
 
 fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callconv(.c) ?*c.PJRT_Error {
     const executable = executableFromC(args[0].executable);
-    if (args[0].num_args == 0) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx bootstrap execute expects at least one argument");
+    if (args[0].num_args == 0 and executable.plan.parameter_shardings.len != 0) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx bootstrap execute expects arguments for executable parameters");
     if (executable.plan.instructions.len == 0) return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "executable plan has no runtime operations");
     for (0..args[0].num_devices) |device_index| {
-        const first_arg = args[0].argument_lists[device_index][0];
-        var current = bufferFromC(first_arg);
-        var current_owned = false;
+        const value_buffers = allocator.alloc(?*runtime.Buffer, executable.plan.values.len) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate execute value table");
+        defer allocator.free(value_buffers);
+        @memset(value_buffers, null);
+        const value_owned = allocator.alloc(bool, executable.plan.values.len) catch {
+            allocator.free(value_buffers);
+            return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate execute ownership table");
+        };
+        defer allocator.free(value_owned);
+        @memset(value_owned, false);
+        var output_value_ids = allocator.alloc(bool, executable.plan.values.len) catch {
+            allocator.free(value_buffers);
+            allocator.free(value_owned);
+            return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate execute output id table");
+        };
+        defer allocator.free(output_value_ids);
+        @memset(output_value_ids, false);
+        for (executable.plan.output_ids) |id| {
+            if (id.index < output_value_ids.len) output_value_ids[id.index] = true;
+        }
+        var parameter_index: usize = 0;
+        for (executable.plan.values) |value| {
+            if (value.role != .parameter) continue;
+            if (parameter_index >= args[0].num_args) {
+                for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx bootstrap execute received fewer arguments than executable parameters");
+            }
+            value_buffers[value.id.index] = bufferFromC(args[0].argument_lists[device_index][parameter_index]);
+            parameter_index += 1;
+        }
         for (executable.plan.instructions) |plan_instruction| {
+            if (plan_instruction.outputs.len != 1) {
+                for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                return makeError(c.PJRT_Error_Code_INTERNAL, "executable plan instruction arity is invalid");
+            }
+            const output_id = plan_instruction.outputs[0];
             const next = switch (plan_instruction.kind) {
-                .copy_arg0 => runtime.Buffer.initDeviceCopy(allocator, current, device_index) catch {
-                    destroyOwnedBuffer(current, current_owned);
+                .constant => blk: {
+                    const descriptor = executable.plan.values[output_id.index].descriptor;
+                    const device = &executable.client.devices[device_index];
+                    const memory = device.default_memory;
+                    break :blk runtime.Buffer.initHostCopyForBackend(
+                        allocator,
+                        executable.client.backend,
+                        descriptor.element_type,
+                        descriptor.dims,
+                        device,
+                        memory,
+                        device_index,
+                        plan_instruction.literal orelse &.{},
+                    ) catch {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate StableHLO constant");
+                    };
+                },
+                .copy_arg0 => runtime.Buffer.initDeviceCopy(allocator, value_buffers[plan_instruction.inputs[0].index].?, device_index) catch {
+                    for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                     return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate execute output");
                 },
                 .add, .subtract, .multiply, .divide => blk: {
-                    if (args[0].num_args < 2) {
-                        destroyOwnedBuffer(current, current_owned);
-                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "binary StableHLO executable expects two arguments");
-                    }
-                    const rhs = bufferFromC(args[0].argument_lists[device_index][1]);
-                    break :blk runtime.Buffer.initElementwiseBinary(allocator, runtimeBinaryOp(plan_instruction.kind).?, current, rhs, device_index) catch |err| switch (err) {
+                    const lhs = value_buffers[plan_instruction.inputs[0].index].?;
+                    const rhs = value_buffers[plan_instruction.inputs[1].index].?;
+                    break :blk runtime.Buffer.initElementwiseBinary(allocator, runtimeBinaryOp(plan_instruction.kind).?, lhs, rhs, device_index) catch |err| switch (err) {
                         error.UnsupportedElementType => {
-                            destroyOwnedBuffer(current, current_owned);
+                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                             return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "binary StableHLO execution currently supports u8 and f32 buffers only");
                         },
                         error.ShapeMismatch => {
-                            destroyOwnedBuffer(current, current_owned);
+                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                             return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "binary StableHLO arguments must have the same shape");
                         },
                         else => {
-                            destroyOwnedBuffer(current, current_owned);
+                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                             return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute binary StableHLO op");
                         },
                     };
                 },
-                .negate, .exp, .tanh, .sqrt, .rsqrt => runtime.Buffer.initElementwiseUnary(allocator, runtimeUnaryOp(plan_instruction.kind).?, current, device_index) catch |err| switch (err) {
+                .negate, .exp, .tanh, .sqrt, .rsqrt => runtime.Buffer.initElementwiseUnary(allocator, runtimeUnaryOp(plan_instruction.kind).?, value_buffers[plan_instruction.inputs[0].index].?, device_index) catch |err| switch (err) {
                     error.UnsupportedElementType => {
-                        destroyOwnedBuffer(current, current_owned);
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                         return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "unary StableHLO execution currently supports u8 negate and f32 math buffers only");
                     },
                     else => {
-                        destroyOwnedBuffer(current, current_owned);
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute unary StableHLO op");
                     },
                 },
-                .reshape => runtime.Buffer.initReshape(allocator, current, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
+                .reshape => runtime.Buffer.initReshape(allocator, value_buffers[plan_instruction.inputs[0].index].?, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
                     error.UnsupportedElementType => {
-                        destroyOwnedBuffer(current, current_owned);
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                         return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "reshape StableHLO execution currently supports u8 and f32 MLX buffers only");
                     },
                     error.ShapeMismatch => {
-                        destroyOwnedBuffer(current, current_owned);
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                         return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "reshape StableHLO output shape must preserve byte size");
                     },
                     else => {
-                        destroyOwnedBuffer(current, current_owned);
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute reshape StableHLO op");
                     },
                 },
-                .transpose => runtime.Buffer.initTranspose(allocator, current, plan_instruction.permutation orelse &.{}, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
+                .transpose => runtime.Buffer.initTranspose(allocator, value_buffers[plan_instruction.inputs[0].index].?, plan_instruction.permutation orelse &.{}, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
                     error.UnsupportedElementType => {
-                        destroyOwnedBuffer(current, current_owned);
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                         return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "transpose StableHLO execution currently supports dense u8 and f32 buffers only");
                     },
                     error.ShapeMismatch => {
-                        destroyOwnedBuffer(current, current_owned);
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                         return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "transpose StableHLO permutation or output shape is invalid");
                     },
                     else => {
-                        destroyOwnedBuffer(current, current_owned);
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute transpose StableHLO op");
                     },
                 },
-                .broadcast_in_dim => runtime.Buffer.initBroadcastInDim(allocator, current, plan_instruction.broadcast_dimensions orelse &.{}, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
+                .broadcast_in_dim => runtime.Buffer.initBroadcastInDim(allocator, value_buffers[plan_instruction.inputs[0].index].?, plan_instruction.broadcast_dimensions orelse &.{}, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
                     error.UnsupportedElementType => {
-                        destroyOwnedBuffer(current, current_owned);
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                         return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "broadcast_in_dim StableHLO execution currently supports dense u8 and f32 buffers only");
                     },
                     error.ShapeMismatch => {
-                        destroyOwnedBuffer(current, current_owned);
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                         return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "broadcast_in_dim StableHLO dimensions or output shape are invalid");
                     },
                     else => {
-                        destroyOwnedBuffer(current, current_owned);
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute broadcast_in_dim StableHLO op");
                     },
                 },
                 .slice => runtime.Buffer.initSlice(
                     allocator,
-                    current,
+                    value_buffers[plan_instruction.inputs[0].index].?,
                     plan_instruction.start_indices orelse &.{},
                     plan_instruction.limit_indices orelse &.{},
                     plan_instruction.strides orelse &.{},
@@ -980,57 +1026,134 @@ fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callc
                     device_index,
                 ) catch |err| switch (err) {
                     error.UnsupportedElementType => {
-                        destroyOwnedBuffer(current, current_owned);
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                         return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "slice StableHLO execution currently supports dense u8 and f32 buffers only");
                     },
                     error.ShapeMismatch => {
-                        destroyOwnedBuffer(current, current_owned);
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                         return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "slice StableHLO bounds, strides, or output shape are invalid");
                     },
                     else => {
-                        destroyOwnedBuffer(current, current_owned);
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute slice StableHLO op");
                     },
                 },
                 .concatenate => blk: {
-                    if (args[0].num_args < 2) {
-                        destroyOwnedBuffer(current, current_owned);
-                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "concatenate StableHLO executable expects two arguments in the bootstrap executor");
-                    }
-                    const rhs = bufferFromC(args[0].argument_lists[device_index][1]);
+                    const lhs = value_buffers[plan_instruction.inputs[0].index].?;
+                    const rhs = value_buffers[plan_instruction.inputs[1].index].?;
                     break :blk runtime.Buffer.initConcatenate(
                         allocator,
-                        current,
+                        lhs,
                         rhs,
                         plan_instruction.dimension orelse 0,
                         plan_instruction.dims orelse &.{},
                         device_index,
                     ) catch |err| switch (err) {
                         error.UnsupportedElementType => {
-                            destroyOwnedBuffer(current, current_owned);
+                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                             return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "concatenate StableHLO execution currently supports dense u8 and f32 buffers only");
                         },
                         error.ShapeMismatch => {
-                            destroyOwnedBuffer(current, current_owned);
+                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                             return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "concatenate StableHLO input shapes, dimension, or output shape are invalid");
                         },
                         else => {
-                            destroyOwnedBuffer(current, current_owned);
+                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                             return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute concatenate StableHLO op");
                         },
                     };
                 },
+                .dot_general => runtime.Buffer.initDotGeneral(
+                    allocator,
+                    value_buffers[plan_instruction.inputs[0].index].?,
+                    value_buffers[plan_instruction.inputs[1].index].?,
+                    plan_instruction.lhs_batch_dimensions orelse &.{},
+                    plan_instruction.rhs_batch_dimensions orelse &.{},
+                    plan_instruction.lhs_contracting_dimensions orelse &.{},
+                    plan_instruction.rhs_contracting_dimensions orelse &.{},
+                    plan_instruction.dims orelse &.{},
+                    device_index,
+                ) catch |err| switch (err) {
+                    error.UnsupportedElementType => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "dot_general StableHLO execution currently supports f32 matmul-like tensors only");
+                    },
+                    error.ShapeMismatch => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "dot_general StableHLO dimension numbers or output shape are invalid");
+                    },
+                    else => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute dot_general StableHLO op");
+                    },
+                },
+                .reduce_sum, .reduce_max => runtime.Buffer.initReduce(allocator, plan_instruction.kind, value_buffers[plan_instruction.inputs[0].index].?, plan_instruction.reduce_dimensions orelse &.{}, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
+                    error.UnsupportedElementType => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "reduce StableHLO execution currently supports f32 sum/max only");
+                    },
+                    error.ShapeMismatch => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "reduce StableHLO dimensions or output shape are invalid");
+                    },
+                    else => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute reduce StableHLO op");
+                    },
+                },
+                .compare => runtime.Buffer.initCompare(allocator, value_buffers[plan_instruction.inputs[0].index].?, value_buffers[plan_instruction.inputs[1].index].?, plan_instruction.compare_direction orelse .eq, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
+                    error.UnsupportedElementType => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "compare StableHLO execution currently supports f32 predicates only");
+                    },
+                    error.ShapeMismatch => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "compare StableHLO input or output shape is invalid");
+                    },
+                    else => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute compare StableHLO op");
+                    },
+                },
+                .select => runtime.Buffer.initSelect(allocator, value_buffers[plan_instruction.inputs[0].index].?, value_buffers[plan_instruction.inputs[1].index].?, value_buffers[plan_instruction.inputs[2].index].?, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
+                    error.UnsupportedElementType => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "select StableHLO execution currently supports pred with matching dense data buffers");
+                    },
+                    error.ShapeMismatch => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "select StableHLO input or output shape is invalid");
+                    },
+                    else => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute select StableHLO op");
+                    },
+                },
                 .unsupported => {
-                    destroyOwnedBuffer(current, current_owned);
+                    for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                     return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "executable plan contains an unsupported runtime operation");
                 },
             };
-            destroyOwnedBuffer(current, current_owned);
-            current = next;
-            current_owned = true;
+            value_buffers[output_id.index] = next;
+            value_owned[output_id.index] = true;
         }
-        const output = current;
-        args[0].output_lists[device_index][0] = @ptrCast(output);
+        for (executable.plan.output_ids, 0..) |output_id, output_index| {
+            const output_buffer = value_buffers[output_id.index] orelse {
+                for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                return makeError(c.PJRT_Error_Code_INTERNAL, "executable output value was not produced");
+            };
+            if (value_owned[output_id.index]) {
+                args[0].output_lists[device_index][output_index] = @ptrCast(output_buffer);
+                value_owned[output_id.index] = false;
+            } else {
+                const copied = runtime.Buffer.initDeviceCopy(allocator, output_buffer, device_index) catch {
+                    for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                    return makeError(c.PJRT_Error_Code_INTERNAL, "failed to copy argument output");
+                };
+                args[0].output_lists[device_index][output_index] = @ptrCast(copied);
+            }
+        }
+        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
         if (args[0].device_complete_events) |events| events[device_index] = eventCreateReady();
     }
     return null;

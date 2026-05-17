@@ -81,6 +81,22 @@ fn noConcatenate(_: backend.Backend, _: backend.BufferHandle, _: backend.BufferH
     return null;
 }
 
+fn noDotGeneral(_: backend.Backend, _: backend.BufferHandle, _: backend.BufferHandle, _: []const i64, _: []const i64, _: []const i64, _: []const i64, _: []const i64) backend.Error!?backend.BufferHandle {
+    return null;
+}
+
+fn noReduce(_: backend.Backend, _: backend.BufferHandle, _: core.PlanInstructionKind, _: []const i64, _: []const i64) backend.Error!?backend.BufferHandle {
+    return null;
+}
+
+fn noCompare(_: backend.Backend, _: backend.BufferHandle, _: backend.BufferHandle, _: core.CompareOp, _: []const i64) backend.Error!?backend.BufferHandle {
+    return null;
+}
+
+fn noSelect(_: backend.Backend, _: backend.BufferHandle, _: backend.BufferHandle, _: backend.BufferHandle, _: []const i64) backend.Error!?backend.BufferHandle {
+    return null;
+}
+
 fn noCopy(_: backend.Backend, _: backend.BufferHandle, _: []u8) backend.Error!void {
     return error.BufferCopyFailed;
 }
@@ -101,6 +117,10 @@ const vtable: backend.Backend.VTable = .{
     .broadcastInDim = noBroadcast,
     .slice = noSlice,
     .concatenate = noConcatenate,
+    .dotGeneral = noDotGeneral,
+    .reduce = noReduce,
+    .compare = noCompare,
+    .select = noSelect,
     .copyToHost = noCopy,
     .destroyBuffer = noDestroy,
 };

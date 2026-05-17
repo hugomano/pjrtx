@@ -108,6 +108,44 @@ fn concatenate(_: backend.Backend, lhs: backend.BufferHandle, rhs: backend.Buffe
     return @ptrCast(handle);
 }
 
+fn dotGeneral(_: backend.Backend, lhs: backend.BufferHandle, rhs: backend.BufferHandle, lhs_batch_dimensions: []const i64, rhs_batch_dimensions: []const i64, lhs_contracting_dimensions: []const i64, rhs_contracting_dimensions: []const i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    const handle = c.pjrtx_mlx_metal_buffer_dot_general(
+        @ptrCast(@alignCast(lhs)),
+        @ptrCast(@alignCast(rhs)),
+        lhs_batch_dimensions.ptr,
+        lhs_batch_dimensions.len,
+        rhs_batch_dimensions.ptr,
+        rhs_batch_dimensions.len,
+        lhs_contracting_dimensions.ptr,
+        lhs_contracting_dimensions.len,
+        rhs_contracting_dimensions.ptr,
+        rhs_contracting_dimensions.len,
+        output_dims.ptr,
+        output_dims.len,
+    ) orelse return error.CommandSubmissionFailed;
+    return @ptrCast(handle);
+}
+
+fn reduce(_: backend.Backend, src: backend.BufferHandle, op: core.PlanInstructionKind, dimensions: []const i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    const code: c_int = switch (op) {
+        .reduce_sum => c.PJRTX_MLX_METAL_REDUCE_SUM,
+        .reduce_max => c.PJRTX_MLX_METAL_REDUCE_MAX,
+        else => return error.CommandSubmissionFailed,
+    };
+    const handle = c.pjrtx_mlx_metal_buffer_reduce(@ptrCast(@alignCast(src)), code, dimensions.ptr, dimensions.len, output_dims.ptr, output_dims.len) orelse return error.CommandSubmissionFailed;
+    return @ptrCast(handle);
+}
+
+fn compare(_: backend.Backend, lhs: backend.BufferHandle, rhs: backend.BufferHandle, direction: core.CompareOp, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    const handle = c.pjrtx_mlx_metal_buffer_compare(@ptrCast(@alignCast(lhs)), @ptrCast(@alignCast(rhs)), mlxCompareOpCode(direction), output_dims.ptr, output_dims.len) orelse return error.CommandSubmissionFailed;
+    return @ptrCast(handle);
+}
+
+fn select(_: backend.Backend, pred: backend.BufferHandle, on_true: backend.BufferHandle, on_false: backend.BufferHandle, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    const handle = c.pjrtx_mlx_metal_buffer_select(@ptrCast(@alignCast(pred)), @ptrCast(@alignCast(on_true)), @ptrCast(@alignCast(on_false)), output_dims.ptr, output_dims.len) orelse return error.CommandSubmissionFailed;
+    return @ptrCast(handle);
+}
+
 fn copyToHost(_: backend.Backend, src: backend.BufferHandle, dst: []u8) backend.Error!void {
     const ok = c.pjrtx_mlx_metal_buffer_copy_to_host(@ptrCast(@alignCast(src)), dst.ptr, dst.len);
     if (ok == 0) return error.BufferCopyFailed;
@@ -124,6 +162,7 @@ fn cNameBytes(name: *const [128]u8) []const u8 {
 
 fn mlxDtype(element_type: core.BufferType) ?c_int {
     return switch (element_type) {
+        .pred => c.PJRTX_MLX_METAL_DTYPE_PRED,
         .u8 => c.PJRTX_MLX_METAL_DTYPE_U8,
         .f32 => c.PJRTX_MLX_METAL_DTYPE_F32,
         else => null,
@@ -149,6 +188,17 @@ fn mlxUnaryOpCode(op: core.ElementwiseUnaryOp) c_int {
     };
 }
 
+fn mlxCompareOpCode(op: core.CompareOp) c_int {
+    return switch (op) {
+        .eq => c.PJRTX_MLX_METAL_COMPARE_EQ,
+        .ne => c.PJRTX_MLX_METAL_COMPARE_NE,
+        .ge => c.PJRTX_MLX_METAL_COMPARE_GE,
+        .gt => c.PJRTX_MLX_METAL_COMPARE_GT,
+        .le => c.PJRTX_MLX_METAL_COMPARE_LE,
+        .lt => c.PJRTX_MLX_METAL_COMPARE_LT,
+    };
+}
+
 const vtable: backend.Backend.VTable = .{
     .kind = kind,
     .capabilities = capabilities,
@@ -163,6 +213,10 @@ const vtable: backend.Backend.VTable = .{
     .broadcastInDim = broadcastInDim,
     .slice = slice,
     .concatenate = concatenate,
+    .dotGeneral = dotGeneral,
+    .reduce = reduce,
+    .compare = compare,
+    .select = select,
     .copyToHost = copyToHost,
     .destroyBuffer = destroyBuffer,
 };

@@ -8,6 +8,7 @@ pub const BackendKind = core.BackendKind;
 pub const BufferType = core.BufferType;
 pub const ElementwiseBinaryOp = core.ElementwiseBinaryOp;
 pub const ElementwiseUnaryOp = core.ElementwiseUnaryOp;
+pub const CompareOp = core.CompareOp;
 
 pub const Device = struct {
     id: i32,
@@ -319,7 +320,7 @@ pub const Buffer = struct {
 
         var backend_buffer: ?backend_api.BufferHandle = null;
         if (lhs.backend_buffer != null and rhs.backend_buffer != null) {
-            backend_buffer = try lhs.backend.binary(lhs.backend_buffer.?, rhs.backend_buffer.?, op);
+            backend_buffer = lhs.backend.binary(lhs.backend_buffer.?, rhs.backend_buffer.?, op) catch null;
         }
         errdefer if (backend_buffer) |owned| lhs.backend.destroyBuffer(owned);
 
@@ -406,7 +407,7 @@ pub const Buffer = struct {
 
         var backend_buffer: ?backend_api.BufferHandle = null;
         if (src.backend_buffer) |src_backend| {
-            backend_buffer = try src.backend.unary(src_backend, op);
+            backend_buffer = src.backend.unary(src_backend, op) catch null;
         }
         errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
 
@@ -433,6 +434,7 @@ pub const Buffer = struct {
         new_dims: []const i64,
         shard_index: usize,
     ) !*Buffer {
+        if (src.element_type.byteSize() == 0) return error.UnsupportedElementType;
         if (denseByteSize(src.element_type, new_dims) != src.bytes.len) return error.ShapeMismatch;
 
         const buffer = try allocator.create(Buffer);
@@ -444,7 +446,7 @@ pub const Buffer = struct {
         const bytes = try allocator.dupe(u8, src.bytes);
         errdefer allocator.free(bytes);
 
-        const backend_buffer = try src.backend.reshape(src.device.local_hardware_id, src.element_type, src.bytes, new_dims);
+        const backend_buffer = src.backend.reshape(src.device.local_hardware_id, src.element_type, src.bytes, new_dims) catch null;
         errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
 
         buffer.* = .{
@@ -508,7 +510,7 @@ pub const Buffer = struct {
 
         var backend_buffer: ?backend_api.BufferHandle = null;
         if (src.backend_buffer) |src_backend| {
-            backend_buffer = try src.backend.transpose(src_backend, permutation);
+            backend_buffer = src.backend.transpose(src_backend, permutation) catch null;
         }
         errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
 
@@ -574,7 +576,7 @@ pub const Buffer = struct {
 
         var backend_buffer: ?backend_api.BufferHandle = null;
         if (src.backend_buffer) |src_backend| {
-            backend_buffer = try src.backend.broadcastInDim(src_backend, broadcast_dimensions, output_dims);
+            backend_buffer = src.backend.broadcastInDim(src_backend, broadcast_dimensions, output_dims) catch null;
         }
         errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
 
@@ -641,7 +643,7 @@ pub const Buffer = struct {
 
         var backend_buffer: ?backend_api.BufferHandle = null;
         if (src.backend_buffer) |src_backend| {
-            backend_buffer = try src.backend.slice(src_backend, start_indices, limit_indices, strides_, output_dims);
+            backend_buffer = src.backend.slice(src_backend, start_indices, limit_indices, strides_, output_dims) catch null;
         }
         errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
 
@@ -723,7 +725,7 @@ pub const Buffer = struct {
 
         var backend_buffer: ?backend_api.BufferHandle = null;
         if (lhs.backend_buffer != null and rhs.backend_buffer != null) {
-            backend_buffer = try lhs.backend.concatenate(lhs.backend_buffer.?, rhs.backend_buffer.?, dimension, output_dims);
+            backend_buffer = lhs.backend.concatenate(lhs.backend_buffer.?, rhs.backend_buffer.?, dimension, output_dims) catch null;
         }
         errdefer if (backend_buffer) |owned| lhs.backend.destroyBuffer(owned);
 
@@ -737,6 +739,203 @@ pub const Buffer = struct {
             .memory_id = lhs.memory_id,
             .device = lhs.device,
             .memory = lhs.memory,
+            .shard_index = shard_index,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer;
+    }
+
+    pub fn initDotGeneral(
+        allocator: std.mem.Allocator,
+        lhs: *Buffer,
+        rhs: *Buffer,
+        lhs_batch_dimensions: []const i64,
+        rhs_batch_dimensions: []const i64,
+        lhs_contracting_dimensions: []const i64,
+        rhs_contracting_dimensions: []const i64,
+        output_dims: []const i64,
+        shard_index: usize,
+    ) !*Buffer {
+        if (lhs.element_type != .f32 or rhs.element_type != .f32) return error.UnsupportedElementType;
+        if (!validDotGeneral(lhs.dims, rhs.dims, lhs_batch_dimensions, rhs_batch_dimensions, lhs_contracting_dimensions, rhs_contracting_dimensions, output_dims)) return error.ShapeMismatch;
+
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+
+        const dims = try allocator.dupe(i64, output_dims);
+        errdefer allocator.free(dims);
+
+        const output_byte_size = denseByteSize(.f32, output_dims);
+        const bytes = try allocator.alloc(u8, output_byte_size);
+        errdefer allocator.free(bytes);
+
+        try evalDotGeneralF32(allocator, lhs.bytes, lhs.dims, rhs.bytes, rhs.dims, lhs_batch_dimensions, rhs_batch_dimensions, lhs_contracting_dimensions, rhs_contracting_dimensions, output_dims, bytes);
+
+        var backend_buffer: ?backend_api.BufferHandle = null;
+        if (lhs.backend_buffer != null and rhs.backend_buffer != null) {
+            backend_buffer = lhs.backend.dotGeneral(lhs.backend_buffer.?, rhs.backend_buffer.?, lhs_batch_dimensions, rhs_batch_dimensions, lhs_contracting_dimensions, rhs_contracting_dimensions, output_dims) catch null;
+        }
+        errdefer if (backend_buffer) |owned| lhs.backend.destroyBuffer(owned);
+
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = lhs.backend,
+            .backend_kind = lhs.backend_kind,
+            .element_type = .f32,
+            .dims = dims,
+            .device_id = lhs.device_id,
+            .memory_id = lhs.memory_id,
+            .device = lhs.device,
+            .memory = lhs.memory,
+            .shard_index = shard_index,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer;
+    }
+
+    pub fn initReduce(
+        allocator: std.mem.Allocator,
+        kind: core.PlanInstructionKind,
+        src: *Buffer,
+        dimensions: []const i64,
+        output_dims: []const i64,
+        shard_index: usize,
+    ) !*Buffer {
+        if (src.element_type != .f32) return error.UnsupportedElementType;
+        if (kind != .reduce_sum and kind != .reduce_max) return error.UnsupportedElementType;
+        if (!validReduce(src.dims, dimensions, output_dims)) return error.ShapeMismatch;
+
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+
+        const dims = try allocator.dupe(i64, output_dims);
+        errdefer allocator.free(dims);
+
+        const output_byte_size = denseByteSize(.f32, output_dims);
+        const bytes = try allocator.alloc(u8, output_byte_size);
+        errdefer allocator.free(bytes);
+
+        try evalReduceF32(allocator, kind, src.bytes, src.dims, dimensions, output_dims, bytes);
+
+        var backend_buffer: ?backend_api.BufferHandle = null;
+        if (src.backend_buffer) |src_backend| {
+            backend_buffer = src.backend.reduce(src_backend, kind, dimensions, output_dims) catch null;
+        }
+        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
+
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = src.backend,
+            .backend_kind = src.backend_kind,
+            .element_type = .f32,
+            .dims = dims,
+            .device_id = src.device_id,
+            .memory_id = src.memory_id,
+            .device = src.device,
+            .memory = src.memory,
+            .shard_index = shard_index,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer;
+    }
+
+    pub fn initCompare(
+        allocator: std.mem.Allocator,
+        lhs: *Buffer,
+        rhs: *Buffer,
+        direction: CompareOp,
+        output_dims: []const i64,
+        shard_index: usize,
+    ) !*Buffer {
+        if (lhs.element_type != rhs.element_type) return error.UnsupportedElementType;
+        if (lhs.element_type != .f32) return error.UnsupportedElementType;
+        if (!std.mem.eql(i64, lhs.dims, rhs.dims) or !std.mem.eql(i64, lhs.dims, output_dims)) return error.ShapeMismatch;
+
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+
+        const dims = try allocator.dupe(i64, output_dims);
+        errdefer allocator.free(dims);
+
+        const element_count = lhs.bytes.len / 4;
+        const bytes = try allocator.alloc(u8, element_count);
+        errdefer allocator.free(bytes);
+        for (0..element_count) |i| {
+            const a = readF32LE(lhs.bytes, i);
+            const b = readF32LE(rhs.bytes, i);
+            bytes[i] = if (compareF32(a, b, direction)) 1 else 0;
+        }
+
+        var backend_buffer: ?backend_api.BufferHandle = null;
+        if (lhs.backend_buffer != null and rhs.backend_buffer != null) {
+            backend_buffer = lhs.backend.compare(lhs.backend_buffer.?, rhs.backend_buffer.?, direction, output_dims) catch null;
+        }
+        errdefer if (backend_buffer) |owned| lhs.backend.destroyBuffer(owned);
+
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = lhs.backend,
+            .backend_kind = lhs.backend_kind,
+            .element_type = .pred,
+            .dims = dims,
+            .device_id = lhs.device_id,
+            .memory_id = lhs.memory_id,
+            .device = lhs.device,
+            .memory = lhs.memory,
+            .shard_index = shard_index,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer;
+    }
+
+    pub fn initSelect(
+        allocator: std.mem.Allocator,
+        pred: *Buffer,
+        on_true: *Buffer,
+        on_false: *Buffer,
+        output_dims: []const i64,
+        shard_index: usize,
+    ) !*Buffer {
+        if (pred.element_type != .pred) return error.UnsupportedElementType;
+        if (on_true.element_type != on_false.element_type) return error.UnsupportedElementType;
+        if (!std.mem.eql(i64, on_true.dims, on_false.dims) or !std.mem.eql(i64, on_true.dims, output_dims) or !std.mem.eql(i64, pred.dims, output_dims)) return error.ShapeMismatch;
+        const element_size = on_true.element_type.byteSize();
+        if (element_size == 0) return error.UnsupportedElementType;
+
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+
+        const dims = try allocator.dupe(i64, output_dims);
+        errdefer allocator.free(dims);
+
+        const bytes = try allocator.alloc(u8, on_true.bytes.len);
+        errdefer allocator.free(bytes);
+        const element_count = on_true.bytes.len / element_size;
+        for (0..element_count) |i| {
+            const src = if (pred.bytes[i] != 0) on_true.bytes else on_false.bytes;
+            @memcpy(bytes[i * element_size ..][0..element_size], src[i * element_size ..][0..element_size]);
+        }
+
+        var backend_buffer: ?backend_api.BufferHandle = null;
+        if (pred.backend_buffer != null and on_true.backend_buffer != null and on_false.backend_buffer != null) {
+            backend_buffer = on_true.backend.select(pred.backend_buffer.?, on_true.backend_buffer.?, on_false.backend_buffer.?, output_dims) catch null;
+        }
+        errdefer if (backend_buffer) |owned| on_true.backend.destroyBuffer(owned);
+
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = on_true.backend,
+            .backend_kind = on_true.backend_kind,
+            .element_type = on_true.element_type,
+            .dims = dims,
+            .device_id = on_true.device_id,
+            .memory_id = on_true.memory_id,
+            .device = on_true.device,
+            .memory = on_true.memory,
             .shard_index = shard_index,
             .bytes = bytes,
             .backend_buffer = backend_buffer,
@@ -840,6 +1039,54 @@ fn validConcatenate(lhs_dims: []const i64, rhs_dims: []const i64, dimension: i64
     return true;
 }
 
+fn validDotGeneral(
+    lhs_dims: []const i64,
+    rhs_dims: []const i64,
+    lhs_batch_dimensions: []const i64,
+    rhs_batch_dimensions: []const i64,
+    lhs_contracting_dimensions: []const i64,
+    rhs_contracting_dimensions: []const i64,
+    output_dims: []const i64,
+) bool {
+    if (lhs_contracting_dimensions.len != 1 or rhs_contracting_dimensions.len != 1) return false;
+    if (lhs_batch_dimensions.len != rhs_batch_dimensions.len) return false;
+    const lhs_contract: usize = if (lhs_contracting_dimensions[0] < 0) return false else @intCast(lhs_contracting_dimensions[0]);
+    const rhs_contract: usize = if (rhs_contracting_dimensions[0] < 0) return false else @intCast(rhs_contracting_dimensions[0]);
+    if (lhs_contract >= lhs_dims.len or rhs_contract >= rhs_dims.len) return false;
+    if (lhs_dims[lhs_contract] != rhs_dims[rhs_contract]) return false;
+    for (lhs_batch_dimensions, rhs_batch_dimensions) |lhs_axis_i64, rhs_axis_i64| {
+        if (lhs_axis_i64 < 0 or rhs_axis_i64 < 0) return false;
+        const lhs_axis: usize = @intCast(lhs_axis_i64);
+        const rhs_axis: usize = @intCast(rhs_axis_i64);
+        if (lhs_axis >= lhs_dims.len or rhs_axis >= rhs_dims.len or lhs_dims[lhs_axis] != rhs_dims[rhs_axis]) return false;
+    }
+    return denseByteSize(.f32, output_dims) != 0;
+}
+
+fn validReduce(input_dims: []const i64, dimensions: []const i64, output_dims: []const i64) bool {
+    var reduced = [_]bool{false} ** 64;
+    if (input_dims.len > reduced.len) return false;
+    for (dimensions) |dim_i64| {
+        if (dim_i64 < 0 or dim_i64 >= @as(i64, @intCast(input_dims.len))) return false;
+        const dim: usize = @intCast(dim_i64);
+        if (reduced[dim]) return false;
+        reduced[dim] = true;
+    }
+    var expected_rank: usize = 0;
+    for (0..input_dims.len) |axis| {
+        if (!reduced[axis]) expected_rank += 1;
+    }
+    if (output_dims.len != expected_rank) return false;
+    var out_axis: usize = 0;
+    for (input_dims, 0..) |dim, axis| {
+        if (!reduced[axis]) {
+            if (output_dims[out_axis] != dim) return false;
+            out_axis += 1;
+        }
+    }
+    return true;
+}
+
 fn rowMajorStrides(allocator: std.mem.Allocator, dims: []const i64) ![]usize {
     const strides = try allocator.alloc(usize, dims.len);
     var stride: usize = 1;
@@ -862,6 +1109,136 @@ fn unravelIndex(index: usize, dims: []const i64, strides: []const usize, out: []
 
 fn readF32LE(bytes: []const u8, index: usize) f32 {
     return @bitCast(std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little));
+}
+
+fn writeF32LE(bytes: []u8, index: usize, value: f32) void {
+    std.mem.writeInt(u32, bytes[index * 4 ..][0..4], @bitCast(value), .little);
+}
+
+fn compareF32(lhs: f32, rhs: f32, direction: CompareOp) bool {
+    return switch (direction) {
+        .eq => lhs == rhs,
+        .ne => lhs != rhs,
+        .ge => lhs >= rhs,
+        .gt => lhs > rhs,
+        .le => lhs <= rhs,
+        .lt => lhs < rhs,
+    };
+}
+
+fn axisInList(axis: usize, axes: []const i64) bool {
+    for (axes) |candidate| {
+        if (candidate >= 0 and @as(usize, @intCast(candidate)) == axis) return true;
+    }
+    return false;
+}
+
+fn outputAxesWithout(input_rank: usize, removed_axes: []const i64, allocator: std.mem.Allocator) ![]usize {
+    var axes = try allocator.alloc(usize, input_rank - removed_axes.len);
+    var out: usize = 0;
+    for (0..input_rank) |axis| {
+        if (!axisInList(axis, removed_axes)) {
+            axes[out] = axis;
+            out += 1;
+        }
+    }
+    return axes;
+}
+
+fn evalReduceF32(
+    allocator: std.mem.Allocator,
+    kind: core.PlanInstructionKind,
+    src_bytes: []const u8,
+    input_dims: []const i64,
+    dimensions: []const i64,
+    output_dims: []const i64,
+    out_bytes: []u8,
+) !void {
+    const input_strides = try rowMajorStrides(allocator, input_dims);
+    defer allocator.free(input_strides);
+    const output_strides = try rowMajorStrides(allocator, output_dims);
+    defer allocator.free(output_strides);
+    const coords = try allocator.alloc(usize, input_dims.len);
+    defer allocator.free(coords);
+    const output_axes = try outputAxesWithout(input_dims.len, dimensions, allocator);
+    defer allocator.free(output_axes);
+
+    const output_count = if (output_dims.len == 0) 1 else denseByteSize(.f32, output_dims) / 4;
+    for (0..output_count) |i| {
+        writeF32LE(out_bytes, i, if (kind == .reduce_sum) 0.0 else -std.math.inf(f32));
+    }
+    const input_count = src_bytes.len / 4;
+    for (0..input_count) |input_index| {
+        unravelIndex(input_index, input_dims, input_strides, coords);
+        var output_index: usize = 0;
+        for (output_axes, 0..) |input_axis, output_axis| {
+            output_index += coords[input_axis] * output_strides[output_axis];
+        }
+        const current = readF32LE(out_bytes, output_index);
+        const value = readF32LE(src_bytes, input_index);
+        writeF32LE(out_bytes, output_index, if (kind == .reduce_sum) current + value else @max(current, value));
+    }
+}
+
+fn evalDotGeneralF32(
+    allocator: std.mem.Allocator,
+    lhs_bytes: []const u8,
+    lhs_dims: []const i64,
+    rhs_bytes: []const u8,
+    rhs_dims: []const i64,
+    lhs_batch_dimensions: []const i64,
+    rhs_batch_dimensions: []const i64,
+    lhs_contracting_dimensions: []const i64,
+    rhs_contracting_dimensions: []const i64,
+    output_dims: []const i64,
+    out_bytes: []u8,
+) !void {
+    const lhs_contract: usize = @intCast(lhs_contracting_dimensions[0]);
+    const rhs_contract: usize = @intCast(rhs_contracting_dimensions[0]);
+    const lhs_strides = try rowMajorStrides(allocator, lhs_dims);
+    defer allocator.free(lhs_strides);
+    const rhs_strides = try rowMajorStrides(allocator, rhs_dims);
+    defer allocator.free(rhs_strides);
+    const out_strides = try rowMajorStrides(allocator, output_dims);
+    defer allocator.free(out_strides);
+    const out_coords = try allocator.alloc(usize, output_dims.len);
+    defer allocator.free(out_coords);
+
+    const lhs_free_axes = try outputAxesWithout(lhs_dims.len, lhs_contracting_dimensions, allocator);
+    defer allocator.free(lhs_free_axes);
+    const rhs_free_axes = try outputAxesWithout(rhs_dims.len, rhs_contracting_dimensions, allocator);
+    defer allocator.free(rhs_free_axes);
+    const batch_count = lhs_batch_dimensions.len;
+    const lhs_non_batch_count = lhs_free_axes.len - batch_count;
+    const rhs_non_batch_count = rhs_free_axes.len - batch_count;
+    const contract_size: usize = @intCast(lhs_dims[lhs_contract]);
+    const output_count = out_bytes.len / 4;
+
+    for (0..output_count) |out_index| {
+        unravelIndex(out_index, output_dims, out_strides, out_coords);
+        var lhs_base: usize = 0;
+        var rhs_base: usize = 0;
+        var out_axis: usize = 0;
+        for (0..batch_count) |i| {
+            const coord = out_coords[out_axis];
+            lhs_base += coord * lhs_strides[@intCast(lhs_batch_dimensions[i])];
+            rhs_base += coord * rhs_strides[@intCast(rhs_batch_dimensions[i])];
+            out_axis += 1;
+        }
+        for (lhs_free_axes[batch_count..], 0..) |lhs_axis, i| {
+            lhs_base += out_coords[out_axis + i] * lhs_strides[lhs_axis];
+        }
+        out_axis += lhs_non_batch_count;
+        for (rhs_free_axes[batch_count..], 0..) |rhs_axis, i| {
+            rhs_base += out_coords[out_axis + i] * rhs_strides[rhs_axis];
+        }
+        _ = rhs_non_batch_count;
+        var acc: f32 = 0.0;
+        for (0..contract_size) |k| {
+            acc += readF32LE(lhs_bytes, lhs_base + k * lhs_strides[lhs_contract]) * readF32LE(rhs_bytes, rhs_base + k * rhs_strides[rhs_contract]);
+        }
+        writeF32LE(out_bytes, out_index, acc);
+    }
 }
 
 fn syntheticBackendForTest() backend_api.Backend {

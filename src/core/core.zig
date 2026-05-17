@@ -62,6 +62,15 @@ pub const ElementwiseUnaryOp = enum {
     rsqrt,
 };
 
+pub const CompareOp = enum {
+    eq,
+    ne,
+    ge,
+    gt,
+    le,
+    lt,
+};
+
 pub const DeviceDescriptor = struct {
     id: i32,
     local_hardware_id: i32,
@@ -158,6 +167,7 @@ pub const Value = struct {
 };
 
 pub const PlanInstructionKind = enum {
+    constant,
     copy_arg0,
     add,
     subtract,
@@ -173,6 +183,11 @@ pub const PlanInstructionKind = enum {
     broadcast_in_dim,
     slice,
     concatenate,
+    dot_general,
+    reduce_sum,
+    reduce_max,
+    compare,
+    select,
     unsupported,
 };
 
@@ -187,6 +202,13 @@ pub const PlanInstruction = struct {
     limit_indices: ?[]const i64 = null,
     strides: ?[]const i64 = null,
     dimension: ?i64 = null,
+    reduce_dimensions: ?[]const i64 = null,
+    lhs_batch_dimensions: ?[]const i64 = null,
+    rhs_batch_dimensions: ?[]const i64 = null,
+    lhs_contracting_dimensions: ?[]const i64 = null,
+    rhs_contracting_dimensions: ?[]const i64 = null,
+    compare_direction: ?CompareOp = null,
+    literal: ?[]const u8 = null,
 };
 
 pub const ExecutablePlan = struct {
@@ -195,6 +217,7 @@ pub const ExecutablePlan = struct {
     values: []Value = &.{},
     parameter_shardings: []ShardingPlan,
     output_shardings: []ShardingPlan,
+    output_ids: []const ValueId = &.{},
     instructions: []PlanInstruction,
 
     pub fn deinit(self: *ExecutablePlan) void {
@@ -216,6 +239,12 @@ pub const ExecutablePlan = struct {
             if (instruction.start_indices) |start_indices| self.allocator.free(start_indices);
             if (instruction.limit_indices) |limit_indices| self.allocator.free(limit_indices);
             if (instruction.strides) |strides| self.allocator.free(strides);
+            if (instruction.reduce_dimensions) |reduce_dimensions| self.allocator.free(reduce_dimensions);
+            if (instruction.lhs_batch_dimensions) |dims| self.allocator.free(dims);
+            if (instruction.rhs_batch_dimensions) |dims| self.allocator.free(dims);
+            if (instruction.lhs_contracting_dimensions) |dims| self.allocator.free(dims);
+            if (instruction.rhs_contracting_dimensions) |dims| self.allocator.free(dims);
+            if (instruction.literal) |literal| self.allocator.free(literal);
         }
         for (self.values) |value| {
             if (value.descriptor.dims.len != 0) self.allocator.free(value.descriptor.dims);
@@ -223,6 +252,7 @@ pub const ExecutablePlan = struct {
         if (self.values.len != 0) self.allocator.free(self.values);
         self.allocator.free(self.parameter_shardings);
         self.allocator.free(self.output_shardings);
+        self.allocator.free(self.output_ids);
         self.allocator.free(self.instructions);
     }
 };

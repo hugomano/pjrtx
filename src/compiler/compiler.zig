@@ -206,13 +206,13 @@ fn addPipeline(
     var buffer: [4096]u8 = undefined;
     var scratch = std.Io.Writer.fixed(&buffer);
     var ctx: MlirStringCallbackCtx = .{ .writer = &scratch };
-    const result = mlir.mlirOpPassManagerAddPipeline(
+    const ok = mlir.pjrtxMlirOpPassManagerAddPipelineSucceeded(
         op_pass_manager,
         mlirStringRef(pipeline),
         writeMlirCallback,
         &ctx,
     );
-    if (ctx.err != null or !mlir.mlirLogicalResultIsSuccess(result)) {
+    if (ctx.err != null or !ok) {
         try writer.print("invalid StableHLO module: failed to construct MLIR pass pipeline {s}", .{pipeline});
         const detail = scratch.buffered();
         if (detail.len != 0) try writer.print(": {s}", .{detail});
@@ -265,7 +265,7 @@ fn operationUsesShardy(op: mlir.MlirOperation) bool {
     return false;
 }
 
-fn parseAndRunMlirWithCapi(module_text: []const u8, writer: *std.Io.Writer) AnalyzeError!MlirSession {
+fn createMlirSession(writer: *std.Io.Writer) AnalyzeError!MlirSession {
     const registry = mlir.mlirDialectRegistryCreate();
     if (mlir.mlirDialectRegistryIsNull(registry)) {
         try writer.writeAll("invalid StableHLO module: failed to create MLIR dialect registry");
@@ -302,12 +302,10 @@ fn parseAndRunMlirWithCapi(module_text: []const u8, writer: *std.Io.Writer) Anal
     try loadDialect(context, mlir.mlirGetDialectHandle__sdy__());
     try loadDialect(context, mlir.mlirGetDialectHandle__stablehlo__());
 
-    session.module = mlir.mlirModuleCreateParse(context, mlirStringRef(module_text));
-    if (mlir.mlirModuleIsNull(session.module)) {
-        try writer.writeAll("invalid StableHLO module: MLIR parser rejected module");
-        return error.InvalidStablehloModule;
-    }
+    return session;
+}
 
+fn runMlirCanonicalization(session: *MlirSession, writer: *std.Io.Writer) AnalyzeError!void {
     const op = mlir.mlirModuleGetOperation(session.module);
     if (!mlir.mlirOperationVerify(op)) {
         try writer.writeAll("invalid StableHLO module: MLIR verifier rejected module");
@@ -318,7 +316,7 @@ fn parseAndRunMlirWithCapi(module_text: []const u8, writer: *std.Io.Writer) Anal
     registerTransformPassesOnce();
     if (uses_shardy) registerShardyPassesOnce();
 
-    session.pass_manager = mlir.mlirPassManagerCreate(context);
+    session.pass_manager = mlir.mlirPassManagerCreate(session.context);
     if (mlir.mlirPassManagerIsNull(session.pass_manager)) {
         try writer.writeAll("invalid StableHLO module: failed to create MLIR pass manager");
         return error.InvalidStablehloModule;
@@ -334,8 +332,49 @@ fn parseAndRunMlirWithCapi(module_text: []const u8, writer: *std.Io.Writer) Anal
         try writer.writeAll("invalid StableHLO module: MLIR pass pipeline failed");
         return error.InvalidStablehloModule;
     }
+}
 
+fn parseAndRunMlirWithCapi(module_text: []const u8, writer: *std.Io.Writer) AnalyzeError!MlirSession {
+    var session = try createMlirSession(writer);
+    errdefer session.deinit();
+
+    session.module = mlir.mlirModuleCreateParse(session.context, mlirStringRef(module_text));
+    if (mlir.mlirModuleIsNull(session.module)) {
+        try writer.writeAll("invalid StableHLO module: MLIR parser rejected module");
+        return error.InvalidStablehloModule;
+    }
+
+    try runMlirCanonicalization(&session, writer);
     return session;
+}
+
+fn deserializeStablehloPortableArtifactWithCapi(artifact: []const u8, writer: *std.Io.Writer) AnalyzeError!MlirSession {
+    var session = try createMlirSession(writer);
+    errdefer session.deinit();
+
+    session.module = mlir.stablehloDeserializePortableArtifactNoError(mlirStringRef(artifact), session.context);
+    if (mlir.mlirModuleIsNull(session.module)) {
+        try writer.writeAll("invalid StableHLO module: StableHLO portable artifact deserialization failed");
+        return error.InvalidStablehloModule;
+    }
+
+    try runMlirCanonicalization(&session, writer);
+    return session;
+}
+
+fn writeModuleText(session: MlirSession, writer: *std.Io.Writer) AnalyzeError!void {
+    var ctx: MlirStringCallbackCtx = .{ .writer = writer };
+    mlir.mlirOperationPrint(mlir.mlirModuleGetOperation(session.module), writeMlirCallback, &ctx);
+    if (ctx.err != null) return error.WriteFailed;
+}
+
+fn isLikelyTextMlir(source: []const u8) bool {
+    for (source[0..@min(source.len, 256)]) |byte| {
+        if (byte == 0) return false;
+        if (byte < 0x09) return false;
+        if (byte > 0x0d and byte < 0x20) return false;
+    }
+    return true;
 }
 
 pub const ShardingPlan = core.ShardingPlan;
@@ -1509,14 +1548,20 @@ pub fn analyzeProgramFromReader(
         try diagnostic_writer.print("unsupported program format: {s}", .{format_text});
         return error.UnsupportedProgramFormat;
     }
-    if (format == .stablehlo_bytecode) {
-        try diagnostic_writer.writeAll("unsupported program encoding: StableHLO bytecode deserialization is not wired in milestone 1");
-        return error.UnsupportedProgramEncoding;
-    }
 
-    const source = try program_reader.allocRemaining(allocator, .limited(64 * 1024 * 1024));
+    var source = try program_reader.allocRemaining(allocator, .limited(64 * 1024 * 1024));
     errdefer allocator.free(source);
-    var session = try parseAndRunMlirWithCapi(source, diagnostic_writer);
+    const use_portable_artifact = format == .stablehlo_bytecode or !isLikelyTextMlir(source);
+    var session = if (use_portable_artifact) blk: {
+        const artifact = source;
+        var deserialized_text = std.Io.Writer.Allocating.init(allocator);
+        errdefer deserialized_text.deinit();
+        const deserialized = try deserializeStablehloPortableArtifactWithCapi(artifact, diagnostic_writer);
+        try writeModuleText(deserialized, &deserialized_text.writer);
+        source = try deserialized_text.toOwnedSlice();
+        allocator.free(artifact);
+        break :blk deserialized;
+    } else try parseAndRunMlirWithCapi(source, diagnostic_writer);
     defer session.deinit();
     return analyzeMlirSessionWithCapi(allocator, source, session, diagnostic_writer);
 }
@@ -1906,14 +1951,14 @@ test "analyze stablehlo text reports unsupported op with location dtype rank and
     try std.testing.expect(std.mem.indexOf(u8, text, "sharding=sdy.sharding_per_value") != null);
 }
 
-test "analyze stablehlo bytecode is a precise unsupported encoding" {
-    var reader: std.Io.Reader = .fixed("MLIR bytecode placeholder");
+test "analyze stablehlo bytecode reports deserialization failures precisely" {
+    var reader: std.Io.Reader = .fixed("\x00not-a-stablehlo-portable-artifact");
     var diagnostics = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer diagnostics.deinit();
 
     try std.testing.expectError(
-        error.UnsupportedProgramEncoding,
+        error.InvalidStablehloModule,
         analyzeProgramFromReader(std.testing.allocator, "stablehlo_bytecode", &reader, &diagnostics.writer),
     );
-    try std.testing.expect(std.mem.indexOf(u8, diagnostics.writer.buffered(), "bytecode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.writer.buffered(), "portable artifact deserialization failed") != null);
 }

@@ -1,0 +1,28 @@
+load("@rules_python//python/uv:lock.bzl", uv_lock = "lock")
+load("@rules_python//python:py_binary.bzl", "py_binary")
+load("@rules_python//python:py_test.bzl", "py_test")
+
+py_binary(
+    name = "jax_plugin_smoke",
+    srcs = ["jax_plugin_smoke.py"],
+    data = ["//src/plugin:pjrtx_metal_plugin"],
+    main = "jax_plugin_smoke.py",
+    deps = ["@jax_sandbox_deps//jax:pkg"],
+)
+
+py_test(
+    name = "jax_plugin_smoke_test",
+    srcs = ["jax_plugin_smoke.py"],
+    data = ["//src/plugin:pjrtx_metal_plugin"],
+    main = "jax_plugin_smoke.py",
+    tags = ["manual"],
+    deps = ["@jax_sandbox_deps//jax:pkg"],
+)
+
+uv_lock(
+    name = "requirements",
+    srcs = ["requirements.in"],
+    out = "requirements.lock.txt",
+    args = ["--upgrade"],
+    tags = ["manual"],
+)

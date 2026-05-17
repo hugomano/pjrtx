@@ -14,13 +14,20 @@
 #include "shardy/integrations/c/passes.h"
 #include "stablehlo/integrations/c/ChloDialect.h"
 #include "stablehlo/integrations/c/StablehloDialect.h"
+#include "stablehlo/integrations/c/StablehloDialectApi.h"
 
 #ifdef __cplusplus
 extern "C" void mlirRegisterFuncExtensions(MlirDialectRegistry registry);
+extern "C" bool pjrtxMlirOpPassManagerAddPipelineSucceeded(
+    MlirOpPassManager op_pass_manager, MlirStringRef pipeline,
+    MlirStringCallback callback, void *user_data);
 extern "C" bool pjrtxMlirPassManagerRunOnOpSucceeded(
     MlirPassManager pass_manager, MlirOperation op);
 #else
 void mlirRegisterFuncExtensions(MlirDialectRegistry registry);
+bool pjrtxMlirOpPassManagerAddPipelineSucceeded(
+    MlirOpPassManager op_pass_manager, MlirStringRef pipeline,
+    MlirStringCallback callback, void *user_data);
 bool pjrtxMlirPassManagerRunOnOpSucceeded(MlirPassManager pass_manager,
                                           MlirOperation op);
 #endif

@@ -12,6 +12,34 @@ bazel test //...
 bazel build //src/plugin:pjrtx_metal_plugin
 ```
 
+## JAX Sandbox
+
+The first JAX-facing sandbox is split into two targets:
+
+```sh
+bazel test //tests/pjrt:plugin_ctypes_smoke_test
+bazel build //tests/jax:jax_plugin_smoke
+```
+
+`//tests/pjrt:plugin_ctypes_smoke_test` runs in the Bazel macOS sandbox, loads
+the plugin dylib, and verifies `GetPjrtApi` is exported.
+`//tests/jax:jax_plugin_smoke` registers the same dylib with JAX as the `pjrtx`
+backend and runs a tiny `jax.jit` add program through JAX's normal PJRT plugin
+path. The hermetic Python graph pins `jax` and `jaxlib`.
+
+```sh
+bazel run //tests/jax:jax_plugin_smoke
+# or, as an explicit manual test:
+bazel test //tests/jax:jax_plugin_smoke_test --test_output=streamed
+```
+
+The runner defaults to the synthetic backend so it can shake out PJRT/JAX ABI
+behavior before depending on physical Metal availability:
+
+```sh
+PJRTX_BACKEND=synthetic PJRTX_SYNTHETIC_DEVICE_COUNT=1 bazel run //tests/jax:jax_plugin_smoke
+```
+
 The default `.bazelrc` uses:
 
 ```sh
@@ -151,7 +179,9 @@ DMA copies, or library calls without pretending every op is a buffer allocation.
   MLIR DenseI64ArrayAttr, and concatenate dimensions from MLIR integer
   attributes), and emits precise diagnostics
   through `std.Io.Writer` for unsupported ops, GSPMD shardings, CHLO/shape
-  interop, and unsupported StableHLO bytecode. The transform path is back on:
+  interop, and invalid StableHLO portable artifacts. JAX-provided VHLO/StableHLO
+  portable artifacts are deserialized at the StableHLO frontend boundary before
+  later PjRTx-owned compiler stages run. The transform path is back on:
   Shardy propagation is gated on Shardy usage, then canonicalize/CSE/canonicalize
   runs through the MLIR pass manager.
 - `src/plugin`: Zig shared library exporting `GetPjrtApi` and a PJRT API table

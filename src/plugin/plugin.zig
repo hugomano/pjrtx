@@ -15,6 +15,7 @@ const plugin_name = "PjRTx";
 const stablehlo_version = [_]i64{ 1, 0, 0 };
 const synthetic_device_count_option = "pjrtx_synthetic_device_count";
 const backend_option = "pjrtx_backend";
+const default_memory_kind = "device";
 
 const PjrtxError = struct {
     base: c.PJRT_Error,
@@ -31,17 +32,42 @@ const DeviceAttributes = struct {
     attrs: [5]c.PJRT_NamedValue,
 };
 
+const SerializedTopology = struct {
+    bytes: []u8,
+};
+
 const Executable = struct {
     client: *runtime.Client,
     plan: compiler.ExecutablePlan,
+    logical_ids: []c.PJRT_LogicalDeviceIds,
+    optimized_program: []u8,
+    parameter_memory_kinds: [][*c]const u8,
+    parameter_memory_kind_sizes: []usize,
+    output_memory_kinds: [][*c]const u8,
+    output_memory_kind_sizes: []usize,
+    fingerprint: []u8,
     name: []const u8 = "pjrtx_executable",
     deleted: bool = false,
 
     fn deinit(self: *Executable) void {
+        allocator.free(self.fingerprint);
+        allocator.free(self.output_memory_kind_sizes);
+        allocator.free(self.output_memory_kinds);
+        allocator.free(self.parameter_memory_kind_sizes);
+        allocator.free(self.parameter_memory_kinds);
+        allocator.free(self.optimized_program);
+        allocator.free(self.logical_ids);
         self.plan.deinit();
         allocator.destroy(self);
     }
 };
+
+fn fillMemoryKindArrays(kinds: [][*c]const u8, sizes: []usize) void {
+    for (kinds, sizes) |*kind, *size| {
+        kind.* = default_memory_kind.ptr;
+        size.* = default_memory_kind.len;
+    }
+}
 
 var api_storage: c.PJRT_Api = undefined;
 var api_ready = false;
@@ -143,6 +169,10 @@ fn executableFromC(executable: ?*c.PJRT_LoadedExecutable) *Executable {
     return @ptrCast(@alignCast(executable.?));
 }
 
+fn topologyFromC(topology: ?*const c.PJRT_TopologyDescription) *runtime.Client {
+    return @ptrCast(@alignCast(@constCast(topology.?)));
+}
+
 fn initAttrs() void {
     if (attrs_ready) return;
     attrs = std.mem.zeroes(@TypeOf(attrs));
@@ -227,6 +257,17 @@ fn clientCreateConfigFromArgs(args: c.PJRT_Client_Create_Args) !ClientCreateConf
     return config;
 }
 
+fn isPjrtxTextCompileOptions(text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (text) |byte| {
+        if (!(std.ascii.isPrint(byte) or std.ascii.isWhitespace(byte))) return false;
+    }
+    return std.mem.indexOf(u8, text, "replicas=") != null or
+        std.mem.indexOf(u8, text, "partitions=") != null or
+        std.mem.indexOf(u8, text, "assignment=") != null or
+        std.mem.indexOf(u8, text, "use_shardy=") != null;
+}
+
 fn pjrtErrorDestroy(args: [*c]c.PJRT_Error_Destroy_Args) callconv(.c) void {
     if (args[0].@"error") |base| {
         const err: *PjrtxError = @ptrCast(@alignCast(base));
@@ -244,6 +285,10 @@ fn pjrtErrorMessage(args: [*c]c.PJRT_Error_Message_Args) callconv(.c) void {
 fn pjrtErrorGetCode(args: [*c]c.PJRT_Error_GetCode_Args) callconv(.c) ?*c.PJRT_Error {
     const err: *const PjrtxError = @ptrCast(@alignCast(args[0].@"error".?));
     args[0].code = err.code;
+    return null;
+}
+
+fn pjrtErrorForEachPayload(_: [*c]c.PJRT_Error_ForEachPayload_Args) callconv(.c) ?*c.PJRT_Error {
     return null;
 }
 
@@ -332,6 +377,11 @@ fn pjrtClientPlatformVersion(args: [*c]c.PJRT_Client_PlatformVersion_Args) callc
     return null;
 }
 
+fn pjrtClientTopologyDescription(args: [*c]c.PJRT_Client_TopologyDescription_Args) callconv(.c) ?*c.PJRT_Error {
+    args[0].topology = @ptrCast(clientFromC(args[0].client));
+    return null;
+}
+
 fn pjrtClientDevices(args: [*c]c.PJRT_Client_Devices_Args) callconv(.c) ?*c.PJRT_Error {
     const client = clientFromC(args[0].client);
     args[0].devices = @ptrCast(client.device_handles.ptr);
@@ -375,11 +425,13 @@ fn pjrtClientCompile(args: [*c]c.PJRT_Client_Compile_Args) callconv(.c) ?*c.PJRT
     var parsed_options = false;
     if (args[0].compile_options != null and args[0].compile_options_size != 0) {
         const text = args[0].compile_options[0..args[0].compile_options_size];
-        var options_reader: std.Io.Reader = .fixed(text);
-        options = compiler.parseTextCompileOptionsFromReader(allocator, &options_reader) catch {
-            return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "invalid PjRTx text compile options");
-        };
-        parsed_options = true;
+        if (isPjrtxTextCompileOptions(text)) {
+            var options_reader: std.Io.Reader = .fixed(text);
+            options = compiler.parseTextCompileOptionsFromReader(allocator, &options_reader) catch {
+                return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "invalid PjRTx text compile options");
+            };
+            parsed_options = true;
+        }
     }
     defer if (parsed_options) allocator.free(options.device_assignment);
 
@@ -433,8 +485,49 @@ fn pjrtClientCompile(args: [*c]c.PJRT_Client_Compile_Args) callconv(.c) ?*c.PJRT
         return makeError(code, text);
     };
 
+    const logical_ids = allocator.alloc(c.PJRT_LogicalDeviceIds, plan.options.numDevices()) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable logical device ids");
+    errdefer allocator.free(logical_ids);
+    for (logical_ids, 0..) |*id, index| {
+        id.* = .{
+            .replica = @intCast(index / @as(usize, @intCast(plan.options.num_partitions))),
+            .partition = @intCast(index % @as(usize, @intCast(plan.options.num_partitions))),
+        };
+    }
+
+    const optimized_program = if (analysis) |owned_analysis|
+        allocator.dupe(u8, owned_analysis.source) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate optimized program")
+    else
+        allocator.dupe(u8, "module {}\n") catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate optimized program");
+    errdefer allocator.free(optimized_program);
+
+    const parameter_memory_kinds = allocator.alloc([*c]const u8, plan.parameter_shardings.len) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate parameter memory kind table");
+    errdefer allocator.free(parameter_memory_kinds);
+    const parameter_memory_kind_sizes = allocator.alloc(usize, plan.parameter_shardings.len) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate parameter memory kind sizes");
+    errdefer allocator.free(parameter_memory_kind_sizes);
+    fillMemoryKindArrays(parameter_memory_kinds, parameter_memory_kind_sizes);
+
+    const output_memory_kinds = allocator.alloc([*c]const u8, plan.output_shardings.len) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate output memory kind table");
+    errdefer allocator.free(output_memory_kinds);
+    const output_memory_kind_sizes = allocator.alloc(usize, plan.output_shardings.len) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate output memory kind sizes");
+    errdefer allocator.free(output_memory_kind_sizes);
+    fillMemoryKindArrays(output_memory_kinds, output_memory_kind_sizes);
+
+    const fingerprint_value = std.hash.Wyhash.hash(0, optimized_program);
+    const fingerprint = std.fmt.allocPrint(allocator, "pjrtx-{x}", .{fingerprint_value}) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable fingerprint");
+    errdefer allocator.free(fingerprint);
+
     const executable = allocator.create(Executable) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable");
-    executable.* = .{ .client = client, .plan = plan };
+    executable.* = .{
+        .client = client,
+        .plan = plan,
+        .logical_ids = logical_ids,
+        .optimized_program = optimized_program,
+        .parameter_memory_kinds = parameter_memory_kinds,
+        .parameter_memory_kind_sizes = parameter_memory_kind_sizes,
+        .output_memory_kinds = output_memory_kinds,
+        .output_memory_kind_sizes = output_memory_kind_sizes,
+        .fingerprint = fingerprint,
+    };
     args[0].executable = @ptrCast(executable);
     return null;
 }
@@ -461,6 +554,97 @@ fn pjrtClientBufferFromHostBuffer(args: [*c]c.PJRT_Client_BufferFromHostBuffer_A
     };
     args[0].buffer = @ptrCast(buffer);
     args[0].done_with_host_buffer = eventCreateReady();
+    return null;
+}
+
+fn topologyDescriptionCreate(_: [*c]c.PJRT_TopologyDescription_Create_Args) callconv(.c) ?*c.PJRT_Error {
+    return unimplemented("standalone topology creation is not implemented yet");
+}
+
+fn topologyDescriptionDestroy(_: [*c]c.PJRT_TopologyDescription_Destroy_Args) callconv(.c) ?*c.PJRT_Error {
+    return null;
+}
+
+fn topologyDescriptionPlatformName(args: [*c]c.PJRT_TopologyDescription_PlatformName_Args) callconv(.c) ?*c.PJRT_Error {
+    _ = topologyFromC(args[0].topology);
+    args[0].platform_name = platform_name;
+    args[0].platform_name_size = platform_name.len;
+    return null;
+}
+
+fn topologyDescriptionPlatformVersion(args: [*c]c.PJRT_TopologyDescription_PlatformVersion_Args) callconv(.c) ?*c.PJRT_Error {
+    _ = topologyFromC(args[0].topology);
+    args[0].platform_version = platform_version;
+    args[0].platform_version_size = platform_version.len;
+    return null;
+}
+
+fn topologyDescriptionGetDeviceDescriptions(args: [*c]c.PJRT_TopologyDescription_GetDeviceDescriptions_Args) callconv(.c) ?*c.PJRT_Error {
+    const client = topologyFromC(args[0].topology);
+    args[0].descriptions = @ptrCast(client.device_handles.ptr);
+    args[0].num_descriptions = client.device_handles.len;
+    return null;
+}
+
+fn topologySerializedDelete(serialized_topology: ?*c.PJRT_SerializedTopology) callconv(.c) void {
+    if (serialized_topology) |opaque_topology| {
+        const topology: *SerializedTopology = @ptrCast(@alignCast(opaque_topology));
+        allocator.free(topology.bytes);
+        allocator.destroy(topology);
+    }
+}
+
+fn topologyDescriptionSerialize(args: [*c]c.PJRT_TopologyDescription_Serialize_Args) callconv(.c) ?*c.PJRT_Error {
+    const client = topologyFromC(args[0].topology);
+    var writer = std.Io.Writer.Allocating.init(allocator);
+    defer writer.deinit();
+    writer.writer.print("platform={s};version={s};devices={d}", .{ platform_name, platform_version, client.devices.len }) catch {
+        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to serialize topology");
+    };
+    for (client.devices) |device| {
+        writer.writer.print(";device={d}:{d}:{d}:{s}", .{ device.id, device.local_hardware_id, device.process_index, device.name }) catch {
+            return makeError(c.PJRT_Error_Code_INTERNAL, "failed to serialize topology");
+        };
+    }
+
+    const topology = allocator.create(SerializedTopology) catch {
+        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate serialized topology");
+    };
+    topology.* = .{ .bytes = writer.toOwnedSlice() catch {
+        allocator.destroy(topology);
+        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate serialized topology bytes");
+    } };
+
+    args[0].serialized_bytes = topology.bytes.ptr;
+    args[0].serialized_bytes_size = topology.bytes.len;
+    args[0].serialized_topology = @ptrCast(topology);
+    args[0].serialized_topology_deleter = topologySerializedDelete;
+    return null;
+}
+
+fn topologyDescriptionDeserialize(_: [*c]c.PJRT_TopologyDescription_Deserialize_Args) callconv(.c) ?*c.PJRT_Error {
+    return unimplemented("topology deserialization is not implemented yet");
+}
+
+fn topologyDescriptionAttributes(args: [*c]c.PJRT_TopologyDescription_Attributes_Args) callconv(.c) ?*c.PJRT_Error {
+    _ = topologyFromC(args[0].topology);
+    args[0].attributes = null;
+    args[0].num_attributes = 0;
+    return null;
+}
+
+fn topologyDescriptionFingerprint(args: [*c]c.PJRT_TopologyDescription_Fingerprint_Args) callconv(.c) ?*c.PJRT_Error {
+    const client = topologyFromC(args[0].topology);
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(platform_name);
+    hasher.update(platform_version);
+    for (client.devices) |device| {
+        hasher.update(std.mem.asBytes(&device.id));
+        hasher.update(std.mem.asBytes(&device.local_hardware_id));
+        hasher.update(std.mem.asBytes(&device.process_index));
+        hasher.update(device.name);
+    }
+    args[0].fingerprint = hasher.final();
     return null;
 }
 
@@ -585,7 +769,7 @@ fn deviceGetAttributes(args: [*c]c.PJRT_Device_GetAttributes_Args) callconv(.c) 
     initDeviceAttrString(&owned.attrs[0], "device_name", device.name);
     initDeviceAttrInt64(&owned.attrs[1], "pjrtx_registry_id", clampI64(device.registry_id));
     initDeviceAttrInt64(&owned.attrs[2], "pjrtx_recommended_working_set_size", clampI64(device.memory_bytes));
-    initDeviceAttrBool(&owned.attrs[3], "pjrtx_has_unified_memory", device.has_unified_memory);
+    initDeviceAttrInt64(&owned.attrs[3], "pjrtx_has_unified_memory", if (device.has_unified_memory) 1 else 0);
     initDeviceAttrInt64(&owned.attrs[4], "pjrtx_default_memory_id", device.default_memory_id);
 
     args[0].attributes = &owned.attrs;
@@ -641,8 +825,26 @@ fn loadedExecutableGetExecutable(args: [*c]c.PJRT_LoadedExecutable_GetExecutable
 
 fn loadedExecutableAddressableDevices(args: [*c]c.PJRT_LoadedExecutable_AddressableDevices_Args) callconv(.c) ?*c.PJRT_Error {
     const executable = executableFromC(args[0].executable);
-    args[0].addressable_devices = @ptrCast(executable.client.device_handles.ptr);
-    args[0].num_addressable_devices = executable.client.device_handles.len;
+    const num_devices = @min(executable.plan.options.numDevices(), executable.client.device_handles.len);
+    args[0].addressable_devices = @ptrCast(executable.client.device_handles[0..num_devices].ptr);
+    args[0].num_addressable_devices = num_devices;
+    return null;
+}
+
+fn loadedExecutableAddressableDeviceLogicalIds(args: [*c]c.PJRT_LoadedExecutable_AddressableDeviceLogicalIds_Args) callconv(.c) ?*c.PJRT_Error {
+    const executable = executableFromC(args[0].executable);
+    args[0].addressable_device_logical_ids = executable.logical_ids.ptr;
+    args[0].num_addressable_device_logical_ids = executable.logical_ids.len;
+    return null;
+}
+
+fn deviceAssignmentSerializedDeleter(_: ?*c.PJRT_DeviceAssignmentSerialized) callconv(.c) void {}
+
+fn loadedExecutableGetDeviceAssignment(args: [*c]c.PJRT_LoadedExecutable_GetDeviceAssignment_Args) callconv(.c) ?*c.PJRT_Error {
+    args[0].serialized_bytes = null;
+    args[0].serialized_bytes_size = 0;
+    args[0].serialized_device_assignment = null;
+    args[0].serialized_device_assignment_deleter = deviceAssignmentSerializedDeleter;
     return null;
 }
 
@@ -864,6 +1066,48 @@ fn executableNumOutputs(args: [*c]c.PJRT_Executable_NumOutputs_Args) callconv(.c
     return null;
 }
 
+fn executableOptimizedProgram(args: [*c]c.PJRT_Executable_OptimizedProgram_Args) callconv(.c) ?*c.PJRT_Error {
+    const executable: *Executable = @ptrCast(@alignCast(args[0].executable.?));
+    const program = args[0].program;
+    program[0].format = "mlir";
+    program[0].format_size = "mlir".len;
+    program[0].code_size = executable.optimized_program.len;
+    if (program[0].code) |code| {
+        @memcpy(code[0..executable.optimized_program.len], executable.optimized_program);
+    }
+    return null;
+}
+
+fn executableFingerprint(args: [*c]c.PJRT_Executable_Fingerprint_Args) callconv(.c) ?*c.PJRT_Error {
+    const executable: *Executable = @ptrCast(@alignCast(args[0].executable.?));
+    args[0].executable_fingerprint = executable.fingerprint.ptr;
+    args[0].executable_fingerprint_size = executable.fingerprint.len;
+    return null;
+}
+
+fn executableParameterMemoryKinds(args: [*c]c.PJRT_Executable_ParameterMemoryKinds_Args) callconv(.c) ?*c.PJRT_Error {
+    const executable: *Executable = @ptrCast(@alignCast(args[0].executable.?));
+    args[0].num_parameters = executable.parameter_memory_kinds.len;
+    args[0].memory_kinds = @ptrCast(executable.parameter_memory_kinds.ptr);
+    args[0].memory_kind_sizes = executable.parameter_memory_kind_sizes.ptr;
+    return null;
+}
+
+fn executableOutputMemoryKinds(args: [*c]c.PJRT_Executable_OutputMemoryKinds_Args) callconv(.c) ?*c.PJRT_Error {
+    const executable: *Executable = @ptrCast(@alignCast(args[0].executable.?));
+    args[0].num_outputs = executable.output_memory_kinds.len;
+    args[0].memory_kinds = @ptrCast(executable.output_memory_kinds.ptr);
+    args[0].memory_kind_sizes = executable.output_memory_kind_sizes.ptr;
+    return null;
+}
+
+fn loadedExecutableFingerprint(args: [*c]c.PJRT_LoadedExecutable_Fingerprint_Args) callconv(.c) ?*c.PJRT_Error {
+    const executable = executableFromC(args[0].executable);
+    args[0].executable_fingerprint = executable.fingerprint.ptr;
+    args[0].executable_fingerprint_size = executable.fingerprint.len;
+    return null;
+}
+
 fn bufferDestroy(args: [*c]c.PJRT_Buffer_Destroy_Args) callconv(.c) ?*c.PJRT_Error {
     if (args[0].buffer) |buffer| bufferFromC(buffer).deinit();
     return null;
@@ -893,6 +1137,19 @@ fn bufferDelete(args: [*c]c.PJRT_Buffer_Delete_Args) callconv(.c) ?*c.PJRT_Error
 
 fn bufferIsDeleted(args: [*c]c.PJRT_Buffer_IsDeleted_Args) callconv(.c) ?*c.PJRT_Error {
     args[0].is_deleted = bufferFromC(args[0].buffer).deleted;
+    return null;
+}
+
+fn bufferIsOnCpu(args: [*c]c.PJRT_Buffer_IsOnCpu_Args) callconv(.c) ?*c.PJRT_Error {
+    _ = bufferFromC(args[0].buffer);
+    args[0].is_on_cpu = false;
+    return null;
+}
+
+fn bufferDynamicDimensionIndices(args: [*c]c.PJRT_Buffer_DynamicDimensionIndices_Args) callconv(.c) ?*c.PJRT_Error {
+    _ = bufferFromC(args[0].buffer);
+    args[0].dynamic_dim_indices = null;
+    args[0].num_dynamic_dims = 0;
     return null;
 }
 
@@ -942,6 +1199,7 @@ fn initApi() void {
     api_storage.PJRT_Error_Destroy = pjrtErrorDestroy;
     api_storage.PJRT_Error_Message = pjrtErrorMessage;
     api_storage.PJRT_Error_GetCode = pjrtErrorGetCode;
+    api_storage.PJRT_Error_ForEachPayload = pjrtErrorForEachPayload;
     api_storage.PJRT_Plugin_Initialize = pjrtPluginInitialize;
     api_storage.PJRT_Plugin_Attributes = pjrtPluginAttributes;
     api_storage.PJRT_Event_Destroy = pjrtEventDestroy;
@@ -954,6 +1212,7 @@ fn initApi() void {
     api_storage.PJRT_Client_PlatformName = pjrtClientPlatformName;
     api_storage.PJRT_Client_ProcessIndex = pjrtClientProcessIndex;
     api_storage.PJRT_Client_PlatformVersion = pjrtClientPlatformVersion;
+    api_storage.PJRT_Client_TopologyDescription = pjrtClientTopologyDescription;
     api_storage.PJRT_Client_Devices = pjrtClientDevices;
     api_storage.PJRT_Client_AddressableDevices = pjrtClientAddressableDevices;
     api_storage.PJRT_Client_LookupDevice = pjrtClientLookupDevice;
@@ -962,6 +1221,15 @@ fn initApi() void {
     api_storage.PJRT_Client_Compile = pjrtClientCompile;
     api_storage.PJRT_Client_DefaultDeviceAssignment = pjrtClientDefaultDeviceAssignment;
     api_storage.PJRT_Client_BufferFromHostBuffer = pjrtClientBufferFromHostBuffer;
+    api_storage.PJRT_TopologyDescription_Create = topologyDescriptionCreate;
+    api_storage.PJRT_TopologyDescription_Destroy = topologyDescriptionDestroy;
+    api_storage.PJRT_TopologyDescription_PlatformName = topologyDescriptionPlatformName;
+    api_storage.PJRT_TopologyDescription_PlatformVersion = topologyDescriptionPlatformVersion;
+    api_storage.PJRT_TopologyDescription_GetDeviceDescriptions = topologyDescriptionGetDeviceDescriptions;
+    api_storage.PJRT_TopologyDescription_Serialize = topologyDescriptionSerialize;
+    api_storage.PJRT_TopologyDescription_Deserialize = topologyDescriptionDeserialize;
+    api_storage.PJRT_TopologyDescription_Attributes = topologyDescriptionAttributes;
+    api_storage.PJRT_TopologyDescription_Fingerprint = topologyDescriptionFingerprint;
     api_storage.PJRT_DeviceDescription_Id = deviceDescriptionId;
     api_storage.PJRT_DeviceDescription_ProcessIndex = deviceDescriptionProcessIndex;
     api_storage.PJRT_DeviceDescription_Attributes = deviceDescriptionAttributes;
@@ -985,9 +1253,16 @@ fn initApi() void {
     api_storage.PJRT_Executable_NumReplicas = executableNumReplicas;
     api_storage.PJRT_Executable_NumPartitions = executableNumPartitions;
     api_storage.PJRT_Executable_NumOutputs = executableNumOutputs;
+    api_storage.PJRT_Executable_OptimizedProgram = executableOptimizedProgram;
+    api_storage.PJRT_Executable_Fingerprint = executableFingerprint;
+    api_storage.PJRT_Executable_ParameterMemoryKinds = executableParameterMemoryKinds;
+    api_storage.PJRT_Executable_OutputMemoryKinds = executableOutputMemoryKinds;
     api_storage.PJRT_LoadedExecutable_Destroy = loadedExecutableDestroy;
     api_storage.PJRT_LoadedExecutable_GetExecutable = loadedExecutableGetExecutable;
     api_storage.PJRT_LoadedExecutable_AddressableDevices = loadedExecutableAddressableDevices;
+    api_storage.PJRT_LoadedExecutable_AddressableDeviceLogicalIds = loadedExecutableAddressableDeviceLogicalIds;
+    api_storage.PJRT_LoadedExecutable_GetDeviceAssignment = loadedExecutableGetDeviceAssignment;
+    api_storage.PJRT_LoadedExecutable_Fingerprint = loadedExecutableFingerprint;
     api_storage.PJRT_LoadedExecutable_Delete = loadedExecutableDelete;
     api_storage.PJRT_LoadedExecutable_IsDeleted = loadedExecutableIsDeleted;
     api_storage.PJRT_LoadedExecutable_Execute = loadedExecutableExecute;
@@ -997,8 +1272,10 @@ fn initApi() void {
     api_storage.PJRT_Buffer_OnDeviceSizeInBytes = bufferOnDeviceSize;
     api_storage.PJRT_Buffer_Device = bufferDevice;
     api_storage.PJRT_Buffer_Memory = bufferMemory;
+    api_storage.PJRT_Buffer_DynamicDimensionIndices = bufferDynamicDimensionIndices;
     api_storage.PJRT_Buffer_Delete = bufferDelete;
     api_storage.PJRT_Buffer_IsDeleted = bufferIsDeleted;
+    api_storage.PJRT_Buffer_IsOnCpu = bufferIsOnCpu;
     api_storage.PJRT_Buffer_ToHostBuffer = bufferToHost;
     api_storage.PJRT_Buffer_ReadyEvent = bufferReadyEvent;
 

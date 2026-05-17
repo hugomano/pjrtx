@@ -541,8 +541,18 @@ fn pjrtClientCompile(args: [*c]c.PJRT_Client_Compile_Args) callconv(.c) ?*c.PJRT
         allocator.destroy(plan_ptr);
     }
 
-    var graph = runtime.ExecutableGraph.init(allocator, client, plan_ptr) catch {
-        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to build executable graph");
+    var lowering_diagnostics = std.Io.Writer.Allocating.init(allocator);
+    defer lowering_diagnostics.deinit();
+    var graph = runtime.ExecutableGraph.initWithOptions(allocator, client, plan_ptr, .{
+        .mode = .require_backend_executable,
+        .diagnostic_writer = &lowering_diagnostics.writer,
+    }) catch |err| switch (err) {
+        error.UnsupportedRuntimeFeature => {
+            const message = lowering_diagnostics.writer.buffered();
+            const fallback = "program is not fully lowered to the MLX backend executable; host fallback is disabled";
+            return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, if (message.len == 0) fallback else message);
+        },
+        else => return makeError(c.PJRT_Error_Code_INTERNAL, "failed to build executable graph"),
     };
     errdefer graph.deinit();
 
@@ -561,7 +571,7 @@ fn pjrtClientCompile(args: [*c]c.PJRT_Client_Compile_Args) callconv(.c) ?*c.PJRT
     };
     args[0].executable = @ptrCast(executable);
     trace(
-        "event=compile backend={s} devices={d} values={d} instructions={d} outputs={d} backend_executable={d} elapsed_us={d}",
+        "event=compile backend={s} devices={d} values={d} instructions={d} outputs={d} backend_executable={d} lowered={d} fallback={d} elapsed_us={d}",
         .{
             @tagName(client.backend_kind),
             plan_ptr.options.numDevices(),
@@ -569,6 +579,8 @@ fn pjrtClientCompile(args: [*c]c.PJRT_Client_Compile_Args) callconv(.c) ?*c.PJRT
             plan_ptr.instructions.len,
             plan_ptr.output_ids.len,
             @intFromBool(graph.backend_executable != null),
+            graph.lowering.lowered_instruction_count,
+            graph.lowering.fallback_instruction_count,
             elapsedUs(trace_start_ns),
         },
     );
@@ -993,7 +1005,7 @@ fn graphExecuteError(err: runtime.GraphExecuteError) ?*c.PJRT_Error {
         error.InvalidArgument => makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "invalid executable graph arguments or device assignment"),
         error.UnsupportedElementType => makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "executable graph contains an operation unsupported for this element type"),
         error.ShapeMismatch => makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "executable graph shape validation failed during execution"),
-        error.UnsupportedRuntimeFeature => makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "executable graph contains an operation that is not lowered to the runtime yet"),
+        error.UnsupportedRuntimeFeature => makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "executable graph is not fully lowered to the MLX backend executable"),
         error.Internal => makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute executable graph"),
     };
 }
@@ -3200,4 +3212,49 @@ test "compile unsupported op returns detailed PJRT diagnostic" {
     try std.testing.expect(std.mem.indexOf(u8, message, "dtype=f32") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "rank=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "sharding=sdy.sharding_per_value") != null);
+}
+
+test "compile rejects frontend-supported op without MLX executable lowering" {
+    const api = GetPjrtApi();
+
+    var create_args = std.mem.zeroes(c.PJRT_Client_Create_Args);
+    create_args.struct_size = c.PJRT_Client_Create_Args_STRUCT_SIZE;
+    try expectOk(api.PJRT_Client_Create.?(&create_args));
+    defer {
+        var destroy_args = std.mem.zeroes(c.PJRT_Client_Destroy_Args);
+        destroy_args.struct_size = c.PJRT_Client_Destroy_Args_STRUCT_SIZE;
+        destroy_args.client = create_args.client;
+        _ = api.PJRT_Client_Destroy.?(&destroy_args);
+    }
+
+    const module_text =
+        \\func.func @main(%arg0: tensor<2x2xf32>) -> tensor<2x2xf32> {
+        \\  %0 = "stablehlo.custom_call"(%arg0) {call_target_name = "pjrtx.test"} : (tensor<2x2xf32>) -> tensor<2x2xf32>
+        \\  return %0 : tensor<2x2xf32>
+        \\}
+    ;
+    var program = std.mem.zeroes(c.PJRT_Program);
+    program.struct_size = c.PJRT_Program_STRUCT_SIZE;
+    program.code = @constCast(module_text.ptr);
+    program.code_size = module_text.len;
+    program.format = "mlir";
+    program.format_size = "mlir".len;
+
+    var compile_args = std.mem.zeroes(c.PJRT_Client_Compile_Args);
+    compile_args.struct_size = c.PJRT_Client_Compile_Args_STRUCT_SIZE;
+    compile_args.client = create_args.client;
+    compile_args.program = &program;
+    const err = api.PJRT_Client_Compile.?(&compile_args);
+    try std.testing.expect(err != null);
+    defer destroyError(api, err);
+
+    var code_args = std.mem.zeroes(c.PJRT_Error_GetCode_Args);
+    code_args.struct_size = c.PJRT_Error_GetCode_Args_STRUCT_SIZE;
+    code_args.@"error" = err;
+    try expectOk(api.PJRT_Error_GetCode.?(&code_args));
+    try std.testing.expectEqual(@as(c.PJRT_Error_Code, @intCast(c.PJRT_Error_Code_UNIMPLEMENTED)), code_args.code);
+    const message = errorMessage(api, err);
+    try std.testing.expect(std.mem.indexOf(u8, message, "pass=mlx-backend-legalization") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "op=custom_call") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "feature=mlx-backend-executable") != null);
 }

@@ -48,6 +48,12 @@ bool is_valid_binary_u8_op(int op) {
     case PJRTX_MLX_METAL_BINARY_MINIMUM:
     case PJRTX_MLX_METAL_BINARY_POWER:
     case PJRTX_MLX_METAL_BINARY_REMAINDER:
+    case PJRTX_MLX_METAL_BINARY_ATAN2:
+    case PJRTX_MLX_METAL_BINARY_AND:
+    case PJRTX_MLX_METAL_BINARY_OR:
+    case PJRTX_MLX_METAL_BINARY_XOR:
+    case PJRTX_MLX_METAL_BINARY_SHIFT_LEFT:
+    case PJRTX_MLX_METAL_BINARY_SHIFT_RIGHT:
       return true;
     default:
       return false;
@@ -70,6 +76,10 @@ bool is_valid_unary_op(int op) {
     case PJRTX_MLX_METAL_UNARY_SIN:
     case PJRTX_MLX_METAL_UNARY_COS:
     case PJRTX_MLX_METAL_UNARY_SIGN:
+    case PJRTX_MLX_METAL_UNARY_EXPM1:
+    case PJRTX_MLX_METAL_UNARY_NOT:
+    case PJRTX_MLX_METAL_UNARY_ISFINITE:
+    case PJRTX_MLX_METAL_UNARY_ROUND:
       return true;
     default:
       return false;
@@ -96,6 +106,27 @@ size_t dtype_size(int dtype) {
       return sizeof(float);
     default:
       return 0;
+  }
+}
+
+const mlx::core::Dtype* mlx_dtype_from_code(int dtype) {
+  switch (dtype) {
+    case PJRTX_MLX_METAL_DTYPE_U8:
+      return &mlx::core::uint8;
+    case PJRTX_MLX_METAL_DTYPE_S8:
+      return &mlx::core::int8;
+    case PJRTX_MLX_METAL_DTYPE_S32:
+      return &mlx::core::int32;
+    case PJRTX_MLX_METAL_DTYPE_U32:
+      return &mlx::core::uint32;
+    case PJRTX_MLX_METAL_DTYPE_F16:
+      return &mlx::core::float16;
+    case PJRTX_MLX_METAL_DTYPE_BF16:
+      return &mlx::core::bfloat16;
+    case PJRTX_MLX_METAL_DTYPE_F32:
+      return &mlx::core::float32;
+    default:
+      return nullptr;
   }
 }
 
@@ -460,6 +491,22 @@ mlx::core::array mlx_binary_array(const mlx::core::array& lhs,
       return mlx::core::power(lhs, rhs, device);
     case PJRTX_MLX_METAL_BINARY_REMAINDER:
       return mlx::core::remainder(lhs, rhs, device);
+    case PJRTX_MLX_METAL_BINARY_ATAN2:
+      return mlx::core::arctan2(lhs, rhs, device);
+    case PJRTX_MLX_METAL_BINARY_AND:
+      return dtype == PJRTX_MLX_METAL_DTYPE_PRED
+                 ? mlx::core::logical_and(lhs, rhs, device)
+                 : mlx::core::bitwise_and(lhs, rhs, device);
+    case PJRTX_MLX_METAL_BINARY_OR:
+      return dtype == PJRTX_MLX_METAL_DTYPE_PRED
+                 ? mlx::core::logical_or(lhs, rhs, device)
+                 : mlx::core::bitwise_or(lhs, rhs, device);
+    case PJRTX_MLX_METAL_BINARY_XOR:
+      return mlx::core::bitwise_xor(lhs, rhs, device);
+    case PJRTX_MLX_METAL_BINARY_SHIFT_LEFT:
+      return mlx::core::left_shift(lhs, rhs, device);
+    case PJRTX_MLX_METAL_BINARY_SHIFT_RIGHT:
+      return mlx::core::right_shift(lhs, rhs, device);
     default:
       throw std::invalid_argument("unknown PjRTx MLX binary op");
   }
@@ -496,9 +543,22 @@ mlx::core::array mlx_unary_array(const mlx::core::array& src, int op,
       return mlx::core::cos(src, device);
     case PJRTX_MLX_METAL_UNARY_SIGN:
       return mlx::core::sign(src, device);
+    case PJRTX_MLX_METAL_UNARY_EXPM1:
+      return mlx::core::expm1(src, device);
+    case PJRTX_MLX_METAL_UNARY_NOT:
+      return mlx::core::bitwise_invert(src, device);
+    case PJRTX_MLX_METAL_UNARY_ISFINITE:
+      return mlx::core::isfinite(src, device);
+    case PJRTX_MLX_METAL_UNARY_ROUND:
+      return mlx::core::round(src, device);
     default:
       throw std::invalid_argument("unknown PjRTx MLX unary op");
   }
+}
+
+int mlx_unary_output_dtype(int input_dtype, int op) {
+  return op == PJRTX_MLX_METAL_UNARY_ISFINITE ? PJRTX_MLX_METAL_DTYPE_PRED
+                                              : input_dtype;
 }
 
 void eval_on_device(mlx::core::array& array, const mlx::core::Device& device) {
@@ -658,6 +718,48 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_from_host_typed(
   }
 }
 
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_iota(
+    int device_ordinal, int dtype, const int64_t* dims, uint64_t rank,
+    int64_t iota_dimension) {
+  if (dims == nullptr || iota_dimension < 0 ||
+      static_cast<uint64_t>(iota_dimension) >= rank) {
+    return nullptr;
+  }
+  std::vector<int64_t> out_dims(dims, dims + rank);
+  const uint64_t byte_size = byte_size_for_shape(dtype, out_dims);
+  const mlx::core::Dtype* mlx_dtype = mlx_dtype_from_code(dtype);
+  if (byte_size == 0 || mlx_dtype == nullptr) {
+    return nullptr;
+  }
+  for (int64_t dim : out_dims) {
+    if (dim < 0) {
+      return nullptr;
+    }
+  }
+
+  const mlx::core::Device device(mlx::core::Device::gpu, device_ordinal);
+  if (!mlx::core::is_available(device)) {
+    return nullptr;
+  }
+
+  try {
+    const size_t axis = static_cast<size_t>(iota_dimension);
+    auto base = mlx::core::arange(0.0, static_cast<double>(out_dims[axis]),
+                                  1.0, *mlx_dtype, device);
+    mlx::core::Shape reshape_dims(rank, 1);
+    reshape_dims[axis] = static_cast<mlx::core::ShapeElem>(out_dims[axis]);
+    auto shaped = mlx::core::reshape(base, std::move(reshape_dims), device);
+    auto out = mlx::core::broadcast_to(shaped, mlx_shape(out_dims), device);
+    auto array = std::make_unique<mlx::core::array>(std::move(out));
+    return new PjrtxMlxMetalBuffer(std::move(array), byte_size, dtype,
+                                   std::move(out_dims), device_ordinal);
+  } catch (const std::exception&) {
+    return nullptr;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
 PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_clone(PjrtxMlxMetalBuffer* src) {
   if (src == nullptr || src->byte_size == 0) {
     return nullptr;
@@ -770,8 +872,13 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_unary(
 
   try {
     auto out = mlx_unary_array(*src->array, op, device);
+    const int output_dtype = mlx_unary_output_dtype(src->dtype, op);
+    const uint64_t byte_size = byte_size_for_shape(output_dtype, src->dims);
+    if (byte_size == 0) {
+      return nullptr;
+    }
     auto array = std::make_unique<mlx::core::array>(std::move(out));
-    return new PjrtxMlxMetalBuffer(std::move(array), src->byte_size, src->dtype,
+    return new PjrtxMlxMetalBuffer(std::move(array), byte_size, output_dtype,
                                    src->dims, src->device_ordinal);
   } catch (const std::exception&) {
     return nullptr;
@@ -1374,6 +1481,47 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_select(
     return new PjrtxMlxMetalBuffer(std::move(array), byte_size,
                                    on_true->dtype, std::move(out_dims),
                                    on_true->device_ordinal);
+  } catch (const std::exception&) {
+    return nullptr;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_clamp(
+    PjrtxMlxMetalBuffer* min, PjrtxMlxMetalBuffer* value,
+    PjrtxMlxMetalBuffer* max, const int64_t* output_dims,
+    uint64_t output_rank) {
+  if (min == nullptr || value == nullptr || max == nullptr ||
+      output_dims == nullptr || min->dtype != value->dtype ||
+      max->dtype != value->dtype ||
+      min->device_ordinal != value->device_ordinal ||
+      max->device_ordinal != value->device_ordinal) {
+    return nullptr;
+  }
+  std::vector<int64_t> out_dims(output_dims, output_dims + output_rank);
+  const bool min_scalar = min->dims.empty();
+  const bool max_scalar = max->dims.empty();
+  if (out_dims != value->dims || (!min_scalar && min->dims != value->dims) ||
+      (!max_scalar && max->dims != value->dims)) {
+    return nullptr;
+  }
+  const uint64_t byte_size = byte_size_for_shape(value->dtype, out_dims);
+  if (byte_size == 0) {
+    return nullptr;
+  }
+  const mlx::core::Device device(mlx::core::Device::gpu, value->device_ordinal);
+  if (!mlx::core::is_available(device) || min->array == nullptr ||
+      value->array == nullptr || max->array == nullptr) {
+    return nullptr;
+  }
+  try {
+    auto lower_bounded = mlx::core::maximum(*value->array, *min->array, device);
+    auto out = mlx::core::minimum(lower_bounded, *max->array, device);
+    auto array = std::make_unique<mlx::core::array>(std::move(out));
+    return new PjrtxMlxMetalBuffer(std::move(array), byte_size, value->dtype,
+                                   std::move(out_dims),
+                                   value->device_ordinal);
   } catch (const std::exception&) {
     return nullptr;
   } catch (...) {

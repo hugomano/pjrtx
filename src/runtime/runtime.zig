@@ -195,6 +195,23 @@ pub const GraphNode = struct {
     kind: GraphNodeKind,
 };
 
+pub const LoweringMode = enum {
+    allow_runtime_fallback,
+    require_backend_executable,
+};
+
+pub const LoweringOptions = struct {
+    mode: LoweringMode = .allow_runtime_fallback,
+    diagnostic_writer: ?*std.Io.Writer = null,
+};
+
+pub const LoweringPipeline = struct {
+    mode: LoweringMode,
+    backend_executable_ready: bool,
+    lowered_instruction_count: usize,
+    fallback_instruction_count: usize,
+};
+
 pub const ExecutableGraph = struct {
     allocator: std.mem.Allocator,
     backend: backend_api.Backend,
@@ -202,8 +219,13 @@ pub const ExecutableGraph = struct {
     device_local_hardware_ids: []i32,
     nodes: []GraphNode,
     backend_executable: ?backend_api.ExecutableHandle = null,
+    lowering: LoweringPipeline,
 
     pub fn init(allocator: std.mem.Allocator, client: *const Client, plan: *const core.ExecutablePlan) !ExecutableGraph {
+        return initWithOptions(allocator, client, plan, .{});
+    }
+
+    pub fn initWithOptions(allocator: std.mem.Allocator, client: *const Client, plan: *const core.ExecutablePlan, options: LoweringOptions) !ExecutableGraph {
         const device_count = plan.options.numDevices();
         if (device_count == 0 or device_count > client.devices.len) return error.InvalidGraph;
 
@@ -237,8 +259,18 @@ pub const ExecutableGraph = struct {
             }
         }
 
-        const backend_executable = client.backend.compileExecutable(allocator, plan, device_local_hardware_ids) catch null;
+        const backend_executable = client.backend.compileExecutable(allocator, plan, device_local_hardware_ids) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
         errdefer if (backend_executable) |handle| client.backend.destroyExecutable(handle);
+        if (backend_executable == null and options.mode == .require_backend_executable) {
+            if (options.diagnostic_writer) |writer| {
+                client.backend.writeExecutableLoweringDiagnostic(plan, device_local_hardware_ids, writer) catch {};
+            }
+            return error.UnsupportedRuntimeFeature;
+        }
+        const backend_ready = backend_executable != null;
 
         return .{
             .allocator = allocator,
@@ -247,6 +279,12 @@ pub const ExecutableGraph = struct {
             .device_local_hardware_ids = device_local_hardware_ids,
             .nodes = nodes,
             .backend_executable = backend_executable,
+            .lowering = .{
+                .mode = options.mode,
+                .backend_executable_ready = backend_ready,
+                .lowered_instruction_count = if (backend_ready) plan.instructions.len else 0,
+                .fallback_instruction_count = if (backend_ready) 0 else plan.instructions.len,
+            },
         };
     }
 
@@ -272,6 +310,7 @@ pub const ExecutableGraph = struct {
         if (self.tryExecuteBackendExecutable(allocator, client, device_index, arguments) catch |err| return err) |outputs| {
             return outputs;
         }
+        if (self.lowering.mode == .require_backend_executable) return error.UnsupportedRuntimeFeature;
 
         var value_buffers = try allocator.alloc(?*Buffer, plan.values.len);
         defer allocator.free(value_buffers);
@@ -1306,11 +1345,10 @@ pub const Buffer = struct {
         if (src.element_type.byteSize() == 0 or output_type.byteSize() == 0) return error.UnsupportedElementType;
         const output_byte_size = denseByteSize(output_type, output_dims);
         if (src.backend_buffer) |src_backend| {
-            if (output_type == src.element_type) {
-                if (src.backend.unary(src_backend, op) catch null) |backend_buffer| {
-                    return initBackendOnly(allocator, src, output_type, output_dims, output_byte_size, backend_buffer, shard_index);
-                }
+            if (src.backend.unary(src_backend, op) catch null) |backend_buffer| {
+                return initBackendOnly(allocator, src, output_type, output_dims, output_byte_size, backend_buffer, shard_index);
             }
+            if (src.bytes.len == 0) return error.UnsupportedRuntimeFeature;
         }
 
         const buffer = try allocator.create(Buffer);
@@ -2011,6 +2049,22 @@ pub const Buffer = struct {
     ) !*Buffer {
         if (iota_dimension < 0 or iota_dimension >= @as(i64, @intCast(output_dims.len))) return error.ShapeMismatch;
         if (element_type.byteSize() == 0) return error.UnsupportedElementType;
+        if (backend_impl.iota(device.local_hardware_id, element_type, output_dims, iota_dimension) catch null) |backend_buffer| {
+            return initBackendHandle(
+                allocator,
+                backend_impl,
+                element_type,
+                output_dims,
+                device,
+                memory,
+                shard_index,
+                denseByteSize(element_type, output_dims),
+                backend_buffer,
+            ) catch |err| {
+                backend_impl.destroyBuffer(backend_buffer);
+                return err;
+            };
+        }
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
@@ -2126,6 +2180,16 @@ pub const Buffer = struct {
         const max_scalar = max_buffer.dims.len == 0;
         if (!min_scalar and !std.mem.eql(i64, min_buffer.dims, output_dims)) return error.ShapeMismatch;
         if (!max_scalar and !std.mem.eql(i64, max_buffer.dims, output_dims)) return error.ShapeMismatch;
+        if (min_buffer.backend_buffer) |min_backend| {
+            if (value_buffer.backend_buffer) |value_backend| {
+                if (max_buffer.backend_buffer) |max_backend| {
+                    if (value_buffer.backend.clamp(min_backend, value_backend, max_backend, output_dims) catch null) |backend_buffer| {
+                        return initBackendOnly(allocator, value_buffer, value_buffer.element_type, output_dims, denseByteSize(value_buffer.element_type, output_dims), backend_buffer, shard_index);
+                    }
+                }
+            }
+            if (value_buffer.bytes.len == 0) return error.UnsupportedRuntimeFeature;
+        }
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
@@ -3070,6 +3134,37 @@ test "executable graph materializes per-device scheduled nodes" {
     try std.testing.expectEqual(GraphNodeKind.control_flow, graph.nodes[2].kind);
     try std.testing.expectEqual(@as(usize, 0), graph.nodes[0].device_index);
     try std.testing.expectEqual(@as(i32, 0), graph.nodes[0].device_id);
+    try std.testing.expectEqual(LoweringMode.allow_runtime_fallback, graph.lowering.mode);
+    try std.testing.expectEqual(false, graph.lowering.backend_executable_ready);
+    try std.testing.expectEqual(@as(usize, 3), graph.lowering.fallback_instruction_count);
+}
+
+test "executable graph device-only lowering rejects unsupported backend executable" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+    const allocator = std.testing.allocator;
+
+    var plan = core.ExecutablePlan{
+        .allocator = allocator,
+        .options = .{
+            .num_replicas = 1,
+            .num_partitions = 1,
+            .device_assignment = try allocator.dupe(i32, &.{0}),
+        },
+        .values = &.{},
+        .parameter_shardings = try allocator.alloc(core.ShardingPlan, 0),
+        .output_shardings = try allocator.alloc(core.ShardingPlan, 0),
+        .output_ids = try allocator.alloc(core.ValueId, 0),
+        .instructions = try allocator.dupe(core.PlanInstruction, &.{
+            .{ .kind = .custom_call },
+        }),
+    };
+    defer plan.deinit();
+
+    try std.testing.expectError(
+        error.UnsupportedRuntimeFeature,
+        ExecutableGraph.initWithOptions(allocator, client, &plan, .{ .mode = .require_backend_executable }),
+    );
 }
 
 test "executable graph executes through runtime buffers" {
@@ -3123,6 +3218,10 @@ test "executable graph executes through runtime buffers" {
     var graph = try ExecutableGraph.init(allocator, client, &plan);
     defer graph.deinit();
     try std.testing.expect(graph.backend_executable != null);
+    try std.testing.expectEqual(LoweringMode.allow_runtime_fallback, graph.lowering.mode);
+    try std.testing.expectEqual(true, graph.lowering.backend_executable_ready);
+    try std.testing.expectEqual(@as(usize, 1), graph.lowering.lowered_instruction_count);
+    try std.testing.expectEqual(@as(usize, 0), graph.lowering.fallback_instruction_count);
 
     const lhs_data = [_]u8{ 1, 2, 3, 4 };
     const rhs_data = [_]u8{ 10, 20, 30, 40 };
@@ -3221,6 +3320,27 @@ test "buffer convert uses backend astype for resident buffers" {
     try std.testing.expect(converted.backend_buffer != null);
     try std.testing.expectEqual(@as(usize, 0), converted.bytes.len);
     try expectBufferF32(converted, &.{ 1.0, 255.0 });
+}
+
+test "buffer iota uses resident mlx backend path" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+
+    const dims = [_]i64{ 2, 3 };
+    const buffer = try Buffer.initIota(
+        std.testing.allocator,
+        client.backend,
+        .f32,
+        &dims,
+        &client.devices[0],
+        &client.memories[0],
+        1,
+        0,
+    );
+    defer buffer.deinit();
+    try std.testing.expect(buffer.backend_buffer != null);
+    try std.testing.expectEqual(@as(usize, 0), buffer.bytes.len);
+    try expectBufferF32(buffer, &.{ 0.0, 1.0, 2.0, 0.0, 1.0, 2.0 });
 }
 
 test "buffer movement ops use resident mlx backend paths" {

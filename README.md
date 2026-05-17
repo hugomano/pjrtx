@@ -135,13 +135,20 @@ The compiler contract keeps these concepts separate:
 
 Compile now materializes a runtime `ExecutableGraph` from the PjRTx plan and
 asks the selected backend to compile an opaque backend executable. Execution
-enters through that graph per device; when all inputs are already backend
-buffers, runtime dispatches the backend executable directly and wraps opaque
-backend output handles back into PJRT buffers. If a program is not legalized to a
-backend executable yet, the graph falls back to backend-neutral runtime
-operations. The next lowering step is to broaden backend legalization so devices
-enqueue MLX kernels, collectives, custom calls, DMA copies, or library calls
-directly without pretending every op is a buffer allocation.
+enters through that graph per device. PJRT compile uses device-only lowering:
+the whole program must legalize to an MLX backend executable, and execute only
+dispatches opaque backend buffer handles through that executable. The old
+backend-neutral operation interpreter remains available only as an explicit
+runtime test mode. New llama-facing work should broaden backend legalization so
+devices enqueue MLX kernels, collectives, custom calls, DMA copies, or library
+calls directly without pretending every op is a buffer allocation.
+
+Backend legalization is validated before the plugin accepts a compiled program.
+Failures are reported through `std.Io.Writer` diagnostics with the lowering
+pass, instruction index, op name, value id, dtype/rank/shape, sharding label, and
+backend feature label, so unsupported forms such as general gather or interior
+padding fail during compile instead of falling through to host/reference
+execution.
 
 ## Current Status
 
@@ -180,14 +187,15 @@ directly without pretending every op is a buffer allocation.
   of the fast path until the backend has an explicit dtype reinterpretation API.
   MLX backend executables keep compile-time constants resident as device arrays
   and clone those handles during execute, which is the first weight-residency
-  path. Elementwise arithmetic, common unary math, compare/select, reductions,
-  `dot_general`, dtype casts, shape/view ops, StableHLO `reverse`, dynamic
-  slice, dynamic update-slice, constant edge padding, restricted axis-0 gather,
-  and ascending/descending StableHLO `sort` now run
-  through MLX core operations on the GPU device when MLX arrays and Metal
-  devices are available. StableHLO interior padding and general gather/scatter
-  metadata still require broader backend legalization before they enter the fast
-  path.
+  path. Elementwise arithmetic, extra unary/binary math (`atan2`, `expm1`,
+  `is_finite`, nearest-even `round`), logical/bitwise ops, compare/select,
+  reductions, `dot_general`, dtype casts, StableHLO `iota`, StableHLO `clamp`,
+  shape/view ops, StableHLO `reverse`, dynamic slice, dynamic update-slice,
+  constant edge padding, restricted axis-0 gather, and ascending/descending
+  StableHLO `sort` now run through MLX core operations on the GPU device when
+  MLX arrays and Metal devices are available. StableHLO interior padding and general
+  gather/scatter metadata still require broader backend legalization before they
+  enter the fast path.
   The PjRTx C shim no longer builds direct Metal arithmetic kernels or calls
   host `xcrun`.
 - `src/compiler`: compile-option parsing and executable-plan construction for
@@ -215,21 +223,20 @@ directly without pretending every op is a buffer allocation.
   host buffer copies, compile skeleton, loaded executable metadata, and
   per-device execute plumbing. Compile builds a runtime executable graph from
   the compiler plan; execute calls that graph for each selected device and no
-  longer owns instruction scheduling in the PJRT adapter. When the MLX backend
-  can compile the plan and all inputs are device buffers, execution dispatches
-  the backend executable directly. The runtime graph falls back to
-  backend-neutral buffer operations only for unsupported backend executable
-  fragments. Bootstrap graph execution supports: empty bootstrap programs copy
-  arg0, linear
+  longer owns instruction scheduling in the PJRT adapter. Compile now rejects
+  programs that cannot fully lower to an MLX backend executable, so llama-facing
+  execution does not fall back through host/reference buffers. Bootstrap graph
+  execution supports: empty bootstrap programs copy arg0, linear
   StableHLO arithmetic chains execute the bootstrap `u8` and `f32` elementwise
   paths for matching buffers, StableHLO reshape preserves bytes while updating
-  buffer dimensions and typed MLX metadata, StableHLO transpose performs dense
-  row-major layout permutation, StableHLO broadcast-in-dim expands dense buffers
-  with explicit output dimensions, StableHLO slice performs dense strided
-  slicing with explicit bounds, StableHLO `reverse` flips compiled axes,
-  StableHLO concatenate joins two dense buffers along the compiled dimension,
-  StableHLO `sort` uses the comparator direction parsed from the StableHLO
-  region, StableHLO `reduce_precision` is an identity
+  buffer dimensions and typed MLX metadata, StableHLO `iota` materializes
+  coordinate grids on device, StableHLO transpose performs dense row-major
+  layout permutation, StableHLO broadcast-in-dim expands dense buffers with
+  explicit output dimensions, StableHLO slice performs dense strided slicing
+  with explicit bounds, StableHLO `reverse` flips compiled axes, StableHLO
+  concatenate joins two dense buffers along the compiled dimension, StableHLO
+  `sort` uses the comparator direction parsed from the StableHLO region,
+  StableHLO `reduce_precision` is an identity
   device copy, `partition_id` materializes scalar partition ids, deterministic
   bootstrap `rng`/`rng_bit_generator` paths exist for tests, and f32 dense
   `cholesky` currently has a correctness implementation that must move behind a
@@ -257,10 +264,11 @@ bazel-bin/src/plugin/libpjrtx_metal_plugin.dylib
 
 ## Next Implementation Steps
 
-- Finish the backend-executable cutover. Runtime buffers now keep backend
-  handles live across supported instruction chains; the next step is to move
-  more graph fragments into MLX executable legalization and make the fallback
-  path test-only for unsupported features.
+- Broaden MLX backend executable legalization. The PJRT path is now device-only
+  and the runtime fallback path is test-only, so unsupported StableHLO ops must
+  either lower to MLX graph fragments or fail at compile time with precise
+  diagnostics. Current backend legalization diagnostics identify the blocking
+  pass, op/value, shape, sharding, and MLX feature label.
 - Expand the MLX backend implementation for the remaining LLM hot path:
   general gather, interior pad lowering, scatter, custom comparator sort/top-k,
   and custom-call

@@ -40,6 +40,12 @@ enum {
   PJRTX_MLX_METAL_BINARY_MINIMUM = 5,
   PJRTX_MLX_METAL_BINARY_POWER = 6,
   PJRTX_MLX_METAL_BINARY_REMAINDER = 7,
+  PJRTX_MLX_METAL_BINARY_ATAN2 = 8,
+  PJRTX_MLX_METAL_BINARY_AND = 9,
+  PJRTX_MLX_METAL_BINARY_OR = 10,
+  PJRTX_MLX_METAL_BINARY_XOR = 11,
+  PJRTX_MLX_METAL_BINARY_SHIFT_LEFT = 12,
+  PJRTX_MLX_METAL_BINARY_SHIFT_RIGHT = 13,
 };
 
 enum {
@@ -57,6 +63,10 @@ enum {
   PJRTX_MLX_METAL_UNARY_SIN = 11,
   PJRTX_MLX_METAL_UNARY_COS = 12,
   PJRTX_MLX_METAL_UNARY_SIGN = 13,
+  PJRTX_MLX_METAL_UNARY_EXPM1 = 14,
+  PJRTX_MLX_METAL_UNARY_NOT = 15,
+  PJRTX_MLX_METAL_UNARY_ISFINITE = 16,
+  PJRTX_MLX_METAL_UNARY_ROUND = 17,
 };
 
 enum {
@@ -86,6 +96,9 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_from_host(int device_ordinal,
 PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_from_host_typed(
     int device_ordinal, const void* data, uint64_t byte_size, int dtype,
     const int64_t* dims, uint64_t rank);
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_iota(
+    int device_ordinal, int dtype, const int64_t* dims, uint64_t rank,
+    int64_t iota_dimension);
 PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_clone(PjrtxMlxMetalBuffer* src);
 PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_astype(
     PjrtxMlxMetalBuffer* src, int dtype);
@@ -152,6 +165,10 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_compare(
 PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_select(
     PjrtxMlxMetalBuffer* pred, PjrtxMlxMetalBuffer* on_true,
     PjrtxMlxMetalBuffer* on_false, const int64_t* output_dims,
+    uint64_t output_rank);
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_clamp(
+    PjrtxMlxMetalBuffer* min, PjrtxMlxMetalBuffer* value,
+    PjrtxMlxMetalBuffer* max, const int64_t* output_dims,
     uint64_t output_rank);
 uint64_t pjrtx_mlx_metal_buffer_size(PjrtxMlxMetalBuffer* buffer);
 int pjrtx_mlx_metal_buffer_has_host_shadow(PjrtxMlxMetalBuffer* buffer);

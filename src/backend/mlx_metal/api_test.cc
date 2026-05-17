@@ -4,6 +4,7 @@
 #include <cmath>
 
 bool near(float lhs, float rhs) { return std::fabs(lhs - rhs) < 0.0001f; }
+bool near_relaxed(float lhs, float rhs) { return std::fabs(lhs - rhs) < 0.01f; }
 
 int main() {
   assert(pjrtx_mlx_metal_version_major() == 0);
@@ -91,6 +92,18 @@ int main() {
     }
     pjrtx_mlx_metal_buffer_destroy(product);
 
+    PjrtxMlxMetalBuffer* bitwise_and = pjrtx_mlx_metal_buffer_binary_u8(
+        buffer, rhs_buffer, PJRTX_MLX_METAL_BINARY_AND);
+    assert(bitwise_and != nullptr);
+    unsigned char bitwise_and_output[sizeof(input)] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               bitwise_and, bitwise_and_output, sizeof(bitwise_and_output)) ==
+           1);
+    for (int i = 0; i < static_cast<int>(sizeof(input)); ++i) {
+      assert(bitwise_and_output[i] == static_cast<unsigned char>(input[i] & rhs[i]));
+    }
+    pjrtx_mlx_metal_buffer_destroy(bitwise_and);
+
     PjrtxMlxMetalBuffer* quotient = pjrtx_mlx_metal_buffer_binary_u8(
         rhs_buffer, buffer, PJRTX_MLX_METAL_U8_BINARY_DIVIDE);
     assert(quotient != nullptr);
@@ -117,6 +130,21 @@ int main() {
     pjrtx_mlx_metal_buffer_destroy(rhs_buffer);
     pjrtx_mlx_metal_buffer_destroy(buffer);
 
+    const int64_t iota_dims[] = {2, 3};
+    PjrtxMlxMetalBuffer* iota = pjrtx_mlx_metal_buffer_iota(
+        devices[0].ordinal, PJRTX_MLX_METAL_DTYPE_F32, iota_dims, 2, 1);
+    assert(iota != nullptr);
+    float iota_output[6] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               iota, iota_output, sizeof(iota_output)) == 1);
+    {
+      const float expected[] = {0.0f, 1.0f, 2.0f, 0.0f, 1.0f, 2.0f};
+      for (int i = 0; i < 6; ++i) {
+        assert(near(iota_output[i], expected[i]));
+      }
+    }
+    pjrtx_mlx_metal_buffer_destroy(iota);
+
     const int64_t f32_dims[] = {3};
     const float f32_input[] = {1.5f, -2.0f, 4.0f};
     const float f32_rhs[] = {2.0f, 3.0f, -0.5f};
@@ -131,6 +159,33 @@ int main() {
     for (int i = 0; i < 3; ++i) {
       assert(near(f32_output[i], f32_input[i]));
     }
+    const float clamp_min_scalar = -1.0f;
+    const float clamp_max_scalar = 2.0f;
+    PjrtxMlxMetalBuffer* clamp_min =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, &clamp_min_scalar, sizeof(clamp_min_scalar),
+            PJRTX_MLX_METAL_DTYPE_F32, nullptr, 0);
+    PjrtxMlxMetalBuffer* clamp_max =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, &clamp_max_scalar, sizeof(clamp_max_scalar),
+            PJRTX_MLX_METAL_DTYPE_F32, nullptr, 0);
+    assert(clamp_min != nullptr);
+    assert(clamp_max != nullptr);
+    PjrtxMlxMetalBuffer* clamped = pjrtx_mlx_metal_buffer_clamp(
+        clamp_min, f32_buffer, clamp_max, f32_dims, 1);
+    assert(clamped != nullptr);
+    float clamp_output[3] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               clamped, clamp_output, sizeof(clamp_output)) == 1);
+    {
+      const float expected[] = {1.5f, -1.0f, 2.0f};
+      for (int i = 0; i < 3; ++i) {
+        assert(near(clamp_output[i], expected[i]));
+      }
+    }
+    pjrtx_mlx_metal_buffer_destroy(clamped);
+    pjrtx_mlx_metal_buffer_destroy(clamp_max);
+    pjrtx_mlx_metal_buffer_destroy(clamp_min);
 
     const int64_t half_dims[] = {2};
     const uint16_t f16_input[] = {0x3c00, 0xc000};
@@ -186,6 +241,16 @@ int main() {
       }
       pjrtx_mlx_metal_buffer_destroy(f32_sum);
     }
+    PjrtxMlxMetalBuffer* f32_atan2 = pjrtx_mlx_metal_buffer_binary(
+        f32_buffer, f32_rhs_buffer, PJRTX_MLX_METAL_BINARY_ATAN2);
+    assert(f32_atan2 != nullptr);
+    float f32_atan2_output[3] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               f32_atan2, f32_atan2_output, sizeof(f32_atan2_output)) == 1);
+    for (int i = 0; i < 3; ++i) {
+      assert(near(f32_atan2_output[i], std::atan2(f32_input[i], f32_rhs[i])));
+    }
+    pjrtx_mlx_metal_buffer_destroy(f32_atan2);
     PjrtxMlxMetalBuffer* f32_sqrt = pjrtx_mlx_metal_buffer_unary(
         f32_buffer, PJRTX_MLX_METAL_UNARY_SQRT);
     if (f32_sqrt != nullptr) {
@@ -197,6 +262,27 @@ int main() {
       assert(near(f32_sqrt_output[2], std::sqrt(f32_input[2])));
       pjrtx_mlx_metal_buffer_destroy(f32_sqrt);
     }
+    PjrtxMlxMetalBuffer* f32_expm1 = pjrtx_mlx_metal_buffer_unary(
+        f32_buffer, PJRTX_MLX_METAL_UNARY_EXPM1);
+    assert(f32_expm1 != nullptr);
+    float f32_expm1_output[3] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               f32_expm1, f32_expm1_output, sizeof(f32_expm1_output)) == 1);
+    for (int i = 0; i < 3; ++i) {
+      assert(near_relaxed(f32_expm1_output[i], std::expm1(f32_input[i])));
+    }
+    pjrtx_mlx_metal_buffer_destroy(f32_expm1);
+    PjrtxMlxMetalBuffer* f32_isfinite = pjrtx_mlx_metal_buffer_unary(
+        f32_buffer, PJRTX_MLX_METAL_UNARY_ISFINITE);
+    assert(f32_isfinite != nullptr);
+    unsigned char f32_isfinite_output[3] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               f32_isfinite, f32_isfinite_output,
+               sizeof(f32_isfinite_output)) == 1);
+    for (int i = 0; i < 3; ++i) {
+      assert(f32_isfinite_output[i] == 1);
+    }
+    pjrtx_mlx_metal_buffer_destroy(f32_isfinite);
 
     const int64_t transpose_dims[] = {2, 3};
     const int64_t permutation[] = {1, 0};

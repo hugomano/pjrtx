@@ -39,6 +39,7 @@ pub const Backend = struct {
         enumerateDevices: *const fn (backend: Backend, allocator: std.mem.Allocator, device_count_hint: usize) Error![]core.DeviceDescriptor,
         releaseDeviceDescriptors: *const fn (backend: Backend, allocator: std.mem.Allocator, descriptors: []core.DeviceDescriptor) void,
         bufferFromHost: *const fn (backend: Backend, device_local_hardware_id: i32, element_type: core.BufferType, dims: []const i64, src: []const u8) Error!?BufferHandle,
+        iota: *const fn (backend: Backend, device_local_hardware_id: i32, element_type: core.BufferType, dims: []const i64, iota_dimension: i64) Error!?BufferHandle,
         cloneBuffer: *const fn (backend: Backend, src: BufferHandle) Error!?BufferHandle,
         convert: *const fn (backend: Backend, src: BufferHandle, output_type: core.BufferType) Error!?BufferHandle,
         binary: *const fn (backend: Backend, lhs: BufferHandle, rhs: BufferHandle, op: core.ElementwiseBinaryOp) Error!?BufferHandle,
@@ -58,7 +59,9 @@ pub const Backend = struct {
         reduce: *const fn (backend: Backend, src: BufferHandle, op: core.PlanInstructionKind, dimensions: []const i64, output_dims: []const i64) Error!?BufferHandle,
         compare: *const fn (backend: Backend, lhs: BufferHandle, rhs: BufferHandle, direction: core.CompareOp, output_dims: []const i64) Error!?BufferHandle,
         select: *const fn (backend: Backend, pred: BufferHandle, on_true: BufferHandle, on_false: BufferHandle, output_dims: []const i64) Error!?BufferHandle,
+        clamp: *const fn (backend: Backend, min: BufferHandle, value: BufferHandle, max: BufferHandle, output_dims: []const i64) Error!?BufferHandle,
         compileExecutable: *const fn (backend: Backend, allocator: std.mem.Allocator, plan: *const core.ExecutablePlan, device_local_hardware_ids: []const i32) Error!?ExecutableHandle,
+        writeExecutableLoweringDiagnostic: *const fn (backend: Backend, plan: *const core.ExecutablePlan, device_local_hardware_ids: []const i32, writer: *std.Io.Writer) std.Io.Writer.Error!void,
         executeExecutable: *const fn (backend: Backend, allocator: std.mem.Allocator, executable: ExecutableHandle, device_index: usize, arguments: []const BufferHandle) Error!?[]ExecutableOutput,
         destroyExecutable: *const fn (backend: Backend, executable: ExecutableHandle) void,
         copyToHost: *const fn (backend: Backend, src: BufferHandle, dst: []u8) Error!void,
@@ -83,6 +86,10 @@ pub const Backend = struct {
 
     pub fn bufferFromHost(self: Backend, device_local_hardware_id: i32, element_type: core.BufferType, dims: []const i64, src: []const u8) Error!?BufferHandle {
         return self.vtable.bufferFromHost(self, device_local_hardware_id, element_type, dims, src);
+    }
+
+    pub fn iota(self: Backend, device_local_hardware_id: i32, element_type: core.BufferType, dims: []const i64, iota_dimension: i64) Error!?BufferHandle {
+        return self.vtable.iota(self, device_local_hardware_id, element_type, dims, iota_dimension);
     }
 
     pub fn cloneBuffer(self: Backend, src: BufferHandle) Error!?BufferHandle {
@@ -161,8 +168,16 @@ pub const Backend = struct {
         return self.vtable.select(self, pred, on_true, on_false, output_dims);
     }
 
+    pub fn clamp(self: Backend, min: BufferHandle, value: BufferHandle, max: BufferHandle, output_dims: []const i64) Error!?BufferHandle {
+        return self.vtable.clamp(self, min, value, max, output_dims);
+    }
+
     pub fn compileExecutable(self: Backend, allocator: std.mem.Allocator, plan: *const core.ExecutablePlan, device_local_hardware_ids: []const i32) Error!?ExecutableHandle {
         return self.vtable.compileExecutable(self, allocator, plan, device_local_hardware_ids);
+    }
+
+    pub fn writeExecutableLoweringDiagnostic(self: Backend, plan: *const core.ExecutablePlan, device_local_hardware_ids: []const i32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        return self.vtable.writeExecutableLoweringDiagnostic(self, plan, device_local_hardware_ids, writer);
     }
 
     pub fn executeExecutable(self: Backend, allocator: std.mem.Allocator, executable: ExecutableHandle, device_index: usize, arguments: []const BufferHandle) Error!?[]ExecutableOutput {

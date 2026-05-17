@@ -69,6 +69,12 @@ fn bufferFromHost(_: backend.Backend, device_local_hardware_id: i32, element_typ
     return @ptrCast(handle);
 }
 
+fn iota(_: backend.Backend, device_local_hardware_id: i32, element_type: core.BufferType, dims: []const i64, iota_dimension: i64) backend.Error!?backend.BufferHandle {
+    const dtype = mlxDtype(element_type) orelse return error.UnsupportedElementType;
+    const handle = c.pjrtx_mlx_metal_buffer_iota(device_local_hardware_id, dtype, dims.ptr, dims.len, iota_dimension) orelse return error.CommandSubmissionFailed;
+    return @ptrCast(handle);
+}
+
 fn cloneBuffer(_: backend.Backend, src: backend.BufferHandle) backend.Error!?backend.BufferHandle {
     const handle = c.pjrtx_mlx_metal_buffer_clone(@ptrCast(@alignCast(src))) orelse return error.CommandSubmissionFailed;
     return @ptrCast(handle);
@@ -228,6 +234,11 @@ fn select(_: backend.Backend, pred: backend.BufferHandle, on_true: backend.Buffe
     return @ptrCast(handle);
 }
 
+fn clamp(_: backend.Backend, min: backend.BufferHandle, value: backend.BufferHandle, max: backend.BufferHandle, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    const handle = c.pjrtx_mlx_metal_buffer_clamp(@ptrCast(@alignCast(min)), @ptrCast(@alignCast(value)), @ptrCast(@alignCast(max)), output_dims.ptr, output_dims.len) orelse return error.CommandSubmissionFailed;
+    return @ptrCast(handle);
+}
+
 fn copyToHost(_: backend.Backend, src: backend.BufferHandle, dst: []u8) backend.Error!void {
     const ok = c.pjrtx_mlx_metal_buffer_copy_to_host(@ptrCast(@alignCast(src)), dst.ptr, dst.len);
     if (ok == 0) return error.BufferCopyFailed;
@@ -244,15 +255,16 @@ const CompiledExecutable = struct {
     constant_handles: []?backend.BufferHandle,
 };
 
+const LoweringIssue = struct {
+    instruction_index: ?usize = null,
+    value_id: ?core.ValueId = null,
+    op: ?core.PlanInstructionKind = null,
+    detail: []const u8,
+    feature: []const u8 = "mlx-backend-executable",
+};
+
 fn compileExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator, plan: *const core.ExecutablePlan, device_local_hardware_ids: []const i32) backend.Error!?backend.ExecutableHandle {
-    if (device_local_hardware_ids.len == 0) return null;
-    for (plan.instructions) |instruction| {
-        if (!executableSupportsInstruction(instruction.kind)) return null;
-        if (instruction.outputs.len != 1) return null;
-        const output_id = instruction.outputs[0];
-        if (output_id.index >= plan.values.len) return null;
-        if (instruction.kind == .constant and instruction.literal == null) return null;
-    }
+    if (executableLoweringIssue(plan, device_local_hardware_ids)) |_| return null;
 
     const executable = try allocator.create(CompiledExecutable);
     errdefer allocator.destroy(executable);
@@ -286,6 +298,14 @@ fn compileExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
         .constant_handles = constant_handles,
     };
     return @ptrCast(executable);
+}
+
+fn writeExecutableLoweringDiagnostic(_: backend.Backend, plan: *const core.ExecutablePlan, device_local_hardware_ids: []const i32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    if (executableLoweringIssue(plan, device_local_hardware_ids)) |issue| {
+        try writeLoweringIssue(plan, issue, writer);
+        return;
+    }
+    try writer.writeAll("invalid executable plan: pass=mlx-backend-legalization detail=\"MLX backend rejected executable plan without a specific issue\" feature=mlx-backend-executable");
 }
 
 fn executeExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator, executable_handle: backend.ExecutableHandle, device_index: usize, arguments: []const backend.BufferHandle) backend.Error!?[]backend.ExecutableOutput {
@@ -326,17 +346,26 @@ fn executeExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
                 const input = value_handles[instruction.inputs[0].index] orelse return error.CommandSubmissionFailed;
                 break :blk (try cloneBuffer(backend_impl, input)) orelse return null;
             },
+            .iota => blk: {
+                break :blk (try iota(
+                    backend_impl,
+                    executable.device_local_hardware_ids[device_index],
+                    output_descriptor.element_type,
+                    output_dims,
+                    instruction.iota_dimension orelse return null,
+                )) orelse return null;
+            },
             .convert => blk: {
                 const input = value_handles[instruction.inputs[0].index] orelse return error.CommandSubmissionFailed;
                 break :blk (try convert(backend_impl, input, output_descriptor.element_type)) orelse return null;
             },
-            .add, .subtract, .multiply, .divide, .maximum, .minimum, .power, .remainder => blk: {
+            .add, .subtract, .multiply, .divide, .maximum, .minimum, .power, .atan2, .remainder, .and_, .or_, .xor, .shift_left, .shift_right_arithmetic, .shift_right_logical => blk: {
                 const op = executableBinaryOp(instruction.kind) orelse return null;
                 const lhs = value_handles[instruction.inputs[0].index] orelse return error.CommandSubmissionFailed;
                 const rhs = value_handles[instruction.inputs[1].index] orelse return error.CommandSubmissionFailed;
                 break :blk (try binary(backend_impl, lhs, rhs, op)) orelse return null;
             },
-            .negate, .exp, .tanh, .sqrt, .rsqrt, .abs, .ceil, .floor, .log, .log1p, .logistic, .sine, .cosine, .sign => blk: {
+            .negate, .exp, .expm1, .tanh, .sqrt, .rsqrt, .abs, .ceil, .floor, .log, .log1p, .logistic, .sine, .cosine, .not_, .sign, .is_finite, .round_nearest_even => blk: {
                 const op = executableUnaryOp(instruction.kind) orelse return null;
                 const input = value_handles[instruction.inputs[0].index] orelse return error.CommandSubmissionFailed;
                 break :blk (try unary(backend_impl, input, op)) orelse return null;
@@ -454,6 +483,12 @@ fn executeExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
                 const on_false = value_handles[instruction.inputs[2].index] orelse return error.CommandSubmissionFailed;
                 break :blk (try select(backend_impl, pred, on_true, on_false, output_dims)) orelse return null;
             },
+            .clamp => blk: {
+                const min = value_handles[instruction.inputs[0].index] orelse return error.CommandSubmissionFailed;
+                const value = value_handles[instruction.inputs[1].index] orelse return error.CommandSubmissionFailed;
+                const max = value_handles[instruction.inputs[2].index] orelse return error.CommandSubmissionFailed;
+                break :blk (try clamp(backend_impl, min, value, max, output_dims)) orelse return null;
+            },
             else => return null,
         };
 
@@ -512,6 +547,7 @@ fn constantIndex(instruction_count: usize, device_index: usize, instruction_inde
 fn executableSupportsInstruction(kind_: core.PlanInstructionKind) bool {
     return switch (kind_) {
         .constant,
+        .iota,
         .copy_arg0,
         .reduce_precision,
         .convert,
@@ -522,9 +558,17 @@ fn executableSupportsInstruction(kind_: core.PlanInstructionKind) bool {
         .maximum,
         .minimum,
         .power,
+        .atan2,
         .remainder,
+        .and_,
+        .or_,
+        .xor,
+        .shift_left,
+        .shift_right_arithmetic,
+        .shift_right_logical,
         .negate,
         .exp,
+        .expm1,
         .tanh,
         .sqrt,
         .rsqrt,
@@ -536,7 +580,10 @@ fn executableSupportsInstruction(kind_: core.PlanInstructionKind) bool {
         .logistic,
         .sine,
         .cosine,
+        .not_,
         .sign,
+        .is_finite,
+        .round_nearest_even,
         .reshape,
         .transpose,
         .broadcast_in_dim,
@@ -553,9 +600,555 @@ fn executableSupportsInstruction(kind_: core.PlanInstructionKind) bool {
         .reduce_max,
         .compare,
         .select,
+        .clamp,
         => true,
         else => false,
     };
+}
+
+fn executableLoweringIssue(plan: *const core.ExecutablePlan, device_local_hardware_ids: []const i32) ?LoweringIssue {
+    if (device_local_hardware_ids.len == 0) return .{
+        .detail = "backend executable requires at least one device",
+        .feature = "mlx-device-assignment",
+    };
+    for (plan.instructions, 0..) |instruction, instruction_index| {
+        if (!executableSupportsInstruction(instruction.kind)) return .{
+            .instruction_index = instruction_index,
+            .op = instruction.kind,
+            .detail = "operation is not supported by the MLX backend executable",
+        };
+        if (instruction.outputs.len != 1) return .{
+            .instruction_index = instruction_index,
+            .op = instruction.kind,
+            .detail = "MLX executable lowering requires exactly one output per instruction",
+            .feature = "mlx-executable-values",
+        };
+        const output_id = instruction.outputs[0];
+        if (output_id.index >= plan.values.len) return .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "instruction output value is outside the executable value table",
+            .feature = "mlx-executable-values",
+        };
+        if (instructionLoweringIssue(plan, instruction, instruction_index, output_id)) |issue| return issue;
+    }
+    return null;
+}
+
+fn instructionLoweringIssue(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+    const output_descriptor = plan.values[output_id.index].descriptor;
+    return switch (instruction.kind) {
+        .constant => if (instruction.literal == null) .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "constant lowering requires an embedded literal",
+            .feature = "mlx-constant-literal",
+        } else null,
+        .iota => blk: {
+            const dim = instruction.iota_dimension orelse break :blk .{
+                .instruction_index = instruction_index,
+                .value_id = output_id,
+                .op = instruction.kind,
+                .detail = "iota lowering requires an iota dimension",
+                .feature = "mlx-iota",
+            };
+            if (dim < 0 or dim >= @as(i64, @intCast(output_descriptor.dims.len))) break :blk .{
+                .instruction_index = instruction_index,
+                .value_id = output_id,
+                .op = instruction.kind,
+                .detail = "iota dimension is outside the output rank",
+                .feature = "mlx-iota",
+            };
+            break :blk null;
+        },
+        .atan2, .and_, .or_, .xor, .shift_left, .shift_right_arithmetic, .shift_right_logical => validateBinaryElementwiseLowering(plan, instruction, instruction_index, output_id),
+        .expm1, .not_, .is_finite, .round_nearest_even => validateUnaryElementwiseLowering(plan, instruction, instruction_index, output_id),
+        .transpose => if (instruction.permutation == null) .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "transpose lowering requires a permutation",
+            .feature = "mlx-layout",
+        } else null,
+        .broadcast_in_dim => if (instruction.broadcast_dimensions == null) .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "broadcast_in_dim lowering requires broadcast dimensions",
+            .feature = "mlx-shape",
+        } else null,
+        .slice => if (instruction.start_indices == null or instruction.limit_indices == null or instruction.strides == null) .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "slice lowering requires static starts, limits, and strides",
+            .feature = "mlx-slice",
+        } else null,
+        .dynamic_slice => if (instruction.slice_sizes == null) .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "dynamic_slice lowering requires static slice sizes",
+            .feature = "mlx-dynamic-slice",
+        } else null,
+        .dynamic_update_slice => if (instruction.inputs.len < 2) .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "dynamic_update_slice lowering requires operand and update inputs",
+            .feature = "mlx-dynamic-update-slice",
+        } else null,
+        .pad => validatePadLowering(plan, instruction, instruction_index, output_id),
+        .concatenate => if (instruction.dimension == null) .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "concatenate lowering requires a dimension",
+            .feature = "mlx-concatenate",
+        } else null,
+        .gather => if (supportedGatherAxis(instruction) == null) .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "gather lowering currently supports collapsed axis-0 embedding gathers only",
+            .feature = "mlx-gather-axis0",
+        } else null,
+        .sort => validateSortLowering(instruction, instruction_index, output_id),
+        .dot_general => validateDotGeneralLowering(plan, instruction, instruction_index, output_id),
+        .reduce_sum, .reduce_max => validateReduceLowering(plan, instruction, instruction_index, output_id),
+        .compare => validateCompareLowering(plan, instruction, instruction_index, output_id),
+        .select => validateSelectLowering(plan, instruction, instruction_index, output_id),
+        .clamp => validateClampLowering(plan, instruction, instruction_index, output_id),
+        else => null,
+    };
+}
+
+fn validateBinaryElementwiseLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+    const lhs = inputDescriptor(plan, instruction, 0) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
+        .op = instruction.kind,
+        .detail = "binary operand lhs is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const rhs = inputDescriptor(plan, instruction, 1) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 1) instruction.inputs[1] else output_id,
+        .op = instruction.kind,
+        .detail = "binary operand rhs is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const output = plan.values[output_id.index].descriptor;
+    if (lhs.element_type != rhs.element_type or lhs.element_type != output.element_type or !dimsEqual(lhs.dims, rhs.dims) or !dimsEqual(lhs.dims, output.dims)) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "binary lowering requires matching input/output dtypes and shapes",
+        .feature = "mlx-elementwise-binary",
+    };
+    switch (instruction.kind) {
+        .atan2 => if (!isSupportedFloat(lhs.element_type)) return .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "atan2 lowering requires an MLX-supported floating dtype",
+            .feature = "mlx-atan2",
+        },
+        .and_, .or_, .xor => if (!isSupportedInteger(lhs.element_type) and lhs.element_type != .pred) return .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "logical/bitwise lowering requires pred or MLX-supported integer dtype",
+            .feature = "mlx-bitwise",
+        },
+        .shift_left, .shift_right_arithmetic, .shift_right_logical => if (!isSupportedInteger(lhs.element_type)) return .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "shift lowering requires an MLX-supported integer dtype",
+            .feature = "mlx-shift",
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn validateUnaryElementwiseLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+    const input = inputDescriptor(plan, instruction, 0) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
+        .op = instruction.kind,
+        .detail = "unary operand is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const output = plan.values[output_id.index].descriptor;
+    if (!dimsEqual(input.dims, output.dims)) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "unary lowering requires matching input/output shapes",
+        .feature = "mlx-elementwise-unary",
+    };
+    switch (instruction.kind) {
+        .expm1, .round_nearest_even => if (!isSupportedFloat(input.element_type) or output.element_type != input.element_type) return .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "floating unary lowering requires matching MLX-supported floating dtype",
+            .feature = "mlx-unary-float",
+        },
+        .is_finite => if (!isSupportedFloat(input.element_type) or output.element_type != .pred) return .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "is_finite lowering requires floating input and pred output",
+            .feature = "mlx-is-finite",
+        },
+        .not_ => if ((!isSupportedInteger(input.element_type) and input.element_type != .pred) or output.element_type != input.element_type) return .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "not lowering requires pred or MLX-supported integer dtype",
+            .feature = "mlx-not",
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn validatePadLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+    const low = instruction.edge_padding_low orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "pad lowering requires low edge padding",
+        .feature = "mlx-pad",
+    };
+    const high = instruction.edge_padding_high orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "pad lowering requires high edge padding",
+        .feature = "mlx-pad",
+    };
+    const interior = instruction.interior_padding orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "pad lowering requires interior padding metadata",
+        .feature = "mlx-pad",
+    };
+    for (interior) |padding| {
+        if (padding != 0) return .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "pad lowering does not support interior padding yet",
+            .feature = "mlx-pad-interior",
+        };
+    }
+    if (instruction.inputs.len < 2) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "pad lowering requires operand and scalar padding value inputs",
+        .feature = "mlx-pad",
+    };
+    const input_descriptor = inputDescriptor(plan, instruction, 0) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = instruction.inputs[0],
+        .op = instruction.kind,
+        .detail = "pad operand is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const output_descriptor = plan.values[output_id.index].descriptor;
+    if (low.len != input_descriptor.dims.len or high.len != input_descriptor.dims.len or output_descriptor.dims.len != input_descriptor.dims.len) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "pad metadata rank does not match operand/output rank",
+        .feature = "mlx-pad",
+    };
+    for (input_descriptor.dims, 0..) |dim, axis| {
+        if (low[axis] < 0 or high[axis] < 0 or output_descriptor.dims[axis] != dim + low[axis] + high[axis]) return .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "pad output shape must equal input plus non-negative edge padding",
+            .feature = "mlx-pad",
+        };
+    }
+    return null;
+}
+
+fn validateSortLowering(instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+    if (instruction.dimension == null) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "sort lowering requires a sort dimension",
+        .feature = "mlx-sort",
+    };
+    switch (instruction.compare_direction orelse .lt) {
+        .lt, .le, .gt, .ge => return null,
+        else => return .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "sort lowering supports lt/le/gt/ge comparator directions only",
+            .feature = "mlx-sort-comparator",
+        },
+    }
+}
+
+fn validateDotGeneralLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+    const lhs = inputDescriptor(plan, instruction, 0) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
+        .op = instruction.kind,
+        .detail = "dot_general lhs is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const rhs = inputDescriptor(plan, instruction, 1) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 1) instruction.inputs[1] else output_id,
+        .op = instruction.kind,
+        .detail = "dot_general rhs is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const output = plan.values[output_id.index].descriptor;
+    if (lhs.element_type != .f32 or rhs.element_type != .f32 or output.element_type != .f32) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "dot_general lowering currently supports f32 matmul-like tensors only",
+        .feature = "mlx-dot-general-f32",
+    };
+    if (!dotGeneralIsMatmulLike(
+        lhs.dims,
+        rhs.dims,
+        instruction.lhs_batch_dimensions orelse &.{},
+        instruction.rhs_batch_dimensions orelse &.{},
+        instruction.lhs_contracting_dimensions orelse &.{},
+        instruction.rhs_contracting_dimensions orelse &.{},
+        output.dims,
+    )) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "dot_general lowering currently supports matmul-like contracting dimensions only",
+        .feature = "mlx-dot-general-matmul",
+    };
+    return null;
+}
+
+fn validateReduceLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+    const input = inputDescriptor(plan, instruction, 0) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
+        .op = instruction.kind,
+        .detail = "reduce operand is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const output = plan.values[output_id.index].descriptor;
+    if (input.element_type != .f32 or output.element_type != .f32) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "reduce lowering currently supports f32 sum/max only",
+        .feature = "mlx-reduce-f32",
+    };
+    return null;
+}
+
+fn validateCompareLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+    const lhs = inputDescriptor(plan, instruction, 0) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
+        .op = instruction.kind,
+        .detail = "compare lhs is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const rhs = inputDescriptor(plan, instruction, 1) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 1) instruction.inputs[1] else output_id,
+        .op = instruction.kind,
+        .detail = "compare rhs is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const output = plan.values[output_id.index].descriptor;
+    if (lhs.element_type != .f32 or rhs.element_type != .f32 or output.element_type != .pred or !dimsEqual(lhs.dims, rhs.dims) or !dimsEqual(lhs.dims, output.dims)) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "compare lowering currently supports same-shape f32 inputs and pred outputs only",
+        .feature = "mlx-compare-f32",
+    };
+    return null;
+}
+
+fn validateSelectLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+    const pred = inputDescriptor(plan, instruction, 0) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
+        .op = instruction.kind,
+        .detail = "select predicate is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const on_true = inputDescriptor(plan, instruction, 1) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 1) instruction.inputs[1] else output_id,
+        .op = instruction.kind,
+        .detail = "select true operand is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const on_false = inputDescriptor(plan, instruction, 2) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 2) instruction.inputs[2] else output_id,
+        .op = instruction.kind,
+        .detail = "select false operand is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const output = plan.values[output_id.index].descriptor;
+    if (pred.element_type != .pred or on_true.element_type != on_false.element_type or !dimsEqual(pred.dims, on_true.dims) or !dimsEqual(on_true.dims, on_false.dims) or !dimsEqual(on_true.dims, output.dims)) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "select lowering requires same-shape pred/true/false tensors",
+        .feature = "mlx-select",
+    };
+    return null;
+}
+
+fn validateClampLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+    const min = inputDescriptor(plan, instruction, 0) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
+        .op = instruction.kind,
+        .detail = "clamp min operand is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const value = inputDescriptor(plan, instruction, 1) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 1) instruction.inputs[1] else output_id,
+        .op = instruction.kind,
+        .detail = "clamp value operand is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const max = inputDescriptor(plan, instruction, 2) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 2) instruction.inputs[2] else output_id,
+        .op = instruction.kind,
+        .detail = "clamp max operand is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const output = plan.values[output_id.index].descriptor;
+    if (min.element_type != value.element_type or max.element_type != value.element_type or output.element_type != value.element_type or !dimsEqual(value.dims, output.dims)) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "clamp lowering requires matching min/value/max/output dtypes and value/output shapes",
+        .feature = "mlx-clamp",
+    };
+    if (min.dims.len != 0 and !dimsEqual(min.dims, value.dims)) return .{
+        .instruction_index = instruction_index,
+        .value_id = instruction.inputs[0],
+        .op = instruction.kind,
+        .detail = "clamp min must be scalar or match the value shape",
+        .feature = "mlx-clamp-bounds",
+    };
+    if (max.dims.len != 0 and !dimsEqual(max.dims, value.dims)) return .{
+        .instruction_index = instruction_index,
+        .value_id = instruction.inputs[2],
+        .op = instruction.kind,
+        .detail = "clamp max must be scalar or match the value shape",
+        .feature = "mlx-clamp-bounds",
+    };
+    return null;
+}
+
+fn inputDescriptor(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, input_index: usize) ?core.BufferDescriptor {
+    if (input_index >= instruction.inputs.len) return null;
+    const id = instruction.inputs[input_index];
+    if (id.index >= plan.values.len) return null;
+    return plan.values[id.index].descriptor;
+}
+
+fn dimsEqual(lhs: []const i64, rhs: []const i64) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |a, b| if (a != b) return false;
+    return true;
+}
+
+fn isSupportedFloat(element_type: core.BufferType) bool {
+    return switch (element_type) {
+        .f16, .f32, .bf16 => true,
+        else => false,
+    };
+}
+
+fn isSupportedInteger(element_type: core.BufferType) bool {
+    return switch (element_type) {
+        .s8, .s32, .u8, .u32 => true,
+        else => false,
+    };
+}
+
+fn dotGeneralIsMatmulLike(lhs_dims: []const i64, rhs_dims: []const i64, lhs_batch: []const i64, rhs_batch: []const i64, lhs_contract: []const i64, rhs_contract: []const i64, output_dims: []const i64) bool {
+    if (lhs_contract.len != 1 or rhs_contract.len != 1 or lhs_batch.len != rhs_batch.len or lhs_dims.len == 0 or rhs_dims.len < 2 or output_dims.len == 0) return false;
+    const lhs_k = lhs_contract[0];
+    const rhs_k = rhs_contract[0];
+    if (lhs_k < 0 or rhs_k < 0) return false;
+    if (lhs_k != @as(i64, @intCast(lhs_dims.len - 1)) or rhs_k != @as(i64, @intCast(rhs_dims.len - 2))) return false;
+    if (lhs_dims[@intCast(lhs_k)] != rhs_dims[@intCast(rhs_k)]) return false;
+    for (lhs_batch, rhs_batch) |lhs_axis, rhs_axis| {
+        if (lhs_axis < 0 or rhs_axis < 0) return false;
+        if (@as(usize, @intCast(lhs_axis)) >= lhs_dims.len or @as(usize, @intCast(rhs_axis)) >= rhs_dims.len) return false;
+        if (lhs_dims[@intCast(lhs_axis)] != rhs_dims[@intCast(rhs_axis)]) return false;
+    }
+    return true;
+}
+
+fn writeLoweringIssue(plan: *const core.ExecutablePlan, issue: LoweringIssue, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.writeAll("invalid executable plan: pass=mlx-backend-legalization");
+    if (issue.instruction_index) |index| try writer.print(" instruction={d}", .{index});
+    if (issue.op) |op| try writer.print(" op={s}", .{@tagName(op)});
+    if (issue.value_id) |value_id| {
+        try writer.print(" value={d}", .{value_id.index});
+        if (value_id.index < plan.values.len) {
+            const descriptor = plan.values[value_id.index].descriptor;
+            try writer.print(" dtype={s} rank={d} shape=", .{ @tagName(descriptor.element_type), descriptor.dims.len });
+            try writeDims(writer, descriptor.dims);
+            try writer.print(" sharding={s}", .{shardingLabel(plan, value_id)});
+        }
+    }
+    try writer.print(" detail=\"{s}\" feature={s}", .{ issue.detail, issue.feature });
+}
+
+fn writeDims(writer: *std.Io.Writer, dims: []const i64) std.Io.Writer.Error!void {
+    try writer.writeAll("[");
+    for (dims, 0..) |dim, index| {
+        if (index != 0) try writer.writeAll(",");
+        try writer.print("{d}", .{dim});
+    }
+    try writer.writeAll("]");
+}
+
+fn shardingLabel(plan: *const core.ExecutablePlan, value_id: core.ValueId) []const u8 {
+    for (plan.output_ids, 0..) |output_id, index| {
+        if (output_id.index == value_id.index and index < plan.output_shardings.len) return @tagName(plan.output_shardings[index].kind);
+    }
+    if (value_id.index < plan.values.len and plan.values[value_id.index].role == .parameter) {
+        var parameter_index: usize = 0;
+        for (plan.values) |value| {
+            if (value.role != .parameter) continue;
+            if (value.id.index == value_id.index and parameter_index < plan.parameter_shardings.len) return @tagName(plan.parameter_shardings[parameter_index].kind);
+            parameter_index += 1;
+        }
+    }
+    return "internal";
 }
 
 fn destroyOwnedValueHandles(backend_impl: backend.Backend, value_handles: []?backend.BufferHandle, value_owned: []const bool) void {
@@ -596,7 +1189,13 @@ fn executableBinaryOp(instruction_kind: core.PlanInstructionKind) ?core.Elementw
         .maximum => .maximum,
         .minimum => .minimum,
         .power => .power,
+        .atan2 => .atan2,
         .remainder => .remainder,
+        .and_ => .and_,
+        .or_ => .or_,
+        .xor => .xor,
+        .shift_left => .shift_left,
+        .shift_right_arithmetic, .shift_right_logical => .shift_right_logical,
         else => null,
     };
 }
@@ -605,6 +1204,7 @@ fn executableUnaryOp(instruction_kind: core.PlanInstructionKind) ?core.Elementwi
     return switch (instruction_kind) {
         .negate => .negate,
         .exp => .exp,
+        .expm1 => .expm1,
         .tanh => .tanh,
         .sqrt => .sqrt,
         .rsqrt => .rsqrt,
@@ -616,7 +1216,10 @@ fn executableUnaryOp(instruction_kind: core.PlanInstructionKind) ?core.Elementwi
         .logistic => .logistic,
         .sine => .sine,
         .cosine => .cosine,
+        .not_ => .not_,
         .sign => .sign,
+        .is_finite => .is_finite,
+        .round_nearest_even => .round_nearest_even,
         else => null,
     };
 }
@@ -649,8 +1252,13 @@ fn mlxBinaryOpCode(op: core.ElementwiseBinaryOp) ?c_int {
         .maximum => c.PJRTX_MLX_METAL_BINARY_MAXIMUM,
         .minimum => c.PJRTX_MLX_METAL_BINARY_MINIMUM,
         .power => c.PJRTX_MLX_METAL_BINARY_POWER,
+        .atan2 => c.PJRTX_MLX_METAL_BINARY_ATAN2,
         .remainder => c.PJRTX_MLX_METAL_BINARY_REMAINDER,
-        else => null,
+        .and_ => c.PJRTX_MLX_METAL_BINARY_AND,
+        .or_ => c.PJRTX_MLX_METAL_BINARY_OR,
+        .xor => c.PJRTX_MLX_METAL_BINARY_XOR,
+        .shift_left => c.PJRTX_MLX_METAL_BINARY_SHIFT_LEFT,
+        .shift_right_arithmetic, .shift_right_logical => c.PJRTX_MLX_METAL_BINARY_SHIFT_RIGHT,
     };
 }
 
@@ -658,6 +1266,7 @@ fn mlxUnaryOpCode(op: core.ElementwiseUnaryOp) ?c_int {
     return switch (op) {
         .negate => c.PJRTX_MLX_METAL_U8_UNARY_NEGATE,
         .exp => c.PJRTX_MLX_METAL_UNARY_EXP,
+        .expm1 => c.PJRTX_MLX_METAL_UNARY_EXPM1,
         .tanh => c.PJRTX_MLX_METAL_UNARY_TANH,
         .sqrt => c.PJRTX_MLX_METAL_UNARY_SQRT,
         .rsqrt => c.PJRTX_MLX_METAL_UNARY_RSQRT,
@@ -669,7 +1278,10 @@ fn mlxUnaryOpCode(op: core.ElementwiseUnaryOp) ?c_int {
         .logistic => c.PJRTX_MLX_METAL_UNARY_LOGISTIC,
         .sine => c.PJRTX_MLX_METAL_UNARY_SIN,
         .cosine => c.PJRTX_MLX_METAL_UNARY_COS,
+        .not_ => c.PJRTX_MLX_METAL_UNARY_NOT,
         .sign => c.PJRTX_MLX_METAL_UNARY_SIGN,
+        .is_finite => c.PJRTX_MLX_METAL_UNARY_ISFINITE,
+        .round_nearest_even => c.PJRTX_MLX_METAL_UNARY_ROUND,
         else => null,
     };
 }
@@ -691,6 +1303,7 @@ const vtable: backend.Backend.VTable = .{
     .enumerateDevices = enumerateDevices,
     .releaseDeviceDescriptors = releaseDeviceDescriptors,
     .bufferFromHost = bufferFromHost,
+    .iota = iota,
     .cloneBuffer = cloneBuffer,
     .convert = convert,
     .binary = binary,
@@ -710,7 +1323,9 @@ const vtable: backend.Backend.VTable = .{
     .reduce = reduce,
     .compare = compare,
     .select = select,
+    .clamp = clamp,
     .compileExecutable = compileExecutable,
+    .writeExecutableLoweringDiagnostic = writeExecutableLoweringDiagnostic,
     .executeExecutable = executeExecutable,
     .destroyExecutable = destroyExecutable,
     .copyToHost = copyToHost,
@@ -819,4 +1434,288 @@ test "mlx metal backend executable runs resident device buffers" {
     try std.testing.expectEqual(@as(usize, 1), second_outputs.len);
     try b.copyToHost(second_outputs[0].handle, &actual);
     try std.testing.expectEqualSlices(u8, &.{ 12, 24, 36, 48 }, &actual);
+}
+
+test "mlx metal backend executable materializes iota on device" {
+    const b = create();
+    const allocator = std.testing.allocator;
+    const devices = try b.enumerateDevices(allocator, 1);
+    defer b.releaseDeviceDescriptors(allocator, devices);
+    const local_hardware_id = devices[0].local_hardware_id;
+    const dims = [_]i64{ 2, 3 };
+    const assignment = [_]i32{0};
+
+    const values = try allocator.alloc(core.Value, 1);
+    errdefer allocator.free(values);
+    values[0] = .{
+        .id = .{ .index = 0 },
+        .role = .instruction_result,
+        .descriptor = .{
+            .element_type = .f32,
+            .dims = try allocator.dupe(i64, &dims),
+            .device_id = 0,
+            .memory_id = 0,
+            .shard_index = 0,
+        },
+    };
+
+    const parameter_shardings = try allocator.alloc(core.ShardingPlan, 0);
+    const output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    output_shardings[0] = .{
+        .kind = .replicated,
+        .mesh_name = try allocator.dupe(u8, ""),
+        .device_assignment = try allocator.dupe(i32, &assignment),
+    };
+
+    var plan = core.ExecutablePlan{
+        .allocator = allocator,
+        .options = .{
+            .num_replicas = 1,
+            .num_partitions = 1,
+            .device_assignment = try allocator.dupe(i32, &assignment),
+        },
+        .values = values,
+        .parameter_shardings = parameter_shardings,
+        .output_shardings = output_shardings,
+        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }}),
+        .instructions = try allocator.dupe(core.PlanInstruction, &.{.{
+            .kind = .iota,
+            .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }}),
+            .dims = try allocator.dupe(i64, &dims),
+            .iota_dimension = 1,
+        }}),
+    };
+    defer plan.deinit();
+
+    const executable = (try b.compileExecutable(allocator, &plan, &.{local_hardware_id})) orelse return error.TestUnexpectedResult;
+    defer b.destroyExecutable(executable);
+
+    const outputs = (try b.executeExecutable(allocator, executable, 0, &.{})) orelse return error.TestUnexpectedResult;
+    defer allocator.free(outputs);
+    defer {
+        for (outputs) |output| b.destroyBuffer(output.handle);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), outputs.len);
+    try std.testing.expectEqual(core.BufferType.f32, outputs[0].element_type);
+    try std.testing.expectEqualSlices(i64, &dims, outputs[0].dims);
+    var actual: [6]f32 = undefined;
+    try b.copyToHost(outputs[0].handle, std.mem.asBytes(&actual));
+    try std.testing.expectEqualSlices(f32, &.{ 0.0, 1.0, 2.0, 0.0, 1.0, 2.0 }, &actual);
+}
+
+test "mlx metal backend executable lowers clamp with scalar bounds" {
+    const b = create();
+    const allocator = std.testing.allocator;
+    const devices = try b.enumerateDevices(allocator, 1);
+    defer b.releaseDeviceDescriptors(allocator, devices);
+    const local_hardware_id = devices[0].local_hardware_id;
+    const dims = [_]i64{3};
+    const assignment = [_]i32{0};
+    const min_literal_value: f32 = -1.0;
+    const max_literal_value: f32 = 2.0;
+
+    const values = try allocator.alloc(core.Value, 4);
+    errdefer allocator.free(values);
+    values[0] = .{
+        .id = .{ .index = 0 },
+        .role = .constant,
+        .descriptor = .{
+            .element_type = .f32,
+            .dims = try allocator.dupe(i64, &.{}),
+            .device_id = 0,
+            .memory_id = 0,
+            .shard_index = 0,
+        },
+    };
+    values[1] = .{
+        .id = .{ .index = 1 },
+        .role = .parameter,
+        .descriptor = .{
+            .element_type = .f32,
+            .dims = try allocator.dupe(i64, &dims),
+            .device_id = 0,
+            .memory_id = 0,
+            .shard_index = 0,
+        },
+    };
+    values[2] = .{
+        .id = .{ .index = 2 },
+        .role = .constant,
+        .descriptor = .{
+            .element_type = .f32,
+            .dims = try allocator.dupe(i64, &.{}),
+            .device_id = 0,
+            .memory_id = 0,
+            .shard_index = 0,
+        },
+    };
+    values[3] = .{
+        .id = .{ .index = 3 },
+        .role = .instruction_result,
+        .descriptor = .{
+            .element_type = .f32,
+            .dims = try allocator.dupe(i64, &dims),
+            .device_id = 0,
+            .memory_id = 0,
+            .shard_index = 0,
+        },
+    };
+
+    var parameter_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    parameter_shardings[0] = .{
+        .kind = .replicated,
+        .mesh_name = try allocator.dupe(u8, ""),
+        .device_assignment = try allocator.dupe(i32, &assignment),
+    };
+    var output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    output_shardings[0] = .{
+        .kind = .replicated,
+        .mesh_name = try allocator.dupe(u8, ""),
+        .device_assignment = try allocator.dupe(i32, &assignment),
+    };
+
+    var plan = core.ExecutablePlan{
+        .allocator = allocator,
+        .options = .{
+            .num_replicas = 1,
+            .num_partitions = 1,
+            .device_assignment = try allocator.dupe(i32, &assignment),
+        },
+        .values = values,
+        .parameter_shardings = parameter_shardings,
+        .output_shardings = output_shardings,
+        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 3 }}),
+        .instructions = try allocator.dupe(core.PlanInstruction, &.{
+            .{
+                .kind = .constant,
+                .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }}),
+                .literal = try allocator.dupe(u8, std.mem.asBytes(&min_literal_value)),
+            },
+            .{
+                .kind = .constant,
+                .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
+                .literal = try allocator.dupe(u8, std.mem.asBytes(&max_literal_value)),
+            },
+            .{
+                .kind = .clamp,
+                .inputs = try allocator.dupe(core.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 }, .{ .index = 2 } }),
+                .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 3 }}),
+                .dims = try allocator.dupe(i64, &dims),
+            },
+        }),
+    };
+    defer plan.deinit();
+
+    const executable = (try b.compileExecutable(allocator, &plan, &.{local_hardware_id})) orelse return error.TestUnexpectedResult;
+    defer b.destroyExecutable(executable);
+
+    const input = [_]f32{ -2.0, 0.5, 3.0 };
+    const input_buffer = (try b.bufferFromHost(local_hardware_id, .f32, &dims, std.mem.asBytes(&input))) orelse return error.TestUnexpectedResult;
+    defer b.destroyBuffer(input_buffer);
+
+    const outputs = (try b.executeExecutable(allocator, executable, 0, &.{input_buffer})) orelse return error.TestUnexpectedResult;
+    defer allocator.free(outputs);
+    defer {
+        for (outputs) |output| b.destroyBuffer(output.handle);
+    }
+
+    var actual: [3]f32 = undefined;
+    try b.copyToHost(outputs[0].handle, std.mem.asBytes(&actual));
+    try std.testing.expectEqualSlices(f32, &.{ -1.0, 0.5, 2.0 }, &actual);
+}
+
+test "mlx metal backend executable rejects unsupported gather form during lowering" {
+    const b = create();
+    const allocator = std.testing.allocator;
+    const assignment = [_]i32{0};
+    const operand_dims = [_]i64{ 4, 2 };
+    const index_dims = [_]i64{2};
+    const output_dims = [_]i64{ 2, 2 };
+
+    const values = try allocator.alloc(core.Value, 3);
+    errdefer allocator.free(values);
+    values[0] = .{
+        .id = .{ .index = 0 },
+        .role = .parameter,
+        .descriptor = .{
+            .element_type = .f32,
+            .dims = try allocator.dupe(i64, &operand_dims),
+            .device_id = 0,
+            .memory_id = 0,
+            .shard_index = 0,
+        },
+    };
+    values[1] = .{
+        .id = .{ .index = 1 },
+        .role = .parameter,
+        .descriptor = .{
+            .element_type = .s32,
+            .dims = try allocator.dupe(i64, &index_dims),
+            .device_id = 0,
+            .memory_id = 0,
+            .shard_index = 0,
+        },
+    };
+    values[2] = .{
+        .id = .{ .index = 2 },
+        .role = .instruction_result,
+        .descriptor = .{
+            .element_type = .f32,
+            .dims = try allocator.dupe(i64, &output_dims),
+            .device_id = 0,
+            .memory_id = 0,
+            .shard_index = 0,
+        },
+    };
+
+    var parameter_shardings = try allocator.alloc(core.ShardingPlan, 2);
+    parameter_shardings[0] = .{
+        .kind = .replicated,
+        .mesh_name = try allocator.dupe(u8, ""),
+        .device_assignment = try allocator.dupe(i32, &assignment),
+    };
+    parameter_shardings[1] = .{
+        .kind = .replicated,
+        .mesh_name = try allocator.dupe(u8, ""),
+        .device_assignment = try allocator.dupe(i32, &assignment),
+    };
+    var output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    output_shardings[0] = .{
+        .kind = .replicated,
+        .mesh_name = try allocator.dupe(u8, ""),
+        .device_assignment = try allocator.dupe(i32, &assignment),
+    };
+
+    var plan = core.ExecutablePlan{
+        .allocator = allocator,
+        .options = .{
+            .num_replicas = 1,
+            .num_partitions = 1,
+            .device_assignment = try allocator.dupe(i32, &assignment),
+        },
+        .values = values,
+        .parameter_shardings = parameter_shardings,
+        .output_shardings = output_shardings,
+        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
+        .instructions = try allocator.dupe(core.PlanInstruction, &.{.{
+            .kind = .gather,
+            .inputs = try allocator.dupe(core.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+            .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
+            .dims = try allocator.dupe(i64, &output_dims),
+            .start_index_map = try allocator.dupe(i64, &.{1}),
+            .collapsed_slice_dims = try allocator.dupe(i64, &.{1}),
+            .slice_sizes = try allocator.dupe(i64, &.{ 4, 1 }),
+            .index_vector_dim = 1,
+        }}),
+    };
+    defer plan.deinit();
+
+    try std.testing.expect((try b.compileExecutable(allocator, &plan, &assignment)) == null);
+    var diagnostics = std.Io.Writer.Allocating.init(allocator);
+    defer diagnostics.deinit();
+    try b.writeExecutableLoweringDiagnostic(&plan, &assignment, &diagnostics.writer);
+    const message = diagnostics.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, message, "op=gather") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "feature=mlx-gather-axis0") != null);
 }

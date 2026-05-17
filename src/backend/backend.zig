@@ -34,7 +34,7 @@ pub const Backend = struct {
         cloneBuffer: *const fn (backend: Backend, src: BufferHandle) Error!?BufferHandle,
         binary: *const fn (backend: Backend, lhs: BufferHandle, rhs: BufferHandle, op: core.ElementwiseBinaryOp) Error!?BufferHandle,
         unary: *const fn (backend: Backend, src: BufferHandle, op: core.ElementwiseUnaryOp) Error!?BufferHandle,
-        reshape: *const fn (backend: Backend, device_local_hardware_id: i32, element_type: core.BufferType, src_bytes: []const u8, dims: []const i64) Error!?BufferHandle,
+        reshape: *const fn (backend: Backend, src: BufferHandle, dims: []const i64) Error!?BufferHandle,
         transpose: *const fn (backend: Backend, src: BufferHandle, permutation: []const i64) Error!?BufferHandle,
         broadcastInDim: *const fn (backend: Backend, src: BufferHandle, broadcast_dimensions: []const i64, output_dims: []const i64) Error!?BufferHandle,
         slice: *const fn (backend: Backend, src: BufferHandle, start_indices: []const i64, limit_indices: []const i64, strides: []const i64, output_dims: []const i64) Error!?BufferHandle,
@@ -79,8 +79,8 @@ pub const Backend = struct {
         return self.vtable.unary(self, src, op);
     }
 
-    pub fn reshape(self: Backend, device_local_hardware_id: i32, element_type: core.BufferType, src_bytes: []const u8, dims: []const i64) Error!?BufferHandle {
-        return self.vtable.reshape(self, device_local_hardware_id, element_type, src_bytes, dims);
+    pub fn reshape(self: Backend, src: BufferHandle, dims: []const i64) Error!?BufferHandle {
+        return self.vtable.reshape(self, src, dims);
     }
 
     pub fn transpose(self: Backend, src: BufferHandle, permutation: []const i64) Error!?BufferHandle {
@@ -126,11 +126,11 @@ pub const Backend = struct {
 
 test "backend capability model is backend-neutral" {
     const caps: Capabilities = .{
-        .kind = .synthetic,
+        .kind = .metal_mlx,
         .name = "test",
         .supports_device_buffers = false,
         .supports_unified_memory = true,
     };
-    try std.testing.expectEqual(core.BackendKind.synthetic, caps.kind);
+    try std.testing.expectEqual(core.BackendKind.metal_mlx, caps.kind);
     try std.testing.expect(!caps.supports_device_buffers);
 }

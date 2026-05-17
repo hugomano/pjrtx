@@ -31,7 +31,7 @@ if grep -Eq 'mlx_metal_api|mlx_metal_backend' src/runtime/BUILD.bazel; then
   fail "runtime BUILD deps must stay independent of MLX backend implementation"
 fi
 
-if find src/backend -maxdepth 1 -type f \( -name 'mlx_*' -o -name 'synthetic_*' \) | grep -q .; then
+if find src/backend -maxdepth 1 -type f -name 'mlx_*' | grep -q .; then
   fail "backend implementations must live under backend-specific directories"
 fi
 

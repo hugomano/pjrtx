@@ -24,6 +24,9 @@ enum {
   PJRTX_MLX_METAL_DTYPE_U8 = 1,
   PJRTX_MLX_METAL_DTYPE_F32 = 2,
   PJRTX_MLX_METAL_DTYPE_PRED = 3,
+  PJRTX_MLX_METAL_DTYPE_S32 = 4,
+  PJRTX_MLX_METAL_DTYPE_U32 = 5,
+  PJRTX_MLX_METAL_DTYPE_S8 = 6,
 };
 
 enum {
@@ -31,6 +34,10 @@ enum {
   PJRTX_MLX_METAL_U8_BINARY_SUBTRACT = 1,
   PJRTX_MLX_METAL_U8_BINARY_MULTIPLY = 2,
   PJRTX_MLX_METAL_U8_BINARY_DIVIDE = 3,
+  PJRTX_MLX_METAL_BINARY_MAXIMUM = 4,
+  PJRTX_MLX_METAL_BINARY_MINIMUM = 5,
+  PJRTX_MLX_METAL_BINARY_POWER = 6,
+  PJRTX_MLX_METAL_BINARY_REMAINDER = 7,
 };
 
 enum {
@@ -39,6 +46,15 @@ enum {
   PJRTX_MLX_METAL_UNARY_TANH = 2,
   PJRTX_MLX_METAL_UNARY_SQRT = 3,
   PJRTX_MLX_METAL_UNARY_RSQRT = 4,
+  PJRTX_MLX_METAL_UNARY_ABS = 5,
+  PJRTX_MLX_METAL_UNARY_CEIL = 6,
+  PJRTX_MLX_METAL_UNARY_FLOOR = 7,
+  PJRTX_MLX_METAL_UNARY_LOG = 8,
+  PJRTX_MLX_METAL_UNARY_LOG1P = 9,
+  PJRTX_MLX_METAL_UNARY_LOGISTIC = 10,
+  PJRTX_MLX_METAL_UNARY_SIN = 11,
+  PJRTX_MLX_METAL_UNARY_COS = 12,
+  PJRTX_MLX_METAL_UNARY_SIGN = 13,
 };
 
 enum {
@@ -79,6 +95,8 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_binary(
     PjrtxMlxMetalBuffer* lhs, PjrtxMlxMetalBuffer* rhs, int op);
 PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_unary(
     PjrtxMlxMetalBuffer* src, int op);
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_reshape(
+    PjrtxMlxMetalBuffer* src, const int64_t* dims, uint64_t rank);
 PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_transpose(
     PjrtxMlxMetalBuffer* src, const int64_t* permutation, uint64_t rank);
 PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_broadcast_in_dim(
@@ -109,6 +127,7 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_select(
     PjrtxMlxMetalBuffer* on_false, const int64_t* output_dims,
     uint64_t output_rank);
 uint64_t pjrtx_mlx_metal_buffer_size(PjrtxMlxMetalBuffer* buffer);
+int pjrtx_mlx_metal_buffer_has_host_shadow(PjrtxMlxMetalBuffer* buffer);
 int pjrtx_mlx_metal_buffer_copy_to_host(PjrtxMlxMetalBuffer* buffer, void* dst,
                                         uint64_t dst_size);
 void pjrtx_mlx_metal_buffer_destroy(PjrtxMlxMetalBuffer* buffer);

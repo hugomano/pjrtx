@@ -64,8 +64,7 @@ def import_jax() -> tuple[Any, Any]:
 
 def register_plugin(path: pathlib.Path) -> None:
     options: dict[str, str | int] = {
-        "pjrtx_backend": os.environ.get("PJRTX_BACKEND", "synthetic"),
-        "pjrtx_synthetic_device_count": int(os.environ.get("PJRTX_SYNTHETIC_DEVICE_COUNT", "1")),
+        "pjrtx_backend": os.environ.get("PJRTX_BACKEND", "metal_mlx"),
     }
 
     from jax._src import xla_bridge as xb  # type: ignore[import-not-found]

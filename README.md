@@ -33,11 +33,11 @@ bazel run //tests/jax:jax_plugin_smoke
 bazel test //tests/jax:jax_plugin_smoke_test --test_output=streamed
 ```
 
-The runner defaults to the synthetic backend so it can shake out PJRT/JAX ABI
-behavior before depending on physical Metal availability:
+The runner uses the MLX/Metal backend. PjRTx currently supports only this
+backend:
 
 ```sh
-PJRTX_BACKEND=synthetic PJRTX_SYNTHETIC_DEVICE_COUNT=1 bazel run //tests/jax:jax_plugin_smoke
+PJRTX_BACKEND=metal_mlx bazel run //tests/jax:jax_plugin_smoke
 ```
 
 The default `.bazelrc` uses:
@@ -80,9 +80,9 @@ The architecture imports these ZML/v2 principles:
   with DMA/pinned staging and overlapped host-to-device writes.
 - Sharding is first-class: meshes, shardings, placements, and manual shard-local
   computation are compiler/runtime data, not backend side channels.
-- Optimized libraries are pluggable backends: MLX is the first real backend,
-  but attention kernels, future Neuron-like hardware, CUDA/ROCm, and synthetic
-  tests should all slot behind PjRTx-owned interfaces.
+- Optimized libraries are pluggable backends: MLX/Metal is the only supported
+  backend today, while attention kernels, future Neuron-like hardware, and
+  CUDA/ROCm should all slot behind PjRTx-owned interfaces later.
 
 - `src/core`: backend-neutral value types for dtype, shape, layout, sharding,
   device ids, memory ids, topology, buffer descriptors, placements, compile
@@ -96,9 +96,9 @@ The architecture imports these ZML/v2 principles:
   scheduling. Runtime consumes PjRTx executable plans and dispatches through a
   backend vtable with opaque backend buffer handles. It does not import MLX,
   Metal, or C symbols.
-- `src/backend`: the PjRTx backend interface plus implementations. Synthetic is
-  first-class for tests and multi-device simulation. MLX/Metal specifics live
-  under `src/backend/mlx_metal` behind the private C++ C ABI shim.
+- `src/backend`: the PjRTx backend interface plus implementations. MLX/Metal
+  specifics live under `src/backend/mlx_metal` behind the private C++ C ABI
+  shim.
 - `src/plugin`: PJRT C API adapter only. It parses PJRT inputs, selects a
   backend through the backend registry, calls compiler/runtime APIs, and
   translates results back into PJRT structs. It does not import MLX symbols.
@@ -122,20 +122,25 @@ The compiler contract keeps these concepts separate:
 - `ExecutablePlan`: topology, compile options, sharding plans, values,
   instructions, device assignment, memory plan, and backend legalization data.
 - `Buffer`: runtime storage for a placed value shard, with logical descriptor,
-  placement, opaque backend handle, optional host/debug cache, and readiness.
+  placement, opaque backend handle, byte-size metadata, and readiness. Host
+  memory is only an explicit transfer source/sink at PJRT boundaries, never a
+  persistent mirror of device storage.
 
-The bootstrap linear executor still walks instructions over buffers for smoke
-tests, but the contract evolves toward value graphs plus backend legalization so
-other backends can lower to command buffers, graphs, fused kernels, streams,
-DMA copies, or library calls without pretending every op is a buffer allocation.
+Compile now materializes a runtime `ExecutableGraph` from the PjRTx plan.
+Execution enters through that graph per device, then dispatches through
+backend-neutral runtime operations. The next lowering step is to legalize graph
+nodes into backend command fragments so devices enqueue MLX kernels, collectives,
+custom calls, DMA copies, or library calls directly without pretending every op
+is a buffer allocation.
 
 ## Current Status
 
-- `src/runtime`: explicit client/device/memory/topology/buffer ownership model,
-  including synthetic 2/4+ device test coverage, stable PJRT handle arrays, and
-  backend-neutral buffer placement/storage split. Buffers keep a host shadow for
-  bootstrap correctness and may own an opaque backend buffer for transfer-path
-  coverage. Operations are not modeled as buffers in the compiler contract:
+- `src/runtime`: explicit client/device/memory/topology/buffer/executable-graph
+  ownership model, including stable PJRT handle arrays, per-device graph nodes,
+  and backend-neutral buffer
+  placement/storage split. Buffers are moving to backend-owned storage as the
+  source of truth; host memory is an ingress/egress transfer medium, not a
+  runtime cache. Operations are not modeled as buffers in the compiler contract:
   PjRTx plans contain logical values and instructions, while runtime buffers are
   only materialized storage for placed value shards.
 - `third_party/mlx`: pinned MLX vendor module at
@@ -151,15 +156,14 @@ DMA copies, or library calls without pretending every op is a buffer allocation.
   Metal header target and linked against the sandboxed macOS SDK framework
   slices. No host Xcode SDK paths are used.
 - `src/backend`: a Zig backend vtable/interface plus backend-specific package
-  directories. `src/backend/synthetic` owns synthetic multi-device simulation.
-  `src/backend/mlx_metal` owns the small private C ABI shim over vendored MLX
+  directories. `src/backend/mlx_metal` owns the small private C ABI shim over vendored MLX
   Metal headers and MLX device APIs. It copies MLX Metal device names and
   recommended working-set sizes into plain C structs so Zig never owns
-  C++/Objective-C objects. The same shim exposes opaque buffers that always keep
-  bootstrap host bytes and opportunistically keep an MLX array when the vendored
-  runtime can construct one, avoiding MLX's non-hermetic default `mlx.metallib`
-  load during plain PJRT host-buffer ownership. The typed constructor preserves
-  dtype and shape metadata for the MLX array path. Elementwise `u8` and `f32`
+  C++/Objective-C objects. The same shim exposes opaque buffers that keep MLX
+  arrays only; host bytes are transient at `buffer_from_host` and
+  `copy_to_host`. There is no persistent host shadow in the MLX backend. The
+  typed constructor preserves dtype and shape metadata for the MLX array path.
+  Elementwise `u8` and `f32`
   arithmetic plus f32 unary math, transpose, broadcast-in-dim, slice, and
   concatenate now run through
   `mlx::core::{add,subtract,multiply,divide,floor_divide,negative,exp,tanh,sqrt,rsqrt,transpose,reshape,broadcast_to,slice,concatenate}`
@@ -176,8 +180,10 @@ DMA copies, or library calls without pretending every op is a buffer allocation.
   plan instructions for StableHLO add/subtract/multiply/divide/negate, f32
   exp/tanh/sqrt/rsqrt, shape metadata for StableHLO reshape, transpose
   permutations, broadcast dimensions, slice start/limit/stride metadata from
-  MLIR DenseI64ArrayAttr, and concatenate dimensions from MLIR integer
-  attributes), and emits precise diagnostics
+  MLIR DenseI64ArrayAttr, concatenate dimensions from MLIR integer attributes,
+  and the ZML-declared heavy/control/random/structural op shells including
+  `cholesky`, `custom_call`, `partition_id`, `reduce_precision`, `rng`,
+  `rng_bit_generator`, `scatter`, `tuple`, and `while`), and emits precise diagnostics
   through `std.Io.Writer` for unsupported ops, GSPMD shardings, CHLO/shape
   interop, and invalid StableHLO portable artifacts. JAX-provided VHLO/StableHLO
   portable artifacts are deserialized at the StableHLO frontend boundary before
@@ -187,18 +193,30 @@ DMA copies, or library calls without pretending every op is a buffer allocation.
 - `src/plugin`: Zig shared library exporting `GetPjrtApi` and a PJRT API table
   with plugin attributes, errors, events, client/device/memory enumeration,
   host buffer copies, compile skeleton, loaded executable metadata, and
-  per-device execute plumbing. Bootstrap execute now dispatches through runtime
-  from compiled executable plans: empty bootstrap programs copy arg0, linear
+  per-device execute plumbing. Compile builds a runtime executable graph from
+  the compiler plan; execute calls that graph for each selected device and no
+  longer owns instruction scheduling in the PJRT adapter. Bootstrap graph
+  execution currently lowers through runtime buffer operations: empty bootstrap
+  programs copy arg0, linear
   StableHLO arithmetic chains execute the bootstrap `u8` and `f32` elementwise
   paths for matching buffers, StableHLO reshape preserves bytes while updating
   buffer dimensions and typed MLX metadata, StableHLO transpose performs dense
   row-major layout permutation, StableHLO broadcast-in-dim expands dense buffers
   with explicit output dimensions, StableHLO slice performs dense strided
-  slicing with explicit bounds, and StableHLO concatenate joins two dense
-  buffers along the compiled dimension.
-  `PJRT_Client_Create` accepts `pjrtx_backend`
-  (`metal_mlx` or `synthetic`) plus `pjrtx_synthetic_device_count` as an int64
-  create option for synthetic multi-device tests. `PJRT_Client_Compile` accepts
+  slicing with explicit bounds, StableHLO concatenate joins two dense buffers
+  along the compiled dimension, StableHLO `reduce_precision` is an identity
+  device copy, `partition_id` materializes scalar partition ids, deterministic
+  bootstrap `rng`/`rng_bit_generator` paths exist for tests, and f32 dense
+  `cholesky` currently has a correctness implementation that must move behind a
+  backend-native linear algebra hook before it is accepted as a fast path.
+  Region/control/complex-heavy
+  operations that need real staged lowering (`while`, `tuple`,
+  `get_tuple_element`, `scatter`, `convolution`, `custom_call`,
+  `triangular_solve`, `fft`, `complex`/`real`/`imag`) fail with explicit
+  `UNIMPLEMENTED` feature diagnostics instead of leaking through buffer-level
+  execution.
+  `PJRT_Client_Create` accepts `pjrtx_backend=metal_mlx`; other backend names
+  are rejected. `PJRT_Client_Compile` accepts
   the bootstrap text compile
   options form used by the compiler tests:
   `replicas=2; partitions=2; use_shardy=true; assignment=0,1,2,3`.
@@ -211,9 +229,18 @@ bazel-bin/src/plugin/libpjrtx_metal_plugin.dylib
 
 ## Next Implementation Steps
 
-- Grow the staged PjRTx IR passes: shape/type/layout verification, topology
-  validation, memory-space planning, tiling/shard planning, async dependency
-  modeling, fusion marking, and backend legalization.
-- Implement the initial StableHLO op set and JAX CPU-vs-PjRTx correctness tests.
-- Add focused backend conformance tests so synthetic and MLX backends prove the
-  same buffer/execution semantics through the vtable.
+- Finish the runtime cutover to device-only storage. Runtime buffers should keep
+  backend handles live across instruction chains, never cache host mirrors, and
+  hand backend-native operations to MLX without synchronizing after every op.
+- Expand the MLX backend implementation for the LLM hot path: f32 binary/unary
+  math, compare/select, reductions, matmul-like `dot_general`, shape/view ops,
+  and then backend-native gather/pad/dynamic-slice/update where MLX exposes the
+  right primitive.
+- Add a backend legalization/pipeline stage to turn PjRTx value graphs into
+  per-device command fragments: memory placement, layout, tiling/shard planning,
+  async dependencies, fusion candidate groups, and final backend kernel/library
+  dispatch. CPU/host reference code remains test-only oracle code, not runtime
+  execution.
+- Add focused MLX backend conformance tests for buffer/execution semantics
+  through the vtable, with extra tests asserting MLX chains do not copy device
+  intermediates back to host.

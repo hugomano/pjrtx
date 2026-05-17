@@ -86,8 +86,9 @@ fn unary(_: backend.Backend, src: backend.BufferHandle, op: core.ElementwiseUnar
     return @ptrCast(handle);
 }
 
-fn reshape(b: backend.Backend, device_local_hardware_id: i32, element_type: core.BufferType, src_bytes: []const u8, dims: []const i64) backend.Error!?backend.BufferHandle {
-    return bufferFromHost(b, device_local_hardware_id, element_type, dims, src_bytes);
+fn reshape(_: backend.Backend, src: backend.BufferHandle, dims: []const i64) backend.Error!?backend.BufferHandle {
+    const handle = c.pjrtx_mlx_metal_buffer_reshape(@ptrCast(@alignCast(src)), dims.ptr, dims.len) orelse return error.CommandSubmissionFailed;
+    return @ptrCast(handle);
 }
 
 fn transpose(_: backend.Backend, src: backend.BufferHandle, permutation: []const i64) backend.Error!?backend.BufferHandle {
@@ -165,7 +166,10 @@ fn cNameBytes(name: *const [128]u8) []const u8 {
 fn mlxDtype(element_type: core.BufferType) ?c_int {
     return switch (element_type) {
         .pred => c.PJRTX_MLX_METAL_DTYPE_PRED,
+        .s8 => c.PJRTX_MLX_METAL_DTYPE_S8,
+        .s32 => c.PJRTX_MLX_METAL_DTYPE_S32,
         .u8 => c.PJRTX_MLX_METAL_DTYPE_U8,
+        .u32 => c.PJRTX_MLX_METAL_DTYPE_U32,
         .f32 => c.PJRTX_MLX_METAL_DTYPE_F32,
         else => null,
     };
@@ -177,6 +181,10 @@ fn mlxBinaryOpCode(op: core.ElementwiseBinaryOp) ?c_int {
         .subtract => c.PJRTX_MLX_METAL_U8_BINARY_SUBTRACT,
         .multiply => c.PJRTX_MLX_METAL_U8_BINARY_MULTIPLY,
         .divide => c.PJRTX_MLX_METAL_U8_BINARY_DIVIDE,
+        .maximum => c.PJRTX_MLX_METAL_BINARY_MAXIMUM,
+        .minimum => c.PJRTX_MLX_METAL_BINARY_MINIMUM,
+        .power => c.PJRTX_MLX_METAL_BINARY_POWER,
+        .remainder => c.PJRTX_MLX_METAL_BINARY_REMAINDER,
         else => null,
     };
 }
@@ -188,6 +196,15 @@ fn mlxUnaryOpCode(op: core.ElementwiseUnaryOp) ?c_int {
         .tanh => c.PJRTX_MLX_METAL_UNARY_TANH,
         .sqrt => c.PJRTX_MLX_METAL_UNARY_SQRT,
         .rsqrt => c.PJRTX_MLX_METAL_UNARY_RSQRT,
+        .abs => c.PJRTX_MLX_METAL_UNARY_ABS,
+        .ceil => c.PJRTX_MLX_METAL_UNARY_CEIL,
+        .floor => c.PJRTX_MLX_METAL_UNARY_FLOOR,
+        .log => c.PJRTX_MLX_METAL_UNARY_LOG,
+        .log1p => c.PJRTX_MLX_METAL_UNARY_LOG1P,
+        .logistic => c.PJRTX_MLX_METAL_UNARY_LOGISTIC,
+        .sine => c.PJRTX_MLX_METAL_UNARY_SIN,
+        .cosine => c.PJRTX_MLX_METAL_UNARY_COS,
+        .sign => c.PJRTX_MLX_METAL_UNARY_SIGN,
         else => null,
     };
 }

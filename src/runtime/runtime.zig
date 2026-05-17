@@ -178,6 +178,450 @@ pub const Client = struct {
     }
 };
 
+pub const GraphNodeKind = enum {
+    constant,
+    parameter,
+    compute,
+    collective,
+    custom_call,
+    control_flow,
+    structural,
+};
+
+pub const GraphNode = struct {
+    instruction_index: usize,
+    device_index: usize,
+    device_id: i32,
+    kind: GraphNodeKind,
+};
+
+pub const ExecutableGraph = struct {
+    allocator: std.mem.Allocator,
+    device_ids: []i32,
+    nodes: []GraphNode,
+
+    pub fn init(allocator: std.mem.Allocator, client: *const Client, plan: *const core.ExecutablePlan) !ExecutableGraph {
+        const device_count = plan.options.numDevices();
+        if (device_count == 0 or device_count > client.devices.len) return error.InvalidGraph;
+
+        const device_ids = try allocator.alloc(i32, device_count);
+        errdefer allocator.free(device_ids);
+        for (device_ids, 0..) |*device_id, i| {
+            device_id.* = if (plan.options.device_assignment.len != 0)
+                plan.options.device_assignment[i]
+            else
+                client.devices[i].id;
+            if (client.lookupDevice(device_id.*) == null) return error.InvalidGraph;
+        }
+
+        const node_count = std.math.mul(usize, plan.instructions.len, device_count) catch return error.InvalidGraph;
+        const nodes = try allocator.alloc(GraphNode, node_count);
+        errdefer allocator.free(nodes);
+
+        var out: usize = 0;
+        for (0..device_count) |device_index| {
+            for (plan.instructions, 0..) |instruction, instruction_index| {
+                nodes[out] = .{
+                    .instruction_index = instruction_index,
+                    .device_index = device_index,
+                    .device_id = device_ids[device_index],
+                    .kind = graphNodeKind(instruction.kind),
+                };
+                out += 1;
+            }
+        }
+
+        return .{
+            .allocator = allocator,
+            .device_ids = device_ids,
+            .nodes = nodes,
+        };
+    }
+
+    pub fn deinit(self: *ExecutableGraph) void {
+        self.allocator.free(self.nodes);
+        self.allocator.free(self.device_ids);
+        self.* = undefined;
+    }
+
+    pub fn executeDevice(
+        self: *const ExecutableGraph,
+        allocator: std.mem.Allocator,
+        client: *Client,
+        plan: *const core.ExecutablePlan,
+        device_index: usize,
+        arguments: []const *Buffer,
+    ) GraphExecuteError![]*Buffer {
+        if (device_index >= self.device_ids.len or device_index >= client.devices.len) return error.InvalidArgument;
+        if (plan.instructions.len == 0) return error.UnsupportedRuntimeFeature;
+        if (arguments.len < plan.parameter_shardings.len) return error.InvalidArgument;
+
+        var value_buffers = try allocator.alloc(?*Buffer, plan.values.len);
+        defer allocator.free(value_buffers);
+        @memset(value_buffers, null);
+
+        var value_owned = try allocator.alloc(bool, plan.values.len);
+        defer allocator.free(value_owned);
+        @memset(value_owned, false);
+        defer destroyExecuteValues(value_buffers, value_owned);
+
+        var parameter_index: usize = 0;
+        for (plan.values) |value| {
+            if (value.role != .parameter) continue;
+            if (parameter_index >= arguments.len) return error.InvalidArgument;
+            if (value.id.index >= value_buffers.len) return error.InvalidArgument;
+            value_buffers[value.id.index] = arguments[parameter_index];
+            parameter_index += 1;
+        }
+
+        for (plan.instructions) |instruction| {
+            try self.executeInstruction(allocator, client, plan, instruction, value_buffers, value_owned, device_index);
+        }
+
+        const outputs = try allocator.alloc(*Buffer, plan.output_ids.len);
+        errdefer allocator.free(outputs);
+        var initialized_outputs: usize = 0;
+        errdefer {
+            for (outputs[0..initialized_outputs]) |buffer| buffer.deinit();
+        }
+
+        for (plan.output_ids, 0..) |output_id, output_index| {
+            if (output_id.index >= value_buffers.len) return error.Internal;
+            const output_buffer = value_buffers[output_id.index] orelse return error.Internal;
+            if (value_owned[output_id.index]) {
+                outputs[output_index] = output_buffer;
+                value_owned[output_id.index] = false;
+            } else {
+                outputs[output_index] = Buffer.initDeviceCopy(allocator, output_buffer, device_index) catch |err| return mapBufferError(err);
+            }
+            initialized_outputs += 1;
+        }
+
+        return outputs;
+    }
+
+    fn executeInstruction(
+        self: *const ExecutableGraph,
+        allocator: std.mem.Allocator,
+        client: *Client,
+        plan: *const core.ExecutablePlan,
+        instruction: core.PlanInstruction,
+        value_buffers: []?*Buffer,
+        value_owned: []bool,
+        device_index: usize,
+    ) GraphExecuteError!void {
+        _ = self;
+        if (instruction.kind == .rng_bit_generator) {
+            if (instruction.inputs.len < 1 or instruction.outputs.len != 2) return error.InvalidArgument;
+            const state_input = value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument;
+            const state_output = Buffer.initRngStateUpdate(allocator, state_input, device_index) catch |err| return mapBufferError(err);
+            errdefer state_output.deinit();
+            const bits_descriptor = plan.values[instruction.outputs[1].index].descriptor;
+            const bits_output = Buffer.initRngBits(
+                allocator,
+                state_input,
+                bits_descriptor.element_type,
+                instruction.dims orelse bits_descriptor.dims,
+                device_index,
+            ) catch |err| return mapBufferError(err);
+            value_buffers[instruction.outputs[0].index] = state_output;
+            value_owned[instruction.outputs[0].index] = true;
+            value_buffers[instruction.outputs[1].index] = bits_output;
+            value_owned[instruction.outputs[1].index] = true;
+            return;
+        }
+
+        if (instruction.outputs.len != 1) return error.InvalidArgument;
+        const output_id = instruction.outputs[0];
+        if (output_id.index >= value_buffers.len) return error.InvalidArgument;
+
+        const next = switch (instruction.kind) {
+            .constant => blk: {
+                const descriptor = plan.values[output_id.index].descriptor;
+                const device = &client.devices[device_index];
+                break :blk Buffer.initHostCopyForBackend(
+                    allocator,
+                    client.backend,
+                    descriptor.element_type,
+                    descriptor.dims,
+                    device,
+                    device.default_memory,
+                    device_index,
+                    instruction.literal orelse &.{},
+                ) catch |err| return mapBufferError(err);
+            },
+            .copy_arg0, .reduce_precision => Buffer.initDeviceCopy(allocator, value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument, device_index) catch |err| return mapBufferError(err),
+            .partition_id => blk: {
+                const descriptor = plan.values[output_id.index].descriptor;
+                const device = &client.devices[device_index];
+                break :blk Buffer.initPartitionId(
+                    allocator,
+                    client.backend,
+                    descriptor.element_type,
+                    descriptor.dims,
+                    device,
+                    device.default_memory,
+                    @intCast(device_index),
+                    device_index,
+                ) catch |err| return mapBufferError(err);
+            },
+            .cholesky => Buffer.initCholesky(
+                allocator,
+                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
+                instruction.lower orelse true,
+                instruction.dims orelse plan.values[output_id.index].descriptor.dims,
+                device_index,
+            ) catch |err| return mapBufferError(err),
+            .rng => Buffer.initRngUniform(
+                allocator,
+                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
+                value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
+                plan.values[output_id.index].descriptor.element_type,
+                instruction.dims orelse plan.values[output_id.index].descriptor.dims,
+                device_index,
+            ) catch |err| return mapBufferError(err),
+            .add, .subtract, .multiply, .divide, .maximum, .minimum, .power, .atan2, .remainder, .and_, .or_, .xor, .shift_left, .shift_right_arithmetic, .shift_right_logical => Buffer.initElementwiseBinary(
+                allocator,
+                runtimeBinaryOp(instruction.kind) orelse return error.UnsupportedRuntimeFeature,
+                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
+                value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
+                device_index,
+            ) catch |err| return mapBufferError(err),
+            .negate, .exp, .expm1, .tanh, .sqrt, .rsqrt, .abs, .cbrt, .ceil, .floor, .log, .log1p, .logistic, .sine, .cosine, .not_, .sign, .is_finite, .round_nearest_afz, .round_nearest_even, .popcnt, .count_leading_zeros => Buffer.initElementwiseUnaryTyped(
+                allocator,
+                runtimeUnaryOp(instruction.kind) orelse return error.UnsupportedRuntimeFeature,
+                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
+                plan.values[output_id.index].descriptor.element_type,
+                instruction.dims orelse plan.values[output_id.index].descriptor.dims,
+                device_index,
+            ) catch |err| return mapBufferError(err),
+            .convert, .bitcast_convert => Buffer.initConvert(
+                allocator,
+                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
+                plan.values[output_id.index].descriptor.element_type,
+                instruction.dims orelse plan.values[output_id.index].descriptor.dims,
+                device_index,
+            ) catch |err| return mapBufferError(err),
+            .iota => blk: {
+                const descriptor = plan.values[output_id.index].descriptor;
+                const device = &client.devices[device_index];
+                break :blk Buffer.initIota(
+                    allocator,
+                    client.backend,
+                    descriptor.element_type,
+                    instruction.dims orelse descriptor.dims,
+                    device,
+                    device.default_memory,
+                    instruction.iota_dimension orelse 0,
+                    device_index,
+                ) catch |err| return mapBufferError(err);
+            },
+            .reshape => Buffer.initReshape(allocator, value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument, instruction.dims orelse &.{}, device_index) catch |err| return mapBufferError(err),
+            .transpose => Buffer.initTranspose(allocator, value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument, instruction.permutation orelse &.{}, instruction.dims orelse &.{}, device_index) catch |err| return mapBufferError(err),
+            .broadcast_in_dim => Buffer.initBroadcastInDim(allocator, value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument, instruction.broadcast_dimensions orelse &.{}, instruction.dims orelse &.{}, device_index) catch |err| return mapBufferError(err),
+            .slice => Buffer.initSlice(
+                allocator,
+                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
+                instruction.start_indices orelse &.{},
+                instruction.limit_indices orelse &.{},
+                instruction.strides orelse &.{},
+                instruction.dims orelse &.{},
+                device_index,
+            ) catch |err| return mapBufferError(err),
+            .dynamic_slice => blk: {
+                const starts = try allocator.alloc(*Buffer, instruction.inputs.len - 1);
+                defer allocator.free(starts);
+                for (instruction.inputs[1..], 0..) |input_id, i| starts[i] = value_buffers[input_id.index] orelse return error.InvalidArgument;
+                break :blk Buffer.initDynamicSlice(
+                    allocator,
+                    value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
+                    starts,
+                    instruction.slice_sizes orelse &.{},
+                    instruction.dims orelse &.{},
+                    device_index,
+                ) catch |err| return mapBufferError(err);
+            },
+            .dynamic_update_slice => blk: {
+                const starts = try allocator.alloc(*Buffer, instruction.inputs.len - 2);
+                defer allocator.free(starts);
+                for (instruction.inputs[2..], 0..) |input_id, i| starts[i] = value_buffers[input_id.index] orelse return error.InvalidArgument;
+                break :blk Buffer.initDynamicUpdateSlice(
+                    allocator,
+                    value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
+                    value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
+                    starts,
+                    instruction.dims orelse &.{},
+                    device_index,
+                ) catch |err| return mapBufferError(err);
+            },
+            .pad => Buffer.initPad(
+                allocator,
+                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
+                value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
+                instruction.edge_padding_low orelse &.{},
+                instruction.edge_padding_high orelse &.{},
+                instruction.interior_padding orelse &.{},
+                instruction.dims orelse &.{},
+                device_index,
+            ) catch |err| return mapBufferError(err),
+            .reverse => Buffer.initReverse(allocator, value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument, instruction.dimensions orelse &.{}, instruction.dims orelse &.{}, device_index) catch |err| return mapBufferError(err),
+            .concatenate => Buffer.initConcatenate(
+                allocator,
+                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
+                value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
+                instruction.dimension orelse 0,
+                instruction.dims orelse &.{},
+                device_index,
+            ) catch |err| return mapBufferError(err),
+            .dot_general => Buffer.initDotGeneral(
+                allocator,
+                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
+                value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
+                instruction.lhs_batch_dimensions orelse &.{},
+                instruction.rhs_batch_dimensions orelse &.{},
+                instruction.lhs_contracting_dimensions orelse &.{},
+                instruction.rhs_contracting_dimensions orelse &.{},
+                instruction.dims orelse &.{},
+                device_index,
+            ) catch |err| return mapBufferError(err),
+            .reduce_sum, .reduce_max => Buffer.initReduce(allocator, instruction.kind, value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument, instruction.reduce_dimensions orelse &.{}, instruction.dims orelse &.{}, device_index) catch |err| return mapBufferError(err),
+            .gather => Buffer.initGather(
+                allocator,
+                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
+                value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
+                instruction.offset_dims orelse &.{},
+                instruction.collapsed_slice_dims orelse &.{},
+                instruction.operand_batching_dims orelse &.{},
+                instruction.start_indices_batching_dims orelse &.{},
+                instruction.start_index_map orelse &.{},
+                instruction.index_vector_dim orelse 0,
+                instruction.slice_sizes orelse &.{},
+                instruction.dims orelse &.{},
+                device_index,
+            ) catch |err| return mapBufferError(err),
+            .compare => Buffer.initCompare(
+                allocator,
+                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
+                value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
+                instruction.compare_direction orelse .eq,
+                instruction.dims orelse &.{},
+                device_index,
+            ) catch |err| return mapBufferError(err),
+            .select => Buffer.initSelect(
+                allocator,
+                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
+                value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
+                value_buffers[instruction.inputs[2].index] orelse return error.InvalidArgument,
+                instruction.dims orelse &.{},
+                device_index,
+            ) catch |err| return mapBufferError(err),
+            .clamp => Buffer.initClamp(
+                allocator,
+                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
+                value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
+                value_buffers[instruction.inputs[2].index] orelse return error.InvalidArgument,
+                instruction.dims orelse &.{},
+                device_index,
+            ) catch |err| return mapBufferError(err),
+            .rng_bit_generator => unreachable,
+            .complex, .real, .imag, .fft, .convolution, .custom_call, .get_tuple_element, .scatter, .triangular_solve, .tuple, .while_, .unsupported => return error.UnsupportedRuntimeFeature,
+        };
+
+        if (value_owned[output_id.index]) {
+            if (value_buffers[output_id.index]) |old| old.deinit();
+        }
+        value_buffers[output_id.index] = next;
+        value_owned[output_id.index] = true;
+    }
+};
+
+pub const GraphExecuteError = error{
+    OutOfMemory,
+    InvalidArgument,
+    UnsupportedElementType,
+    ShapeMismatch,
+    UnsupportedRuntimeFeature,
+    Internal,
+};
+
+fn graphNodeKind(kind: core.PlanInstructionKind) GraphNodeKind {
+    return switch (kind) {
+        .constant => .constant,
+        .custom_call => .custom_call,
+        .while_ => .control_flow,
+        .tuple, .get_tuple_element => .structural,
+        else => .compute,
+    };
+}
+
+fn destroyOwnedBuffer(buffer: *Buffer, owned: bool) void {
+    if (owned) buffer.deinit();
+}
+
+fn destroyExecuteValues(value_buffers: []?*Buffer, value_owned: []const bool) void {
+    for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+}
+
+fn mapBufferError(err: anyerror) GraphExecuteError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.UnsupportedElementType => error.UnsupportedElementType,
+        error.ShapeMismatch => error.ShapeMismatch,
+        error.InvalidArgument => error.InvalidArgument,
+        error.UnsupportedRuntimeFeature => error.UnsupportedRuntimeFeature,
+        else => error.Internal,
+    };
+}
+
+fn runtimeBinaryOp(kind: core.PlanInstructionKind) ?ElementwiseBinaryOp {
+    return switch (kind) {
+        .add => .add,
+        .subtract => .subtract,
+        .multiply => .multiply,
+        .divide => .divide,
+        .maximum => .maximum,
+        .minimum => .minimum,
+        .power => .power,
+        .atan2 => .atan2,
+        .remainder => .remainder,
+        .and_ => .and_,
+        .or_ => .or_,
+        .xor => .xor,
+        .shift_left => .shift_left,
+        .shift_right_arithmetic => .shift_right_arithmetic,
+        .shift_right_logical => .shift_right_logical,
+        else => null,
+    };
+}
+
+fn runtimeUnaryOp(kind: core.PlanInstructionKind) ?ElementwiseUnaryOp {
+    return switch (kind) {
+        .negate => .negate,
+        .exp => .exp,
+        .expm1 => .expm1,
+        .tanh => .tanh,
+        .sqrt => .sqrt,
+        .rsqrt => .rsqrt,
+        .abs => .abs,
+        .cbrt => .cbrt,
+        .ceil => .ceil,
+        .floor => .floor,
+        .log => .log,
+        .log1p => .log1p,
+        .logistic => .logistic,
+        .sine => .sine,
+        .cosine => .cosine,
+        .not_ => .not_,
+        .sign => .sign,
+        .is_finite => .is_finite,
+        .round_nearest_afz => .round_nearest_afz,
+        .round_nearest_even => .round_nearest_even,
+        .popcnt => .popcnt,
+        .count_leading_zeros => .count_leading_zeros,
+        else => null,
+    };
+}
+
 pub const Buffer = struct {
     allocator: std.mem.Allocator,
     backend: backend_api.Backend,
@@ -189,9 +633,46 @@ pub const Buffer = struct {
     device: *Device,
     memory: *Memory,
     shard_index: usize,
+    byte_size: usize,
     bytes: []u8,
     backend_buffer: ?backend_api.BufferHandle = null,
     deleted: bool = false,
+
+    fn initBackendOnly(
+        allocator: std.mem.Allocator,
+        src: *Buffer,
+        element_type: BufferType,
+        dims_: []const i64,
+        byte_size: usize,
+        backend_buffer: backend_api.BufferHandle,
+        shard_index: usize,
+    ) !*Buffer {
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+
+        const dims = try allocator.dupe(i64, dims_);
+        errdefer allocator.free(dims);
+
+        const bytes = try allocator.alloc(u8, 0);
+        errdefer allocator.free(bytes);
+
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = src.backend,
+            .backend_kind = src.backend_kind,
+            .element_type = element_type,
+            .dims = dims,
+            .device_id = src.device_id,
+            .memory_id = src.memory_id,
+            .device = src.device,
+            .memory = src.memory,
+            .shard_index = shard_index,
+            .byte_size = byte_size,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer;
+    }
 
     pub fn initHostCopyForBackend(
         allocator: std.mem.Allocator,
@@ -209,11 +690,11 @@ pub const Buffer = struct {
         const dims = try allocator.dupe(i64, dims_);
         errdefer allocator.free(dims);
 
-        const bytes = try allocator.dupe(u8, src);
-        errdefer allocator.free(bytes);
-
         const backend_buffer = try backend_impl.bufferFromHost(device.local_hardware_id, element_type, dims, src);
         errdefer if (backend_buffer) |owned| backend_impl.destroyBuffer(owned);
+
+        const bytes = if (backend_buffer != null) try allocator.alloc(u8, 0) else try allocator.dupe(u8, src);
+        errdefer allocator.free(bytes);
 
         buffer.* = .{
             .allocator = allocator,
@@ -226,6 +707,7 @@ pub const Buffer = struct {
             .device = device,
             .memory = memory,
             .shard_index = shard_index,
+            .byte_size = src.len,
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
@@ -243,14 +725,14 @@ pub const Buffer = struct {
         const dims = try allocator.dupe(i64, src.dims);
         errdefer allocator.free(dims);
 
-        const bytes = try allocator.dupe(u8, src.bytes);
-        errdefer allocator.free(bytes);
-
         var backend_buffer: ?backend_api.BufferHandle = null;
         if (src.backend_buffer) |src_backend| {
             backend_buffer = try src.backend.cloneBuffer(src_backend);
         }
         errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
+
+        const bytes = if (backend_buffer != null) try allocator.alloc(u8, 0) else try allocator.dupe(u8, src.bytes);
+        errdefer allocator.free(bytes);
 
         buffer.* = .{
             .allocator = allocator,
@@ -263,6 +745,302 @@ pub const Buffer = struct {
             .device = src.device,
             .memory = src.memory,
             .shard_index = shard_index,
+            .byte_size = src.byte_size,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer;
+    }
+
+    pub fn initPartitionId(
+        allocator: std.mem.Allocator,
+        backend_impl: backend_api.Backend,
+        output_type: BufferType,
+        output_dims: []const i64,
+        device: *Device,
+        memory: *Memory,
+        partition_id: u32,
+        shard_index: usize,
+    ) !*Buffer {
+        if (output_dims.len != 0) return error.ShapeMismatch;
+        if (output_type != .u32 and output_type != .s32) return error.UnsupportedElementType;
+
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+
+        const dims = try allocator.dupe(i64, output_dims);
+        errdefer allocator.free(dims);
+
+        const bytes = try allocator.alloc(u8, output_type.byteSize());
+        errdefer allocator.free(bytes);
+        switch (output_type) {
+            .u32 => writeU32LE(bytes, 0, partition_id),
+            .s32 => writeI32LE(bytes, 0, @intCast(partition_id)),
+            else => unreachable,
+        }
+
+        const backend_buffer = backend_impl.bufferFromHost(device.local_hardware_id, output_type, output_dims, bytes) catch null;
+        errdefer if (backend_buffer) |owned| backend_impl.destroyBuffer(owned);
+        const storage_bytes = if (backend_buffer != null) try allocator.alloc(u8, 0) else bytes;
+        errdefer if (backend_buffer != null) allocator.free(storage_bytes);
+
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = backend_impl,
+            .backend_kind = backend_impl.kind(),
+            .element_type = output_type,
+            .dims = dims,
+            .device_id = device.id,
+            .memory_id = memory.id,
+            .device = device,
+            .memory = memory,
+            .shard_index = shard_index,
+            .byte_size = bytes.len,
+            .bytes = storage_bytes,
+            .backend_buffer = backend_buffer,
+        };
+        if (backend_buffer != null) allocator.free(bytes);
+        return buffer;
+    }
+
+    pub fn initCholesky(
+        allocator: std.mem.Allocator,
+        src: *Buffer,
+        lower: bool,
+        output_dims: []const i64,
+        shard_index: usize,
+    ) !*Buffer {
+        if (src.element_type != .f32) return error.UnsupportedElementType;
+        if (src.bytes.len == 0) return error.UnsupportedRuntimeFeature;
+        if (!std.mem.eql(i64, src.dims, output_dims) or output_dims.len < 2) return error.ShapeMismatch;
+        const n_i64 = output_dims[output_dims.len - 1];
+        const rows_i64 = output_dims[output_dims.len - 2];
+        if (n_i64 <= 0 or rows_i64 != n_i64) return error.ShapeMismatch;
+        const n: usize = @intCast(n_i64);
+        const matrix_elems = n * n;
+        const element_count = src.bytes.len / 4;
+        if (element_count % matrix_elems != 0) return error.ShapeMismatch;
+
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+
+        const dims = try allocator.dupe(i64, output_dims);
+        errdefer allocator.free(dims);
+
+        const bytes = try allocator.alloc(u8, src.bytes.len);
+        errdefer allocator.free(bytes);
+        @memset(bytes, 0);
+
+        const batches = element_count / matrix_elems;
+        for (0..batches) |batch| {
+            const base = batch * matrix_elems;
+            for (0..n) |i| {
+                for (0..i + 1) |j| {
+                    var sum = readF32LE(src.bytes, base + i * n + j);
+                    for (0..j) |k| {
+                        sum -= readF32LE(bytes, base + i * n + k) * readF32LE(bytes, base + j * n + k);
+                    }
+                    if (i == j) {
+                        if (sum < 0.0) return error.ShapeMismatch;
+                        writeF32LE(bytes, base + i * n + j, std.math.sqrt(sum));
+                    } else {
+                        const diag = readF32LE(bytes, base + j * n + j);
+                        if (diag == 0.0) return error.ShapeMismatch;
+                        writeF32LE(bytes, base + i * n + j, sum / diag);
+                    }
+                }
+            }
+            if (!lower) {
+                for (0..n) |row| {
+                    for (0..row) |col| {
+                        const value = readF32LE(bytes, base + row * n + col);
+                        writeF32LE(bytes, base + col * n + row, value);
+                        writeF32LE(bytes, base + row * n + col, 0.0);
+                    }
+                }
+            }
+        }
+
+        const backend_buffer = src.backend.bufferFromHost(src.device.local_hardware_id, .f32, output_dims, bytes) catch null;
+        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
+
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = src.backend,
+            .backend_kind = src.backend_kind,
+            .element_type = .f32,
+            .dims = dims,
+            .device_id = src.device_id,
+            .memory_id = src.memory_id,
+            .device = src.device,
+            .memory = src.memory,
+            .shard_index = shard_index,
+            .byte_size = bytes.len,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer;
+    }
+
+    pub fn initRngUniform(
+        allocator: std.mem.Allocator,
+        min: *Buffer,
+        max: *Buffer,
+        output_type: BufferType,
+        output_dims: []const i64,
+        shard_index: usize,
+    ) !*Buffer {
+        if (output_type != .f32 and output_type != .u32 and output_type != .s32) return error.UnsupportedElementType;
+        if (min.element_type != max.element_type or min.element_type != output_type) return error.UnsupportedElementType;
+        if (min.bytes.len == 0 or max.bytes.len == 0) return error.UnsupportedRuntimeFeature;
+        if (min.bytes.len != output_type.byteSize() or max.bytes.len != output_type.byteSize()) return error.ShapeMismatch;
+
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+
+        const dims = try allocator.dupe(i64, output_dims);
+        errdefer allocator.free(dims);
+
+        const bytes = try allocator.alloc(u8, denseByteSize(output_type, output_dims));
+        errdefer allocator.free(bytes);
+        var state = seedFromBytes(min.bytes) ^ rotl64(seedFromBytes(max.bytes), 17) ^ @as(u64, @intCast(shard_index + 1));
+        const count = if (output_type.byteSize() == 0) 0 else bytes.len / output_type.byteSize();
+        for (0..count) |i| {
+            const rnd = nextRandomU32(&state);
+            switch (output_type) {
+                .f32 => {
+                    const lo = readF32LE(min.bytes, 0);
+                    const hi = readF32LE(max.bytes, 0);
+                    const unit = @as(f32, @floatFromInt(rnd)) / @as(f32, @floatFromInt(std.math.maxInt(u32)));
+                    writeF32LE(bytes, i, lo + (hi - lo) * unit);
+                },
+                .u32 => {
+                    const lo = readU32LE(min.bytes, 0);
+                    const hi = readU32LE(max.bytes, 0);
+                    const span = if (hi > lo) hi - lo else 1;
+                    writeU32LE(bytes, i, lo + rnd % span);
+                },
+                .s32 => {
+                    const lo = readI32LE(min.bytes, 0);
+                    const hi = readI32LE(max.bytes, 0);
+                    const span: u32 = if (hi > lo) @intCast(hi - lo) else 1;
+                    writeI32LE(bytes, i, lo + @as(i32, @intCast(rnd % span)));
+                },
+                else => unreachable,
+            }
+        }
+
+        const backend_buffer = min.backend.bufferFromHost(min.device.local_hardware_id, output_type, output_dims, bytes) catch null;
+        errdefer if (backend_buffer) |owned| min.backend.destroyBuffer(owned);
+
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = min.backend,
+            .backend_kind = min.backend_kind,
+            .element_type = output_type,
+            .dims = dims,
+            .device_id = min.device_id,
+            .memory_id = min.memory_id,
+            .device = min.device,
+            .memory = min.memory,
+            .shard_index = shard_index,
+            .byte_size = bytes.len,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer;
+    }
+
+    pub fn initRngBits(
+        allocator: std.mem.Allocator,
+        state: *Buffer,
+        output_type: BufferType,
+        output_dims: []const i64,
+        shard_index: usize,
+    ) !*Buffer {
+        if (output_type != .u32 and output_type != .s32) return error.UnsupportedElementType;
+        if (state.bytes.len == 0) return error.UnsupportedRuntimeFeature;
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+
+        const dims = try allocator.dupe(i64, output_dims);
+        errdefer allocator.free(dims);
+
+        const bytes = try allocator.alloc(u8, denseByteSize(output_type, output_dims));
+        errdefer allocator.free(bytes);
+        var rng_state = seedFromBytes(state.bytes) ^ @as(u64, @intCast(shard_index + 1));
+        const count = bytes.len / output_type.byteSize();
+        for (0..count) |i| {
+            const value = nextRandomU32(&rng_state);
+            switch (output_type) {
+                .u32 => writeU32LE(bytes, i, value),
+                .s32 => writeI32LE(bytes, i, @bitCast(value)),
+                else => unreachable,
+            }
+        }
+
+        const backend_buffer = state.backend.bufferFromHost(state.device.local_hardware_id, output_type, output_dims, bytes) catch null;
+        errdefer if (backend_buffer) |owned| state.backend.destroyBuffer(owned);
+
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = state.backend,
+            .backend_kind = state.backend_kind,
+            .element_type = output_type,
+            .dims = dims,
+            .device_id = state.device_id,
+            .memory_id = state.memory_id,
+            .device = state.device,
+            .memory = state.memory,
+            .shard_index = shard_index,
+            .byte_size = bytes.len,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer;
+    }
+
+    pub fn initRngStateUpdate(
+        allocator: std.mem.Allocator,
+        state: *Buffer,
+        shard_index: usize,
+    ) !*Buffer {
+        if (state.element_type.byteSize() == 0) return error.UnsupportedElementType;
+        if (state.bytes.len == 0) return error.UnsupportedRuntimeFeature;
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+
+        const dims = try allocator.dupe(i64, state.dims);
+        errdefer allocator.free(dims);
+
+        const bytes = try allocator.alloc(u8, state.bytes.len);
+        errdefer allocator.free(bytes);
+        var rng_state = seedFromBytes(state.bytes) ^ rotl64(@as(u64, @intCast(shard_index + 1)), 17);
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const value = nextRandomU32(&rng_state);
+            var word: [4]u8 = undefined;
+            std.mem.writeInt(u32, &word, value, .little);
+            const n = @min(bytes.len - offset, word.len);
+            @memcpy(bytes[offset..][0..n], word[0..n]);
+            offset += n;
+        }
+
+        const backend_buffer = state.backend.bufferFromHost(state.device.local_hardware_id, state.element_type, state.dims, bytes) catch null;
+        errdefer if (backend_buffer) |owned| state.backend.destroyBuffer(owned);
+
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = state.backend,
+            .backend_kind = state.backend_kind,
+            .element_type = state.element_type,
+            .dims = dims,
+            .device_id = state.device_id,
+            .memory_id = state.memory_id,
+            .device = state.device,
+            .memory = state.memory,
+            .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
@@ -278,7 +1056,12 @@ pub const Buffer = struct {
     ) !*Buffer {
         if (lhs.element_type != rhs.element_type) return error.UnsupportedElementType;
         if (lhs.element_type.byteSize() == 0) return error.UnsupportedElementType;
-        if (!std.mem.eql(i64, lhs.dims, rhs.dims) or lhs.bytes.len != rhs.bytes.len) return error.ShapeMismatch;
+        if (!std.mem.eql(i64, lhs.dims, rhs.dims) or lhs.byte_size != rhs.byte_size) return error.ShapeMismatch;
+        if (lhs.backend_buffer != null and rhs.backend_buffer != null) {
+            if (lhs.backend.binary(lhs.backend_buffer.?, rhs.backend_buffer.?, op) catch null) |backend_buffer| {
+                return initBackendOnly(allocator, lhs, lhs.element_type, lhs.dims, lhs.byte_size, backend_buffer, shard_index);
+            }
+        }
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
@@ -391,12 +1174,6 @@ pub const Buffer = struct {
             else => return error.UnsupportedElementType,
         }
 
-        var backend_buffer: ?backend_api.BufferHandle = null;
-        if (lhs.backend_buffer != null and rhs.backend_buffer != null) {
-            backend_buffer = lhs.backend.binary(lhs.backend_buffer.?, rhs.backend_buffer.?, op) catch null;
-        }
-        errdefer if (backend_buffer) |owned| lhs.backend.destroyBuffer(owned);
-
         buffer.* = .{
             .allocator = allocator,
             .backend = lhs.backend,
@@ -408,8 +1185,9 @@ pub const Buffer = struct {
             .device = lhs.device,
             .memory = lhs.memory,
             .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
-            .backend_buffer = backend_buffer,
+            .backend_buffer = null,
         };
         return buffer;
     }
@@ -453,6 +1231,14 @@ pub const Buffer = struct {
     ) !*Buffer {
         if (!std.mem.eql(i64, src.dims, output_dims)) return error.ShapeMismatch;
         if (src.element_type.byteSize() == 0 or output_type.byteSize() == 0) return error.UnsupportedElementType;
+        const output_byte_size = denseByteSize(output_type, output_dims);
+        if (src.backend_buffer) |src_backend| {
+            if (output_type == src.element_type) {
+                if (src.backend.unary(src_backend, op) catch null) |backend_buffer| {
+                    return initBackendOnly(allocator, src, output_type, output_dims, output_byte_size, backend_buffer, shard_index);
+                }
+            }
+        }
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
@@ -460,7 +1246,7 @@ pub const Buffer = struct {
         const dims = try allocator.dupe(i64, output_dims);
         errdefer allocator.free(dims);
 
-        const bytes = try allocator.alloc(u8, denseByteSize(output_type, output_dims));
+        const bytes = try allocator.alloc(u8, output_byte_size);
         errdefer allocator.free(bytes);
         switch (src.element_type) {
             .pred => {
@@ -551,12 +1337,6 @@ pub const Buffer = struct {
             else => return error.UnsupportedElementType,
         }
 
-        var backend_buffer: ?backend_api.BufferHandle = null;
-        if (src.backend_buffer) |src_backend| {
-            backend_buffer = src.backend.unary(src_backend, op) catch null;
-        }
-        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
-
         buffer.* = .{
             .allocator = allocator,
             .backend = src.backend,
@@ -568,8 +1348,9 @@ pub const Buffer = struct {
             .device = src.device,
             .memory = src.memory,
             .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
-            .backend_buffer = backend_buffer,
+            .backend_buffer = null,
         };
         return buffer;
     }
@@ -581,7 +1362,12 @@ pub const Buffer = struct {
         shard_index: usize,
     ) !*Buffer {
         if (src.element_type.byteSize() == 0) return error.UnsupportedElementType;
-        if (denseByteSize(src.element_type, new_dims) != src.bytes.len) return error.ShapeMismatch;
+        if (denseByteSize(src.element_type, new_dims) != src.byte_size) return error.ShapeMismatch;
+        if (src.backend_buffer) |src_backend| {
+            if (src.backend.reshape(src_backend, new_dims) catch null) |backend_buffer| {
+                return initBackendOnly(allocator, src, src.element_type, new_dims, src.byte_size, backend_buffer, shard_index);
+            }
+        }
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
@@ -591,9 +1377,6 @@ pub const Buffer = struct {
 
         const bytes = try allocator.dupe(u8, src.bytes);
         errdefer allocator.free(bytes);
-
-        const backend_buffer = src.backend.reshape(src.device.local_hardware_id, src.element_type, src.bytes, new_dims) catch null;
-        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
 
         buffer.* = .{
             .allocator = allocator,
@@ -606,8 +1389,9 @@ pub const Buffer = struct {
             .device = src.device,
             .memory = src.memory,
             .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
-            .backend_buffer = backend_buffer,
+            .backend_buffer = null,
         };
         return buffer;
     }
@@ -621,9 +1405,14 @@ pub const Buffer = struct {
     ) !*Buffer {
         if (!validPermutation(permutation, src.dims.len)) return error.ShapeMismatch;
         if (new_dims.len != permutation.len) return error.ShapeMismatch;
-        if (denseByteSize(src.element_type, new_dims) != src.bytes.len) return error.ShapeMismatch;
+        if (denseByteSize(src.element_type, new_dims) != src.byte_size) return error.ShapeMismatch;
         const element_size = src.element_type.byteSize();
         if (element_size == 0) return error.UnsupportedElementType;
+        if (src.backend_buffer) |src_backend| {
+            if (src.backend.transpose(src_backend, permutation) catch null) |backend_buffer| {
+                return initBackendOnly(allocator, src, src.element_type, new_dims, src.byte_size, backend_buffer, shard_index);
+            }
+        }
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
@@ -654,12 +1443,6 @@ pub const Buffer = struct {
             );
         }
 
-        var backend_buffer: ?backend_api.BufferHandle = null;
-        if (src.backend_buffer) |src_backend| {
-            backend_buffer = src.backend.transpose(src_backend, permutation) catch null;
-        }
-        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
-
         buffer.* = .{
             .allocator = allocator,
             .backend = src.backend,
@@ -671,8 +1454,9 @@ pub const Buffer = struct {
             .device = src.device,
             .memory = src.memory,
             .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
-            .backend_buffer = backend_buffer,
+            .backend_buffer = null,
         };
         return buffer;
     }
@@ -688,6 +1472,11 @@ pub const Buffer = struct {
         const element_size = src.element_type.byteSize();
         if (element_size == 0) return error.UnsupportedElementType;
         const output_byte_size = denseByteSize(src.element_type, output_dims);
+        if (src.backend_buffer) |src_backend| {
+            if (src.backend.broadcastInDim(src_backend, broadcast_dimensions, output_dims) catch null) |backend_buffer| {
+                return initBackendOnly(allocator, src, src.element_type, output_dims, output_byte_size, backend_buffer, shard_index);
+            }
+        }
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
@@ -720,12 +1509,6 @@ pub const Buffer = struct {
             );
         }
 
-        var backend_buffer: ?backend_api.BufferHandle = null;
-        if (src.backend_buffer) |src_backend| {
-            backend_buffer = src.backend.broadcastInDim(src_backend, broadcast_dimensions, output_dims) catch null;
-        }
-        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
-
         buffer.* = .{
             .allocator = allocator,
             .backend = src.backend,
@@ -737,8 +1520,9 @@ pub const Buffer = struct {
             .device = src.device,
             .memory = src.memory,
             .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
-            .backend_buffer = backend_buffer,
+            .backend_buffer = null,
         };
         return buffer;
     }
@@ -756,6 +1540,11 @@ pub const Buffer = struct {
         const element_size = src.element_type.byteSize();
         if (element_size == 0) return error.UnsupportedElementType;
         const output_byte_size = denseByteSize(src.element_type, output_dims);
+        if (src.backend_buffer) |src_backend| {
+            if (src.backend.slice(src_backend, start_indices, limit_indices, strides_, output_dims) catch null) |backend_buffer| {
+                return initBackendOnly(allocator, src, src.element_type, output_dims, output_byte_size, backend_buffer, shard_index);
+            }
+        }
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
@@ -787,12 +1576,6 @@ pub const Buffer = struct {
             );
         }
 
-        var backend_buffer: ?backend_api.BufferHandle = null;
-        if (src.backend_buffer) |src_backend| {
-            backend_buffer = src.backend.slice(src_backend, start_indices, limit_indices, strides_, output_dims) catch null;
-        }
-        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
-
         buffer.* = .{
             .allocator = allocator,
             .backend = src.backend,
@@ -804,8 +1587,9 @@ pub const Buffer = struct {
             .device = src.device,
             .memory = src.memory,
             .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
-            .backend_buffer = backend_buffer,
+            .backend_buffer = null,
         };
         return buffer;
     }
@@ -823,6 +1607,11 @@ pub const Buffer = struct {
         const element_size = lhs.element_type.byteSize();
         if (element_size == 0) return error.UnsupportedElementType;
         const output_byte_size = denseByteSize(lhs.element_type, output_dims);
+        if (lhs.backend_buffer != null and rhs.backend_buffer != null) {
+            if (lhs.backend.concatenate(lhs.backend_buffer.?, rhs.backend_buffer.?, dimension, output_dims) catch null) |backend_buffer| {
+                return initBackendOnly(allocator, lhs, lhs.element_type, output_dims, output_byte_size, backend_buffer, shard_index);
+            }
+        }
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
@@ -869,12 +1658,6 @@ pub const Buffer = struct {
             }
         }
 
-        var backend_buffer: ?backend_api.BufferHandle = null;
-        if (lhs.backend_buffer != null and rhs.backend_buffer != null) {
-            backend_buffer = lhs.backend.concatenate(lhs.backend_buffer.?, rhs.backend_buffer.?, dimension, output_dims) catch null;
-        }
-        errdefer if (backend_buffer) |owned| lhs.backend.destroyBuffer(owned);
-
         buffer.* = .{
             .allocator = allocator,
             .backend = lhs.backend,
@@ -886,8 +1669,9 @@ pub const Buffer = struct {
             .device = lhs.device,
             .memory = lhs.memory,
             .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
-            .backend_buffer = backend_buffer,
+            .backend_buffer = null,
         };
         return buffer;
     }
@@ -905,6 +1689,12 @@ pub const Buffer = struct {
     ) !*Buffer {
         if (lhs.element_type != .f32 or rhs.element_type != .f32) return error.UnsupportedElementType;
         if (!validDotGeneral(lhs.dims, rhs.dims, lhs_batch_dimensions, rhs_batch_dimensions, lhs_contracting_dimensions, rhs_contracting_dimensions, output_dims)) return error.ShapeMismatch;
+        const output_byte_size = denseByteSize(.f32, output_dims);
+        if (lhs.backend_buffer != null and rhs.backend_buffer != null) {
+            if (lhs.backend.dotGeneral(lhs.backend_buffer.?, rhs.backend_buffer.?, lhs_batch_dimensions, rhs_batch_dimensions, lhs_contracting_dimensions, rhs_contracting_dimensions, output_dims) catch null) |backend_buffer| {
+                return initBackendOnly(allocator, lhs, .f32, output_dims, output_byte_size, backend_buffer, shard_index);
+            }
+        }
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
@@ -912,17 +1702,10 @@ pub const Buffer = struct {
         const dims = try allocator.dupe(i64, output_dims);
         errdefer allocator.free(dims);
 
-        const output_byte_size = denseByteSize(.f32, output_dims);
         const bytes = try allocator.alloc(u8, output_byte_size);
         errdefer allocator.free(bytes);
 
         try evalDotGeneralF32(allocator, lhs.bytes, lhs.dims, rhs.bytes, rhs.dims, lhs_batch_dimensions, rhs_batch_dimensions, lhs_contracting_dimensions, rhs_contracting_dimensions, output_dims, bytes);
-
-        var backend_buffer: ?backend_api.BufferHandle = null;
-        if (lhs.backend_buffer != null and rhs.backend_buffer != null) {
-            backend_buffer = lhs.backend.dotGeneral(lhs.backend_buffer.?, rhs.backend_buffer.?, lhs_batch_dimensions, rhs_batch_dimensions, lhs_contracting_dimensions, rhs_contracting_dimensions, output_dims) catch null;
-        }
-        errdefer if (backend_buffer) |owned| lhs.backend.destroyBuffer(owned);
 
         buffer.* = .{
             .allocator = allocator,
@@ -935,8 +1718,9 @@ pub const Buffer = struct {
             .device = lhs.device,
             .memory = lhs.memory,
             .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
-            .backend_buffer = backend_buffer,
+            .backend_buffer = null,
         };
         return buffer;
     }
@@ -952,6 +1736,12 @@ pub const Buffer = struct {
         if (src.element_type != .f32) return error.UnsupportedElementType;
         if (kind != .reduce_sum and kind != .reduce_max) return error.UnsupportedElementType;
         if (!validReduce(src.dims, dimensions, output_dims)) return error.ShapeMismatch;
+        const output_byte_size = denseByteSize(.f32, output_dims);
+        if (src.backend_buffer) |src_backend| {
+            if (src.backend.reduce(src_backend, kind, dimensions, output_dims) catch null) |backend_buffer| {
+                return initBackendOnly(allocator, src, .f32, output_dims, output_byte_size, backend_buffer, shard_index);
+            }
+        }
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
@@ -959,17 +1749,10 @@ pub const Buffer = struct {
         const dims = try allocator.dupe(i64, output_dims);
         errdefer allocator.free(dims);
 
-        const output_byte_size = denseByteSize(.f32, output_dims);
         const bytes = try allocator.alloc(u8, output_byte_size);
         errdefer allocator.free(bytes);
 
         try evalReduceF32(allocator, kind, src.bytes, src.dims, dimensions, output_dims, bytes);
-
-        var backend_buffer: ?backend_api.BufferHandle = null;
-        if (src.backend_buffer) |src_backend| {
-            backend_buffer = src.backend.reduce(src_backend, kind, dimensions, output_dims) catch null;
-        }
-        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
 
         buffer.* = .{
             .allocator = allocator,
@@ -982,8 +1765,9 @@ pub const Buffer = struct {
             .device = src.device,
             .memory = src.memory,
             .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
-            .backend_buffer = backend_buffer,
+            .backend_buffer = null,
         };
         return buffer;
     }
@@ -998,6 +1782,12 @@ pub const Buffer = struct {
     ) !*Buffer {
         if (lhs.element_type != rhs.element_type) return error.UnsupportedElementType;
         if (!std.mem.eql(i64, lhs.dims, rhs.dims) or !std.mem.eql(i64, lhs.dims, output_dims)) return error.ShapeMismatch;
+        const output_byte_size = denseByteSize(.pred, output_dims);
+        if (lhs.backend_buffer != null and rhs.backend_buffer != null) {
+            if (lhs.backend.compare(lhs.backend_buffer.?, rhs.backend_buffer.?, direction, output_dims) catch null) |backend_buffer| {
+                return initBackendOnly(allocator, lhs, .pred, output_dims, output_byte_size, backend_buffer, shard_index);
+            }
+        }
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
@@ -1014,12 +1804,6 @@ pub const Buffer = struct {
             bytes[i] = if (compareElement(lhs.element_type, lhs.bytes, rhs.bytes, i, direction)) 1 else 0;
         }
 
-        var backend_buffer: ?backend_api.BufferHandle = null;
-        if (lhs.backend_buffer != null and rhs.backend_buffer != null) {
-            backend_buffer = lhs.backend.compare(lhs.backend_buffer.?, rhs.backend_buffer.?, direction, output_dims) catch null;
-        }
-        errdefer if (backend_buffer) |owned| lhs.backend.destroyBuffer(owned);
-
         buffer.* = .{
             .allocator = allocator,
             .backend = lhs.backend,
@@ -1031,8 +1815,9 @@ pub const Buffer = struct {
             .device = lhs.device,
             .memory = lhs.memory,
             .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
-            .backend_buffer = backend_buffer,
+            .backend_buffer = null,
         };
         return buffer;
     }
@@ -1050,6 +1835,11 @@ pub const Buffer = struct {
         if (!std.mem.eql(i64, on_true.dims, on_false.dims) or !std.mem.eql(i64, on_true.dims, output_dims) or !std.mem.eql(i64, pred.dims, output_dims)) return error.ShapeMismatch;
         const element_size = on_true.element_type.byteSize();
         if (element_size == 0) return error.UnsupportedElementType;
+        if (pred.backend_buffer != null and on_true.backend_buffer != null and on_false.backend_buffer != null) {
+            if (on_true.backend.select(pred.backend_buffer.?, on_true.backend_buffer.?, on_false.backend_buffer.?, output_dims) catch null) |backend_buffer| {
+                return initBackendOnly(allocator, on_true, on_true.element_type, output_dims, denseByteSize(on_true.element_type, output_dims), backend_buffer, shard_index);
+            }
+        }
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
@@ -1065,12 +1855,6 @@ pub const Buffer = struct {
             @memcpy(bytes[i * element_size ..][0..element_size], src[i * element_size ..][0..element_size]);
         }
 
-        var backend_buffer: ?backend_api.BufferHandle = null;
-        if (pred.backend_buffer != null and on_true.backend_buffer != null and on_false.backend_buffer != null) {
-            backend_buffer = on_true.backend.select(pred.backend_buffer.?, on_true.backend_buffer.?, on_false.backend_buffer.?, output_dims) catch null;
-        }
-        errdefer if (backend_buffer) |owned| on_true.backend.destroyBuffer(owned);
-
         buffer.* = .{
             .allocator = allocator,
             .backend = on_true.backend,
@@ -1082,8 +1866,9 @@ pub const Buffer = struct {
             .device = on_true.device,
             .memory = on_true.memory,
             .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
-            .backend_buffer = backend_buffer,
+            .backend_buffer = null,
         };
         return buffer;
     }
@@ -1128,6 +1913,7 @@ pub const Buffer = struct {
             .device = src.device,
             .memory = src.memory,
             .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
@@ -1180,6 +1966,7 @@ pub const Buffer = struct {
             .device = device,
             .memory = memory,
             .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
@@ -1231,6 +2018,7 @@ pub const Buffer = struct {
             .device = src.device,
             .memory = src.memory,
             .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
@@ -1280,6 +2068,7 @@ pub const Buffer = struct {
             .device = value_buffer.device,
             .memory = value_buffer.memory,
             .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
@@ -1369,6 +2158,7 @@ pub const Buffer = struct {
             .device = src.device,
             .memory = src.memory,
             .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
@@ -1430,6 +2220,7 @@ pub const Buffer = struct {
             .device = src.device,
             .memory = src.memory,
             .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
@@ -1523,6 +2314,7 @@ pub const Buffer = struct {
             .device = operand.device,
             .memory = operand.memory,
             .shard_index = shard_index,
+            .byte_size = bytes.len,
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
@@ -1547,12 +2339,12 @@ pub const Buffer = struct {
     }
 
     pub fn copyToHost(self: *Buffer, dst: []u8) !void {
-        if (dst.len < self.bytes.len) return error.DestinationTooSmall;
+        if (dst.len < self.byte_size) return error.DestinationTooSmall;
         if (self.backend_buffer) |backend_buffer| {
             self.backend.copyToHost(backend_buffer, dst) catch return error.BackendBufferCopyFailed;
             return;
         }
-        @memcpy(dst[0..self.bytes.len], self.bytes);
+        @memcpy(dst[0..self.byte_size], self.bytes[0..self.byte_size]);
     }
 
     pub fn hasBackendStorage(self: *const Buffer) bool {
@@ -1715,6 +2507,28 @@ fn readU32LE(bytes: []const u8, index: usize) u32 {
 
 fn writeU32LE(bytes: []u8, index: usize, value: u32) void {
     std.mem.writeInt(u32, bytes[index * 4 ..][0..4], value, .little);
+}
+
+fn seedFromBytes(bytes: []const u8) u64 {
+    var hash: u64 = 0xcbf29ce484222325;
+    for (bytes) |byte| {
+        hash ^= byte;
+        hash *%= 0x100000001b3;
+    }
+    return if (hash == 0) 0x9e3779b97f4a7c15 else hash;
+}
+
+fn rotl64(value: u64, amount: u6) u64 {
+    return std.math.rotl(u64, value, amount);
+}
+
+fn nextRandomU32(state: *u64) u32 {
+    var x = state.*;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    state.* = if (x == 0) 0x9e3779b97f4a7c15 else x;
+    return @truncate(x >> 32);
 }
 
 fn compareF32(lhs: f32, rhs: f32, direction: CompareOp) bool {
@@ -1896,12 +2710,12 @@ fn evalDotGeneralF32(
     }
 }
 
-fn syntheticBackendForTest() backend_api.Backend {
-    return @import("src/backend/synthetic").create();
+fn mlxMetalBackendForTest() backend_api.Backend {
+    return @import("src/backend/registry").create(.metal_mlx);
 }
 
-fn initSyntheticClientForTest(device_count: usize) !*Client {
-    return Client.init(std.testing.allocator, syntheticBackendForTest(), device_count);
+fn initMlxMetalClientForTest() !*Client {
+    return Client.init(std.testing.allocator, mlxMetalBackendForTest(), 1);
 }
 
 fn initHostCopyForTest(
@@ -1912,70 +2726,181 @@ fn initHostCopyForTest(
     shard_index: usize,
     src: []const u8,
 ) !*Buffer {
-    return Buffer.initHostCopyForBackend(std.testing.allocator, syntheticBackendForTest(), element_type, dims, device, memory, shard_index, src);
+    return Buffer.initHostCopyForBackend(std.testing.allocator, mlxMetalBackendForTest(), element_type, dims, device, memory, shard_index, src);
 }
 
-test "synthetic client models multiple devices and memories" {
-    const client = try initSyntheticClientForTest(4);
-    defer client.deinit();
+fn expectBufferBytes(buffer: *Buffer, expected: []const u8) !void {
+    const actual = try std.testing.allocator.alloc(u8, expected.len);
+    defer std.testing.allocator.free(actual);
+    try buffer.copyToHost(actual);
+    try std.testing.expectEqualSlices(u8, expected, actual);
+}
 
-    try std.testing.expectEqual(@as(usize, 4), client.devices.len);
-    try std.testing.expectEqual(BackendKind.synthetic, client.backend_kind);
-    try std.testing.expectEqual(@as(usize, 4), client.memories.len);
-    try std.testing.expectEqual(@as(usize, 4), client.device_handles.len);
-    try std.testing.expectEqual(@as(usize, 4), client.memory_handles.len);
-    try std.testing.expectEqual(@as(i32, 4), client.topology.num_partitions);
-    try std.testing.expectEqual(@as(usize, 4), client.topology.numDevices());
-    try std.testing.expect(client.lookupDevice(2) != null);
-    try std.testing.expect(client.lookupMemory(3) != null);
-    try std.testing.expectEqual(@as(i32, 1), client.device_handles[1].id);
-    try std.testing.expectEqual(@as(i32, 1), client.memory_handles[1].id);
-    try std.testing.expectEqual(@as(i32, 2), client.devices[2].default_memory.id);
-    try std.testing.expectEqual(@as(i32, 3), client.memories[3].addressable_devices[0].id);
+fn expectBufferF32(buffer: *Buffer, expected: []const f32) !void {
+    const actual = try std.testing.allocator.alloc(u8, expected.len * @sizeOf(f32));
+    defer std.testing.allocator.free(actual);
+    try buffer.copyToHost(actual);
+    const floats = std.mem.bytesAsSlice(f32, actual);
+    for (expected, floats) |want, got| {
+        try std.testing.expectApproxEqAbs(want, got, 0.0001);
+    }
+}
+
+fn testShardingPlan(allocator: std.mem.Allocator, assignment: []const i32) !core.ShardingPlan {
+    return .{
+        .kind = .replicated,
+        .mesh_name = try allocator.dupe(u8, ""),
+        .device_assignment = try allocator.dupe(i32, assignment),
+    };
+}
+
+test "executable graph materializes per-device scheduled nodes" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+    const allocator = std.testing.allocator;
+
+    var plan = core.ExecutablePlan{
+        .allocator = allocator,
+        .options = .{
+            .num_replicas = 1,
+            .num_partitions = 1,
+            .device_assignment = try allocator.dupe(i32, &.{0}),
+        },
+        .values = &.{},
+        .parameter_shardings = try allocator.alloc(core.ShardingPlan, 0),
+        .output_shardings = try allocator.alloc(core.ShardingPlan, 0),
+        .output_ids = try allocator.alloc(core.ValueId, 0),
+        .instructions = try allocator.dupe(core.PlanInstruction, &.{
+            .{ .kind = .constant },
+            .{ .kind = .custom_call },
+            .{ .kind = .while_ },
+        }),
+    };
+    defer plan.deinit();
+
+    var graph = try ExecutableGraph.init(allocator, client, &plan);
+    defer graph.deinit();
+
+    try std.testing.expectEqualSlices(i32, &.{0}, graph.device_ids);
+    try std.testing.expectEqual(@as(usize, 3), graph.nodes.len);
+    try std.testing.expectEqual(GraphNodeKind.constant, graph.nodes[0].kind);
+    try std.testing.expectEqual(GraphNodeKind.custom_call, graph.nodes[1].kind);
+    try std.testing.expectEqual(GraphNodeKind.control_flow, graph.nodes[2].kind);
+    try std.testing.expectEqual(@as(usize, 0), graph.nodes[0].device_index);
+    try std.testing.expectEqual(@as(i32, 0), graph.nodes[0].device_id);
+}
+
+test "executable graph executes through runtime buffers" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+    const allocator = std.testing.allocator;
+    const assignment = [_]i32{0};
+    const dims = [_]i64{4};
+
+    const values = try allocator.alloc(core.Value, 3);
+    errdefer allocator.free(values);
+    for (values, 0..) |*value, i| {
+        value.* = .{
+            .id = .{ .index = @intCast(i) },
+            .role = if (i < 2) .parameter else .instruction_result,
+            .descriptor = .{
+                .element_type = .u8,
+                .dims = try allocator.dupe(i64, &dims),
+                .device_id = 0,
+                .memory_id = 0,
+                .shard_index = 0,
+            },
+        };
+    }
+
+    var parameter_shardings = try allocator.alloc(core.ShardingPlan, 2);
+    parameter_shardings[0] = try testShardingPlan(allocator, &assignment);
+    parameter_shardings[1] = try testShardingPlan(allocator, &assignment);
+    var output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    output_shardings[0] = try testShardingPlan(allocator, &assignment);
+
+    var plan = core.ExecutablePlan{
+        .allocator = allocator,
+        .options = .{
+            .num_replicas = 1,
+            .num_partitions = 1,
+            .device_assignment = try allocator.dupe(i32, &assignment),
+        },
+        .values = values,
+        .parameter_shardings = parameter_shardings,
+        .output_shardings = output_shardings,
+        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
+        .instructions = try allocator.dupe(core.PlanInstruction, &.{.{
+            .kind = .add,
+            .inputs = try allocator.dupe(core.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+            .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
+        }}),
+    };
+    defer plan.deinit();
+
+    var graph = try ExecutableGraph.init(allocator, client, &plan);
+    defer graph.deinit();
+
+    const lhs_data = [_]u8{ 1, 2, 3, 4 };
+    const rhs_data = [_]u8{ 10, 20, 30, 40 };
+    const lhs = try Buffer.initHostCopyForBackend(allocator, client.backend, .u8, &dims, &client.devices[0], &client.memories[0], 0, &lhs_data);
+    defer lhs.deinit();
+    const rhs = try Buffer.initHostCopyForBackend(allocator, client.backend, .u8, &dims, &client.devices[0], &client.memories[0], 0, &rhs_data);
+    defer rhs.deinit();
+
+    const outputs = try graph.executeDevice(allocator, client, &plan, 0, &.{ lhs, rhs });
+    defer allocator.free(outputs);
+    defer {
+        for (outputs) |output| output.deinit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), outputs.len);
+    try std.testing.expectEqual(@as(usize, 0), outputs[0].shard_index);
+    try expectBufferBytes(outputs[0], &.{ 11, 22, 33, 44 });
 }
 
 test "buffer keeps shard/device/memory ownership metadata" {
-    const client = try initSyntheticClientForTest(2);
+    const client = try initMlxMetalClientForTest();
     defer client.deinit();
 
     const dims = [_]i64{ 2, 2 };
     const data = [_]u8{ 1, 2, 3, 4 };
-    const buffer = try initHostCopyForTest(.u8, &dims, &client.devices[1], &client.memories[1], 1, &data);
+    const buffer = try initHostCopyForTest(.u8, &dims, &client.devices[0], &client.memories[0], 0, &data);
     defer buffer.deinit();
 
-    try std.testing.expectEqual(@as(i32, 1), buffer.device_id);
-    try std.testing.expectEqual(@as(i32, 1), buffer.memory_id);
-    try std.testing.expectEqual(@as(i32, 1), buffer.device.id);
-    try std.testing.expectEqual(@as(i32, 1), buffer.memory.id);
-    try std.testing.expectEqual(@as(usize, 1), buffer.shard_index);
-    try std.testing.expectEqualSlices(u8, &data, buffer.bytes);
+    try std.testing.expectEqual(@as(i32, 0), buffer.device_id);
+    try std.testing.expectEqual(@as(i32, 0), buffer.memory_id);
+    try std.testing.expectEqual(@as(i32, 0), buffer.device.id);
+    try std.testing.expectEqual(@as(i32, 0), buffer.memory.id);
+    try std.testing.expectEqual(@as(usize, 0), buffer.shard_index);
+    try expectBufferBytes(buffer, &data);
 
     const rhs_data = [_]u8{ 10, 20, 30, 40 };
-    const rhs = try initHostCopyForTest(.u8, &dims, &client.devices[1], &client.memories[1], 1, &rhs_data);
+    const rhs = try initHostCopyForTest(.u8, &dims, &client.devices[0], &client.memories[0], 0, &rhs_data);
     defer rhs.deinit();
-    const sum = try Buffer.initU8Add(std.testing.allocator, buffer, rhs, 1);
+    const sum = try Buffer.initU8Add(std.testing.allocator, buffer, rhs, 0);
     defer sum.deinit();
-    try std.testing.expectEqualSlices(u8, &.{ 11, 22, 33, 44 }, sum.bytes);
+    try expectBufferBytes(sum, &.{ 11, 22, 33, 44 });
 
-    const difference = try Buffer.initU8Binary(std.testing.allocator, .subtract, rhs, buffer, 1);
+    const difference = try Buffer.initU8Binary(std.testing.allocator, .subtract, rhs, buffer, 0);
     defer difference.deinit();
-    try std.testing.expectEqualSlices(u8, &.{ 9, 18, 27, 36 }, difference.bytes);
+    try expectBufferBytes(difference, &.{ 9, 18, 27, 36 });
 
-    const product = try Buffer.initU8Binary(std.testing.allocator, .multiply, buffer, rhs, 1);
+    const product = try Buffer.initU8Binary(std.testing.allocator, .multiply, buffer, rhs, 0);
     defer product.deinit();
-    try std.testing.expectEqualSlices(u8, &.{ 10, 40, 90, 160 }, product.bytes);
+    try expectBufferBytes(product, &.{ 10, 40, 90, 160 });
 
-    const quotient = try Buffer.initU8Binary(std.testing.allocator, .divide, rhs, buffer, 1);
+    const quotient = try Buffer.initU8Binary(std.testing.allocator, .divide, rhs, buffer, 0);
     defer quotient.deinit();
-    try std.testing.expectEqualSlices(u8, &.{ 10, 10, 10, 10 }, quotient.bytes);
+    try expectBufferBytes(quotient, &.{ 10, 10, 10, 10 });
 
-    const negated = try Buffer.initU8Unary(std.testing.allocator, .negate, buffer, 1);
+    const negated = try Buffer.initU8Unary(std.testing.allocator, .negate, buffer, 0);
     defer negated.deinit();
-    try std.testing.expectEqualSlices(u8, &.{ 255, 254, 253, 252 }, negated.bytes);
+    try expectBufferBytes(negated, &.{ 255, 254, 253, 252 });
 }
 
-test "buffer elementwise arithmetic supports f32 host execution" {
-    const client = try initSyntheticClientForTest(1);
+test "buffer elementwise arithmetic supports f32 execution" {
+    const client = try initMlxMetalClientForTest();
     defer client.deinit();
 
     const dims = [_]i64{2};
@@ -1988,22 +2913,19 @@ test "buffer elementwise arithmetic supports f32 host execution" {
 
     const sum = try Buffer.initElementwiseBinary(std.testing.allocator, .add, lhs, rhs, 0);
     defer sum.deinit();
-    try std.testing.expectApproxEqAbs(@as(f32, 3.75), readF32LE(sum.bytes, 0), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), readF32LE(sum.bytes, 1), 0.0001);
+    try expectBufferF32(sum, &.{ 3.75, 2.0 });
 
     const quotient = try Buffer.initElementwiseBinary(std.testing.allocator, .divide, rhs, lhs, 0);
     defer quotient.deinit();
-    try std.testing.expectApproxEqAbs(@as(f32, 1.5), readF32LE(quotient.bytes, 0), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, -2.0), readF32LE(quotient.bytes, 1), 0.0001);
+    try expectBufferF32(quotient, &.{ 1.5, -2.0 });
 
     const negated = try Buffer.initElementwiseUnary(std.testing.allocator, .negate, lhs, 0);
     defer negated.deinit();
-    try std.testing.expectApproxEqAbs(@as(f32, -1.5), readF32LE(negated.bytes, 0), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), readF32LE(negated.bytes, 1), 0.0001);
+    try expectBufferF32(negated, &.{ -1.5, 2.0 });
 }
 
-test "buffer elementwise unary math supports f32 host execution" {
-    const client = try initSyntheticClientForTest(1);
+test "buffer elementwise unary math supports f32 execution" {
+    const client = try initMlxMetalClientForTest();
     defer client.deinit();
 
     const dims = [_]i64{2};
@@ -2013,27 +2935,23 @@ test "buffer elementwise unary math supports f32 host execution" {
 
     const exp = try Buffer.initElementwiseUnary(std.testing.allocator, .exp, input, 0);
     defer exp.deinit();
-    try std.testing.expectApproxEqAbs(std.math.exp(@as(f32, 1.0)), readF32LE(exp.bytes, 0), 0.0001);
-    try std.testing.expectApproxEqAbs(std.math.exp(@as(f32, 4.0)), readF32LE(exp.bytes, 1), 0.0001);
+    try expectBufferF32(exp, &.{ std.math.exp(@as(f32, 1.0)), std.math.exp(@as(f32, 4.0)) });
 
     const tanh = try Buffer.initElementwiseUnary(std.testing.allocator, .tanh, input, 0);
     defer tanh.deinit();
-    try std.testing.expectApproxEqAbs(std.math.tanh(@as(f32, 1.0)), readF32LE(tanh.bytes, 0), 0.0001);
-    try std.testing.expectApproxEqAbs(std.math.tanh(@as(f32, 4.0)), readF32LE(tanh.bytes, 1), 0.0001);
+    try expectBufferF32(tanh, &.{ std.math.tanh(@as(f32, 1.0)), std.math.tanh(@as(f32, 4.0)) });
 
     const sqrt = try Buffer.initElementwiseUnary(std.testing.allocator, .sqrt, input, 0);
     defer sqrt.deinit();
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), readF32LE(sqrt.bytes, 0), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), readF32LE(sqrt.bytes, 1), 0.0001);
+    try expectBufferF32(sqrt, &.{ 1.0, 2.0 });
 
     const rsqrt = try Buffer.initElementwiseUnary(std.testing.allocator, .rsqrt, input, 0);
     defer rsqrt.deinit();
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), readF32LE(rsqrt.bytes, 0), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), readF32LE(rsqrt.bytes, 1), 0.0001);
+    try expectBufferF32(rsqrt, &.{ 1.0, 0.5 });
 }
 
 test "buffer reshape preserves typed bytes and updates dimensions" {
-    const client = try initSyntheticClientForTest(1);
+    const client = try initMlxMetalClientForTest();
     defer client.deinit();
 
     const dims = [_]i64{ 2, 2 };
@@ -2045,11 +2963,11 @@ test "buffer reshape preserves typed bytes and updates dimensions" {
     defer reshaped.deinit();
 
     try std.testing.expectEqualSlices(i64, &.{4}, reshaped.dims);
-    try std.testing.expectEqualSlices(u8, input.bytes, reshaped.bytes);
+    try expectBufferF32(reshaped, &values);
 }
 
 test "buffer transpose permutes dense host bytes and updates dimensions" {
-    const client = try initSyntheticClientForTest(1);
+    const client = try initMlxMetalClientForTest();
     defer client.deinit();
 
     const dims = [_]i64{ 2, 3 };
@@ -2061,11 +2979,11 @@ test "buffer transpose permutes dense host bytes and updates dimensions" {
     defer transposed.deinit();
 
     try std.testing.expectEqualSlices(i64, &.{ 3, 2 }, transposed.dims);
-    try std.testing.expectEqualSlices(u8, &.{ 1, 4, 2, 5, 3, 6 }, transposed.bytes);
+    try expectBufferBytes(transposed, &.{ 1, 4, 2, 5, 3, 6 });
 }
 
 test "buffer broadcast_in_dim expands dense host bytes and updates dimensions" {
-    const client = try initSyntheticClientForTest(1);
+    const client = try initMlxMetalClientForTest();
     defer client.deinit();
 
     const dims = [_]i64{3};
@@ -2077,11 +2995,11 @@ test "buffer broadcast_in_dim expands dense host bytes and updates dimensions" {
     defer broadcasted.deinit();
 
     try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, broadcasted.dims);
-    try std.testing.expectEqualSlices(u8, &.{ 7, 8, 9, 7, 8, 9 }, broadcasted.bytes);
+    try expectBufferBytes(broadcasted, &.{ 7, 8, 9, 7, 8, 9 });
 }
 
 test "buffer slice copies strided dense host bytes and updates dimensions" {
-    const client = try initSyntheticClientForTest(1);
+    const client = try initMlxMetalClientForTest();
     defer client.deinit();
 
     const dims = [_]i64{ 3, 4 };
@@ -2101,11 +3019,11 @@ test "buffer slice copies strided dense host bytes and updates dimensions" {
     defer sliced.deinit();
 
     try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, sliced.dims);
-    try std.testing.expectEqualSlices(u8, &.{ 5, 7, 9, 11 }, sliced.bytes);
+    try expectBufferBytes(sliced, &.{ 5, 7, 9, 11 });
 }
 
 test "buffer concatenate joins dense host bytes along an axis" {
-    const client = try initSyntheticClientForTest(1);
+    const client = try initMlxMetalClientForTest();
     defer client.deinit();
 
     const lhs_dims = [_]i64{ 2, 2 };
@@ -2121,5 +3039,51 @@ test "buffer concatenate joins dense host bytes along an axis" {
     defer concatenated.deinit();
 
     try std.testing.expectEqualSlices(i64, &.{ 2, 5 }, concatenated.dims);
-    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 5, 6, 7, 3, 4, 8, 9, 10 }, concatenated.bytes);
+    try expectBufferBytes(concatenated, &.{ 1, 2, 5, 6, 7, 3, 4, 8, 9, 10 });
+}
+
+test "buffer partition_id materializes scalar device partition" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+
+    const partition = try Buffer.initPartitionId(std.testing.allocator, mlxMetalBackendForTest(), .u32, &.{}, &client.devices[0], &client.memories[0], 0, 0);
+    defer partition.deinit();
+
+    try std.testing.expectEqual(@as(i32, 0), partition.device_id);
+    var bytes: [4]u8 = undefined;
+    try partition.copyToHost(&bytes);
+    try std.testing.expectEqual(@as(u32, 0), readU32LE(&bytes, 0));
+}
+
+test "buffer cholesky requires backend-native lowering on MLX buffers" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+
+    const dims = [_]i64{ 2, 2 };
+    const values = [_]f32{ 4.0, 2.0, 2.0, 3.0 };
+    const input = try initHostCopyForTest(.f32, &dims, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&values));
+    defer input.deinit();
+
+    try std.testing.expectError(error.UnsupportedRuntimeFeature, Buffer.initCholesky(std.testing.allocator, input, true, &dims, 0));
+}
+
+test "buffer rng requires backend-native lowering on MLX buffers" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+
+    const scalar = [_]i64{};
+    const min_value = [_]f32{0.0};
+    const max_value = [_]f32{1.0};
+    const min = try initHostCopyForTest(.f32, &scalar, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&min_value));
+    defer min.deinit();
+    const max = try initHostCopyForTest(.f32, &scalar, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&max_value));
+    defer max.deinit();
+
+    try std.testing.expectError(error.UnsupportedRuntimeFeature, Buffer.initRngUniform(std.testing.allocator, min, max, .f32, &.{4}, 0));
+
+    const state_words = [_]u32{ 1, 2 };
+    const state = try initHostCopyForTest(.u32, &.{2}, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&state_words));
+    defer state.deinit();
+    try std.testing.expectError(error.UnsupportedRuntimeFeature, Buffer.initRngBits(std.testing.allocator, state, .u32, &.{4}, 0));
+    try std.testing.expectError(error.UnsupportedRuntimeFeature, Buffer.initRngStateUpdate(std.testing.allocator, state, 0));
 }

@@ -28,6 +28,7 @@ int main() {
                                          sizeof(input));
     assert(buffer != nullptr);
     assert(pjrtx_mlx_metal_buffer_size(buffer) == sizeof(input));
+    assert(pjrtx_mlx_metal_buffer_has_host_shadow(buffer) == 0);
 
     unsigned char output[sizeof(input)] = {};
     assert(pjrtx_mlx_metal_buffer_copy_to_host(buffer, output,
@@ -41,6 +42,7 @@ int main() {
     PjrtxMlxMetalBuffer* cloned = pjrtx_mlx_metal_buffer_clone(buffer);
     assert(cloned != nullptr);
     assert(pjrtx_mlx_metal_buffer_size(cloned) == sizeof(input));
+    assert(pjrtx_mlx_metal_buffer_has_host_shadow(cloned) == 0);
     unsigned char cloned_output[sizeof(input)] = {};
     assert(pjrtx_mlx_metal_buffer_copy_to_host(cloned, cloned_output,
                                                sizeof(cloned_output)) == 1);
@@ -56,6 +58,7 @@ int main() {
     PjrtxMlxMetalBuffer* sum =
         pjrtx_mlx_metal_buffer_add_u8(buffer, rhs_buffer);
     assert(sum != nullptr);
+    assert(pjrtx_mlx_metal_buffer_has_host_shadow(sum) == 0);
     unsigned char sum_output[sizeof(input)] = {};
     assert(pjrtx_mlx_metal_buffer_copy_to_host(sum, sum_output,
                                                sizeof(sum_output)) == 1);

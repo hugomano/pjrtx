@@ -3,7 +3,6 @@ const std = @import("std");
 pub const MAX_DEVICES = 64;
 
 pub const BackendKind = enum {
-    synthetic,
     metal_mlx,
 };
 
@@ -253,6 +252,22 @@ pub const PlanInstructionKind = enum {
     compare,
     select,
     clamp,
+    cholesky,
+    complex,
+    convolution,
+    custom_call,
+    fft,
+    get_tuple_element,
+    imag,
+    partition_id,
+    real,
+    reduce_precision,
+    rng,
+    rng_bit_generator,
+    scatter,
+    triangular_solve,
+    tuple,
+    while_,
     unsupported,
 };
 
@@ -279,6 +294,9 @@ pub const PlanInstruction = struct {
     dimension: ?i64 = null,
     iota_dimension: ?i64 = null,
     dimensions: ?[]const i64 = null,
+    tuple_index: ?i64 = null,
+    lower: ?bool = null,
+    custom_call_target: ?[]const u8 = null,
     reduce_dimensions: ?[]const i64 = null,
     lhs_batch_dimensions: ?[]const i64 = null,
     rhs_batch_dimensions: ?[]const i64 = null,
@@ -326,6 +344,7 @@ pub const ExecutablePlan = struct {
             if (instruction.start_indices_batching_dims) |dims| self.allocator.free(dims);
             if (instruction.start_index_map) |dims| self.allocator.free(dims);
             if (instruction.dimensions) |dimensions| self.allocator.free(dimensions);
+            if (instruction.custom_call_target) |target| self.allocator.free(target);
             if (instruction.reduce_dimensions) |reduce_dimensions| self.allocator.free(reduce_dimensions);
             if (instruction.lhs_batch_dimensions) |dims| self.allocator.free(dims);
             if (instruction.rhs_batch_dimensions) |dims| self.allocator.free(dims);

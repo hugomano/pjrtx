@@ -21,7 +21,6 @@ zig_library(
     deps = [
         ":backend",
         "//src/backend/mlx_metal:mlx_metal",
-        "//src/backend/synthetic:synthetic",
         "//src/core",
     ],
 )

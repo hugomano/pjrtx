@@ -2,4 +2,5 @@ exports_files([
     "generate_metal_jit_includes.sh",
     "mlx.bazel",
     "repo.bzl",
+    "runtime_default_metallib.patch",
 ])

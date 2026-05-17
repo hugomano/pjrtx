@@ -13,7 +13,6 @@ const platform_version = "PjRTx bootstrap Metal/MLX skeleton";
 const device_kind = "Metal";
 const plugin_name = "PjRTx";
 const stablehlo_version = [_]i64{ 1, 0, 0 };
-const synthetic_device_count_option = "pjrtx_synthetic_device_count";
 const backend_option = "pjrtx_backend";
 const default_memory_kind = "device";
 
@@ -39,6 +38,7 @@ const SerializedTopology = struct {
 const Executable = struct {
     client: *runtime.Client,
     plan: compiler.ExecutablePlan,
+    graph: runtime.ExecutableGraph,
     logical_ids: []c.PJRT_LogicalDeviceIds,
     optimized_program: []u8,
     parameter_memory_kinds: [][*c]const u8,
@@ -50,6 +50,7 @@ const Executable = struct {
     deleted: bool = false,
 
     fn deinit(self: *Executable) void {
+        self.graph.deinit();
         allocator.free(self.fingerprint);
         allocator.free(self.output_memory_kind_sizes);
         allocator.free(self.output_memory_kinds);
@@ -215,42 +216,26 @@ fn initAttrs() void {
     attrs_ready = true;
 }
 
-fn syntheticDeviceCount() usize {
-    const env = std.c.getenv("PJRTX_SYNTHETIC_DEVICE_COUNT") orelse return 1;
-    const text = env[0..cstrLen(env)];
-    return std.fmt.parseInt(usize, text, 10) catch 1;
-}
-
 const ClientCreateConfig = struct {
     backend_kind: runtime.BackendKind = .metal_mlx,
-    synthetic_device_count: usize = 1,
 };
 
 fn clientCreateConfigFromArgs(args: c.PJRT_Client_Create_Args) !ClientCreateConfig {
-    var config: ClientCreateConfig = .{
-        .synthetic_device_count = syntheticDeviceCount(),
-    };
+    var config: ClientCreateConfig = .{};
     if (args.create_options != null) {
         for (0..args.num_options) |i| {
             const option = args.create_options[i];
             const name = option.name[0..option.name_size];
-            if (std.mem.eql(u8, name, synthetic_device_count_option)) {
-                if (option.type != c.PJRT_NamedValue_kInt64) return error.InvalidSyntheticDeviceCount;
-                if (option.unnamed_0.int64_value <= 0 or option.unnamed_0.int64_value > runtime.MAX_DEVICES) {
-                    return error.InvalidSyntheticDeviceCount;
-                }
-                config.backend_kind = .synthetic;
-                config.synthetic_device_count = @intCast(option.unnamed_0.int64_value);
-            } else if (std.mem.eql(u8, name, backend_option)) {
+            if (std.mem.eql(u8, name, backend_option)) {
                 if (option.type != c.PJRT_NamedValue_kString) return error.InvalidBackend;
                 const value = option.unnamed_0.string_value[0..option.value_size];
-                if (std.mem.eql(u8, value, "synthetic")) {
-                    config.backend_kind = .synthetic;
-                } else if (std.mem.eql(u8, value, "metal_mlx")) {
+                if (std.mem.eql(u8, value, "metal_mlx")) {
                     config.backend_kind = .metal_mlx;
                 } else {
                     return error.InvalidBackend;
                 }
+            } else {
+                return error.InvalidBackend;
             }
         }
     }
@@ -343,7 +328,6 @@ fn pjrtClientCreate(args: [*c]c.PJRT_Client_Create_Args) callconv(.c) ?*c.PJRT_E
         return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "invalid PjRTx client create option");
     };
     const client = switch (config.backend_kind) {
-        .synthetic => runtime.Client.init(allocator, backend_registry.create(.synthetic), config.synthetic_device_count),
         .metal_mlx => runtime.Client.init(allocator, backend_registry.create(.metal_mlx), 1),
     } catch {
         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to create PjRTx client");
@@ -516,10 +500,16 @@ fn pjrtClientCompile(args: [*c]c.PJRT_Client_Compile_Args) callconv(.c) ?*c.PJRT
     const fingerprint = std.fmt.allocPrint(allocator, "pjrtx-{x}", .{fingerprint_value}) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable fingerprint");
     errdefer allocator.free(fingerprint);
 
+    var graph = runtime.ExecutableGraph.init(allocator, client, &plan) catch {
+        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to build executable graph");
+    };
+    errdefer graph.deinit();
+
     const executable = allocator.create(Executable) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable");
     executable.* = .{
         .client = client,
         .plan = plan,
+        .graph = graph,
         .logical_ids = logical_ids,
         .optimized_program = optimized_program,
         .parameter_memory_kinds = parameter_memory_kinds,
@@ -911,7 +901,62 @@ fn destroyOwnedBuffer(buffer: *runtime.Buffer, owned: bool) void {
     if (owned) buffer.deinit();
 }
 
+fn destroyExecuteValues(value_buffers: []?*runtime.Buffer, value_owned: []const bool) void {
+    for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+}
+
+fn unsupportedRuntimeFeature(kind: compiler.PlanInstructionKind) ?*c.PJRT_Error {
+    const message = switch (kind) {
+        .complex => "StableHLO complex execution is staged for complex dtype support; feature=heavy-control-random-structural",
+        .real => "StableHLO real execution is staged for complex dtype support; feature=heavy-control-random-structural",
+        .imag => "StableHLO imag execution is staged for complex dtype support; feature=heavy-control-random-structural",
+        .fft => "StableHLO fft execution is staged for complex dtype and backend FFT lowering; feature=heavy-control-random-structural",
+        .convolution => "StableHLO convolution execution is staged for dimension-number lowering and backend legalization; feature=heavy-control-random-structural",
+        .scatter => "StableHLO scatter execution is staged for region-aware update lowering; feature=heavy-control-random-structural",
+        .custom_call => "StableHLO custom_call execution requires a registered PjRTx custom target; feature=heavy-control-random-structural",
+        .get_tuple_element, .tuple => "StableHLO tuple execution is staged for structural value lowering; feature=heavy-control-random-structural",
+        .while_ => "StableHLO while execution is staged for region/control-flow lowering; feature=heavy-control-random-structural",
+        .triangular_solve => "StableHLO triangular_solve execution is staged for option-aware linear algebra lowering; feature=heavy-control-random-structural",
+        else => "StableHLO execution is staged for this operation; feature=heavy-control-random-structural",
+    };
+    return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, message);
+}
+
+fn graphExecuteError(err: runtime.GraphExecuteError) ?*c.PJRT_Error {
+    return switch (err) {
+        error.OutOfMemory => makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable graph execution state"),
+        error.InvalidArgument => makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "invalid executable graph arguments or device assignment"),
+        error.UnsupportedElementType => makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "executable graph contains an operation unsupported for this element type"),
+        error.ShapeMismatch => makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "executable graph shape validation failed during execution"),
+        error.UnsupportedRuntimeFeature => makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "executable graph contains an operation that is not lowered to the runtime yet"),
+        error.Internal => makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute executable graph"),
+    };
+}
+
 fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callconv(.c) ?*c.PJRT_Error {
+    const executable = executableFromC(args[0].executable);
+    if (args[0].num_args == 0 and executable.plan.parameter_shardings.len != 0) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx execute expects arguments for executable parameters");
+    if (args[0].num_devices > executable.graph.device_ids.len) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx execute requested more devices than the executable graph contains");
+    for (0..args[0].num_devices) |device_index| {
+        const arguments = allocator.alloc(*runtime.Buffer, args[0].num_args) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable graph argument list");
+        defer allocator.free(arguments);
+        for (arguments, 0..) |*argument, argument_index| {
+            argument.* = bufferFromC(args[0].argument_lists[device_index][argument_index]);
+        }
+
+        const outputs = executable.graph.executeDevice(allocator, executable.client, &executable.plan, device_index, arguments) catch |err| {
+            return graphExecuteError(err);
+        };
+        defer allocator.free(outputs);
+        for (outputs, 0..) |output, output_index| {
+            args[0].output_lists[device_index][output_index] = @ptrCast(output);
+        }
+        if (args[0].device_complete_events) |events| events[device_index] = eventCreateReady();
+    }
+    return null;
+}
+
+fn loadedExecutableExecuteLegacy(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callconv(.c) ?*c.PJRT_Error {
     const executable = executableFromC(args[0].executable);
     if (args[0].num_args == 0 and executable.plan.parameter_shardings.len != 0) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx bootstrap execute expects arguments for executable parameters");
     if (executable.plan.instructions.len == 0) return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "executable plan has no runtime operations");
@@ -946,8 +991,43 @@ fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callc
             parameter_index += 1;
         }
         for (executable.plan.instructions) |plan_instruction| {
+            if (plan_instruction.kind == .rng_bit_generator) {
+                if (plan_instruction.inputs.len < 1 or plan_instruction.outputs.len != 2) {
+                    destroyExecuteValues(value_buffers, value_owned);
+                    return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "rng_bit_generator StableHLO plan must have one state input and two outputs");
+                }
+                const state_input = value_buffers[plan_instruction.inputs[0].index].?;
+                const state_output = runtime.Buffer.initRngStateUpdate(allocator, state_input, device_index) catch {
+                    destroyExecuteValues(value_buffers, value_owned);
+                    return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute rng_bit_generator state update");
+                };
+                const bits_descriptor = executable.plan.values[plan_instruction.outputs[1].index].descriptor;
+                const bits_output = runtime.Buffer.initRngBits(
+                    allocator,
+                    state_input,
+                    bits_descriptor.element_type,
+                    plan_instruction.dims orelse bits_descriptor.dims,
+                    device_index,
+                ) catch |err| switch (err) {
+                    error.UnsupportedElementType => {
+                        state_output.deinit();
+                        destroyExecuteValues(value_buffers, value_owned);
+                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "rng_bit_generator StableHLO execution currently supports u32/s32 random bits");
+                    },
+                    else => {
+                        state_output.deinit();
+                        destroyExecuteValues(value_buffers, value_owned);
+                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute rng_bit_generator StableHLO op");
+                    },
+                };
+                value_buffers[plan_instruction.outputs[0].index] = state_output;
+                value_owned[plan_instruction.outputs[0].index] = true;
+                value_buffers[plan_instruction.outputs[1].index] = bits_output;
+                value_owned[plan_instruction.outputs[1].index] = true;
+                continue;
+            }
             if (plan_instruction.outputs.len != 1) {
-                for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                destroyExecuteValues(value_buffers, value_owned);
                 return makeError(c.PJRT_Error_Code_INTERNAL, "executable plan instruction arity is invalid");
             }
             const output_id = plan_instruction.outputs[0];
@@ -973,6 +1053,78 @@ fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callc
                 .copy_arg0 => runtime.Buffer.initDeviceCopy(allocator, value_buffers[plan_instruction.inputs[0].index].?, device_index) catch {
                     for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                     return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate execute output");
+                },
+                .reduce_precision => runtime.Buffer.initDeviceCopy(allocator, value_buffers[plan_instruction.inputs[0].index].?, device_index) catch {
+                    destroyExecuteValues(value_buffers, value_owned);
+                    return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute reduce_precision StableHLO op");
+                },
+                .partition_id => blk: {
+                    const descriptor = executable.plan.values[output_id.index].descriptor;
+                    const device = &executable.client.devices[device_index];
+                    break :blk runtime.Buffer.initPartitionId(
+                        allocator,
+                        executable.client.backend,
+                        descriptor.element_type,
+                        descriptor.dims,
+                        device,
+                        device.default_memory,
+                        @intCast(device_index),
+                        device_index,
+                    ) catch |err| switch (err) {
+                        error.UnsupportedElementType => {
+                            destroyExecuteValues(value_buffers, value_owned);
+                            return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "partition_id StableHLO execution currently supports u32/s32 scalar outputs");
+                        },
+                        error.ShapeMismatch => {
+                            destroyExecuteValues(value_buffers, value_owned);
+                            return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "partition_id StableHLO output must be scalar");
+                        },
+                        else => {
+                            destroyExecuteValues(value_buffers, value_owned);
+                            return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute partition_id StableHLO op");
+                        },
+                    };
+                },
+                .cholesky => runtime.Buffer.initCholesky(
+                    allocator,
+                    value_buffers[plan_instruction.inputs[0].index].?,
+                    plan_instruction.lower orelse true,
+                    plan_instruction.dims orelse executable.plan.values[output_id.index].descriptor.dims,
+                    device_index,
+                ) catch |err| switch (err) {
+                    error.UnsupportedElementType => {
+                        destroyExecuteValues(value_buffers, value_owned);
+                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "cholesky StableHLO execution currently supports dense f32 tensors only");
+                    },
+                    error.ShapeMismatch => {
+                        destroyExecuteValues(value_buffers, value_owned);
+                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "cholesky StableHLO input must be positive-definite square matrices");
+                    },
+                    else => {
+                        destroyExecuteValues(value_buffers, value_owned);
+                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute cholesky StableHLO op");
+                    },
+                },
+                .rng => runtime.Buffer.initRngUniform(
+                    allocator,
+                    value_buffers[plan_instruction.inputs[0].index].?,
+                    value_buffers[plan_instruction.inputs[1].index].?,
+                    executable.plan.values[output_id.index].descriptor.element_type,
+                    plan_instruction.dims orelse executable.plan.values[output_id.index].descriptor.dims,
+                    device_index,
+                ) catch |err| switch (err) {
+                    error.UnsupportedElementType => {
+                        destroyExecuteValues(value_buffers, value_owned);
+                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "rng StableHLO execution currently supports deterministic uniform f32/u32/s32 generation");
+                    },
+                    error.ShapeMismatch => {
+                        destroyExecuteValues(value_buffers, value_owned);
+                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "rng StableHLO min/max inputs must be scalar");
+                    },
+                    else => {
+                        destroyExecuteValues(value_buffers, value_owned);
+                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute rng StableHLO op");
+                    },
                 },
                 .add, .subtract, .multiply, .divide, .maximum, .minimum, .power, .atan2, .remainder, .and_, .or_, .xor, .shift_left, .shift_right_arithmetic, .shift_right_logical => blk: {
                     const lhs = value_buffers[plan_instruction.inputs[0].index].?;
@@ -1312,6 +1464,11 @@ fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callc
                         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute clamp StableHLO op");
                     },
                 },
+                .rng_bit_generator => unreachable,
+                .complex, .real, .imag, .fft, .convolution, .custom_call, .get_tuple_element, .scatter, .triangular_solve, .tuple, .while_ => {
+                    destroyExecuteValues(value_buffers, value_owned);
+                    return unsupportedRuntimeFeature(plan_instruction.kind);
+                },
                 .unsupported => {
                     for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                     return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "executable plan contains an unsupported runtime operation");
@@ -1432,7 +1589,7 @@ fn bufferDimensions(args: [*c]c.PJRT_Buffer_Dimensions_Args) callconv(.c) ?*c.PJ
 }
 
 fn bufferOnDeviceSize(args: [*c]c.PJRT_Buffer_OnDeviceSizeInBytes_Args) callconv(.c) ?*c.PJRT_Error {
-    args[0].on_device_size_in_bytes = bufferFromC(args[0].buffer).bytes.len;
+    args[0].on_device_size_in_bytes = bufferFromC(args[0].buffer).byte_size;
     return null;
 }
 
@@ -1462,11 +1619,11 @@ fn bufferDynamicDimensionIndices(args: [*c]c.PJRT_Buffer_DynamicDimensionIndices
 fn bufferToHost(args: [*c]c.PJRT_Buffer_ToHostBuffer_Args) callconv(.c) ?*c.PJRT_Error {
     const buffer = bufferFromC(args[0].src);
     if (args[0].dst == null) {
-        args[0].dst_size = buffer.bytes.len;
+        args[0].dst_size = buffer.byte_size;
         return null;
     }
-    if (args[0].dst_size < buffer.bytes.len) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "destination buffer is too small");
-    buffer.copyToHost(@as([*]u8, @ptrCast(args[0].dst))[0..buffer.bytes.len]) catch {
+    if (args[0].dst_size < buffer.byte_size) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "destination buffer is too small");
+    buffer.copyToHost(@as([*]u8, @ptrCast(args[0].dst))[0..buffer.byte_size]) catch {
         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to copy buffer to host");
     };
     args[0].event = eventCreateReady();
@@ -1617,8 +1774,8 @@ test "plugin attributes and client create expose backend selection" {
     option.name = backend_option;
     option.name_size = backend_option.len;
     option.type = c.PJRT_NamedValue_kString;
-    option.unnamed_0.string_value = "synthetic";
-    option.value_size = "synthetic".len;
+    option.unnamed_0.string_value = "metal_mlx";
+    option.value_size = "metal_mlx".len;
 
     var create_args = std.mem.zeroes(c.PJRT_Client_Create_Args);
     create_args.struct_size = c.PJRT_Client_Create_Args_STRUCT_SIZE;
@@ -1632,7 +1789,7 @@ test "plugin attributes and client create expose backend selection" {
         _ = api.PJRT_Client_Destroy.?(&destroy_args);
     }
 
-    try std.testing.expectEqual(runtime.BackendKind.synthetic, clientFromC(create_args.client).backend_kind);
+    try std.testing.expectEqual(runtime.BackendKind.metal_mlx, clientFromC(create_args.client).backend_kind);
 }
 
 fn expectOk(err: [*c]c.PJRT_Error) !void {
@@ -1662,8 +1819,18 @@ fn errorMessage(api: *const c.PJRT_Api, err: [*c]c.PJRT_Error) []const u8 {
 test "client device memory and buffer ownership callbacks return stable handles" {
     const api = GetPjrtApi();
 
+    var option = std.mem.zeroes(c.PJRT_NamedValue);
+    option.struct_size = c.PJRT_NamedValue_STRUCT_SIZE;
+    option.name = backend_option;
+    option.name_size = backend_option.len;
+    option.type = c.PJRT_NamedValue_kString;
+    option.unnamed_0.string_value = "metal_mlx";
+    option.value_size = "metal_mlx".len;
+
     var create_args = std.mem.zeroes(c.PJRT_Client_Create_Args);
     create_args.struct_size = c.PJRT_Client_Create_Args_STRUCT_SIZE;
+    create_args.create_options = &option;
+    create_args.num_options = 1;
     try expectOk(api.PJRT_Client_Create.?(&create_args));
     defer {
         var destroy_args = std.mem.zeroes(c.PJRT_Client_Destroy_Args);
@@ -1780,8 +1947,8 @@ test "loaded executable execute chains u8 StableHLO ops through PJRT argument li
     option.name = backend_option;
     option.name_size = backend_option.len;
     option.type = c.PJRT_NamedValue_kString;
-    option.unnamed_0.string_value = "synthetic";
-    option.value_size = "synthetic".len;
+    option.unnamed_0.string_value = "metal_mlx";
+    option.value_size = "metal_mlx".len;
 
     var create_args = std.mem.zeroes(c.PJRT_Client_Create_Args);
     create_args.struct_size = c.PJRT_Client_Create_Args_STRUCT_SIZE;
@@ -1814,7 +1981,7 @@ test "loaded executable execute chains u8 StableHLO ops through PJRT argument li
     lhs_from_host_args.struct_size = c.PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
     lhs_from_host_args.client = create_args.client;
     lhs_from_host_args.data = &lhs;
-    lhs_from_host_args.type = c.PJRT_Buffer_Type_U8;
+    lhs_from_host_args.type = c.PJRT_Buffer_Type_S8;
     lhs_from_host_args.dims = &dims;
     lhs_from_host_args.num_dims = dims.len;
     lhs_from_host_args.device = devices_args.devices[0];
@@ -1837,7 +2004,7 @@ test "loaded executable execute chains u8 StableHLO ops through PJRT argument li
     rhs_from_host_args.struct_size = c.PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
     rhs_from_host_args.client = create_args.client;
     rhs_from_host_args.data = &rhs;
-    rhs_from_host_args.type = c.PJRT_Buffer_Type_U8;
+    rhs_from_host_args.type = c.PJRT_Buffer_Type_S8;
     rhs_from_host_args.dims = &dims;
     rhs_from_host_args.num_dims = dims.len;
     rhs_from_host_args.device = devices_args.devices[0];
@@ -1937,8 +2104,8 @@ test "loaded executable execute chains f32 binary and unary buffers through PJRT
     option.name = backend_option;
     option.name_size = backend_option.len;
     option.type = c.PJRT_NamedValue_kString;
-    option.unnamed_0.string_value = "synthetic";
-    option.value_size = "synthetic".len;
+    option.unnamed_0.string_value = "metal_mlx";
+    option.value_size = "metal_mlx".len;
 
     var create_args = std.mem.zeroes(c.PJRT_Client_Create_Args);
     create_args.struct_size = c.PJRT_Client_Create_Args_STRUCT_SIZE;
@@ -2085,8 +2252,8 @@ test "loaded executable execute reshapes f32 buffer metadata through PJRT" {
     option.name = backend_option;
     option.name_size = backend_option.len;
     option.type = c.PJRT_NamedValue_kString;
-    option.unnamed_0.string_value = "synthetic";
-    option.value_size = "synthetic".len;
+    option.unnamed_0.string_value = "metal_mlx";
+    option.value_size = "metal_mlx".len;
 
     var create_args = std.mem.zeroes(c.PJRT_Client_Create_Args);
     create_args.struct_size = c.PJRT_Client_Create_Args_STRUCT_SIZE;
@@ -2213,8 +2380,8 @@ test "loaded executable execute transposes f32 buffer data through PJRT" {
     option.name = backend_option;
     option.name_size = backend_option.len;
     option.type = c.PJRT_NamedValue_kString;
-    option.unnamed_0.string_value = "synthetic";
-    option.value_size = "synthetic".len;
+    option.unnamed_0.string_value = "metal_mlx";
+    option.value_size = "metal_mlx".len;
 
     var create_args = std.mem.zeroes(c.PJRT_Client_Create_Args);
     create_args.struct_size = c.PJRT_Client_Create_Args_STRUCT_SIZE;
@@ -2341,8 +2508,8 @@ test "loaded executable execute broadcasts f32 buffer data through PJRT" {
     option.name = backend_option;
     option.name_size = backend_option.len;
     option.type = c.PJRT_NamedValue_kString;
-    option.unnamed_0.string_value = "synthetic";
-    option.value_size = "synthetic".len;
+    option.unnamed_0.string_value = "metal_mlx";
+    option.value_size = "metal_mlx".len;
 
     var create_args = std.mem.zeroes(c.PJRT_Client_Create_Args);
     create_args.struct_size = c.PJRT_Client_Create_Args_STRUCT_SIZE;
@@ -2469,8 +2636,8 @@ test "loaded executable execute slices f32 buffer data through PJRT" {
     option.name = backend_option;
     option.name_size = backend_option.len;
     option.type = c.PJRT_NamedValue_kString;
-    option.unnamed_0.string_value = "synthetic";
-    option.value_size = "synthetic".len;
+    option.unnamed_0.string_value = "metal_mlx";
+    option.value_size = "metal_mlx".len;
 
     var create_args = std.mem.zeroes(c.PJRT_Client_Create_Args);
     create_args.struct_size = c.PJRT_Client_Create_Args_STRUCT_SIZE;
@@ -2597,8 +2764,8 @@ test "loaded executable execute concatenates f32 buffers through PJRT" {
     option.name = backend_option;
     option.name_size = backend_option.len;
     option.type = c.PJRT_NamedValue_kString;
-    option.unnamed_0.string_value = "synthetic";
-    option.value_size = "synthetic".len;
+    option.unnamed_0.string_value = "metal_mlx";
+    option.value_size = "metal_mlx".len;
 
     var create_args = std.mem.zeroes(c.PJRT_Client_Create_Args);
     create_args.struct_size = c.PJRT_Client_Create_Args_STRUCT_SIZE;
@@ -2742,20 +2909,11 @@ test "loaded executable execute concatenates f32 buffers through PJRT" {
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0, 5.0, 6.0, 7.0, 3.0, 4.0, 8.0, 9.0, 10.0 }, &output);
 }
 
-test "client create option exposes synthetic multi-device topology through PJRT" {
+test "client default device assignment follows available Metal devices through PJRT" {
     const api = GetPjrtApi();
-
-    var option = std.mem.zeroes(c.PJRT_NamedValue);
-    option.struct_size = c.PJRT_NamedValue_STRUCT_SIZE;
-    option.name = synthetic_device_count_option;
-    option.name_size = synthetic_device_count_option.len;
-    option.type = c.PJRT_NamedValue_kInt64;
-    option.unnamed_0.int64_value = 4;
 
     var create_args = std.mem.zeroes(c.PJRT_Client_Create_Args);
     create_args.struct_size = c.PJRT_Client_Create_Args_STRUCT_SIZE;
-    create_args.create_options = &option;
-    create_args.num_options = 1;
     try expectOk(api.PJRT_Client_Create.?(&create_args));
     defer {
         var destroy_args = std.mem.zeroes(c.PJRT_Client_Destroy_Args);
@@ -2768,34 +2926,25 @@ test "client create option exposes synthetic multi-device topology through PJRT"
     devices_args.struct_size = c.PJRT_Client_Devices_Args_STRUCT_SIZE;
     devices_args.client = create_args.client;
     try expectOk(api.PJRT_Client_Devices.?(&devices_args));
-    try std.testing.expectEqual(@as(usize, 4), devices_args.num_devices);
+    try std.testing.expect(devices_args.num_devices >= 1);
 
-    var assignment = [_]c_int{ -1, -1, -1, -1 };
+    var assignment = [_]c_int{-1};
     var assignment_args = std.mem.zeroes(c.PJRT_Client_DefaultDeviceAssignment_Args);
     assignment_args.struct_size = c.PJRT_Client_DefaultDeviceAssignment_Args_STRUCT_SIZE;
     assignment_args.client = create_args.client;
-    assignment_args.num_replicas = 2;
-    assignment_args.num_partitions = 2;
+    assignment_args.num_replicas = 1;
+    assignment_args.num_partitions = 1;
     assignment_args.default_assignment_size = assignment.len;
     assignment_args.default_assignment = &assignment;
     try expectOk(api.PJRT_Client_DefaultDeviceAssignment.?(&assignment_args));
-    try std.testing.expectEqualSlices(c_int, &.{ 0, 1, 2, 3 }, &assignment);
+    try std.testing.expectEqualSlices(c_int, &.{0}, &assignment);
 }
 
 test "compile preserves bootstrap replicas partitions and shardy validation" {
     const api = GetPjrtApi();
 
-    var option = std.mem.zeroes(c.PJRT_NamedValue);
-    option.struct_size = c.PJRT_NamedValue_STRUCT_SIZE;
-    option.name = synthetic_device_count_option;
-    option.name_size = synthetic_device_count_option.len;
-    option.type = c.PJRT_NamedValue_kInt64;
-    option.unnamed_0.int64_value = 4;
-
     var create_args = std.mem.zeroes(c.PJRT_Client_Create_Args);
     create_args.struct_size = c.PJRT_Client_Create_Args_STRUCT_SIZE;
-    create_args.create_options = &option;
-    create_args.num_options = 1;
     try expectOk(api.PJRT_Client_Create.?(&create_args));
     defer {
         var destroy_args = std.mem.zeroes(c.PJRT_Client_Destroy_Args);
@@ -2819,7 +2968,7 @@ test "compile preserves bootstrap replicas partitions and shardy validation" {
     program.format = "mlir";
     program.format_size = "mlir".len;
 
-    const compile_options = "replicas=2; partitions=2; use_shardy=true; assignment=0,1,2,3";
+    const compile_options = "replicas=1; partitions=1; use_shardy=true; assignment=0";
     var compile_args = std.mem.zeroes(c.PJRT_Client_Compile_Args);
     compile_args.struct_size = c.PJRT_Client_Compile_Args_STRUCT_SIZE;
     compile_args.client = create_args.client;
@@ -2843,29 +2992,20 @@ test "compile preserves bootstrap replicas partitions and shardy validation" {
     replicas_args.struct_size = c.PJRT_Executable_NumReplicas_Args_STRUCT_SIZE;
     replicas_args.executable = get_executable_args.executable;
     try expectOk(api.PJRT_Executable_NumReplicas.?(&replicas_args));
-    try std.testing.expectEqual(@as(usize, 2), replicas_args.num_replicas);
+    try std.testing.expectEqual(@as(usize, 1), replicas_args.num_replicas);
 
     var partitions_args = std.mem.zeroes(c.PJRT_Executable_NumPartitions_Args);
     partitions_args.struct_size = c.PJRT_Executable_NumPartitions_Args_STRUCT_SIZE;
     partitions_args.executable = get_executable_args.executable;
     try expectOk(api.PJRT_Executable_NumPartitions.?(&partitions_args));
-    try std.testing.expectEqual(@as(usize, 2), partitions_args.num_partitions);
+    try std.testing.expectEqual(@as(usize, 1), partitions_args.num_partitions);
 }
 
-test "compile preserves partitioned shardy executable plan through PJRT" {
+test "compile rejects unavailable multi-device shardy executable plan through PJRT" {
     const api = GetPjrtApi();
-
-    var option = std.mem.zeroes(c.PJRT_NamedValue);
-    option.struct_size = c.PJRT_NamedValue_STRUCT_SIZE;
-    option.name = synthetic_device_count_option;
-    option.name_size = synthetic_device_count_option.len;
-    option.type = c.PJRT_NamedValue_kInt64;
-    option.unnamed_0.int64_value = 2;
 
     var create_args = std.mem.zeroes(c.PJRT_Client_Create_Args);
     create_args.struct_size = c.PJRT_Client_Create_Args_STRUCT_SIZE;
-    create_args.create_options = &option;
-    create_args.num_options = 1;
     try expectOk(api.PJRT_Client_Create.?(&create_args));
     defer {
         var destroy_args = std.mem.zeroes(c.PJRT_Client_Destroy_Args);
@@ -2895,21 +3035,9 @@ test "compile preserves partitioned shardy executable plan through PJRT" {
     compile_args.program = &program;
     compile_args.compile_options = compile_options;
     compile_args.compile_options_size = compile_options.len;
-    try expectOk(api.PJRT_Client_Compile.?(&compile_args));
-    defer {
-        var destroy_args = std.mem.zeroes(c.PJRT_LoadedExecutable_Destroy_Args);
-        destroy_args.struct_size = c.PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
-        destroy_args.executable = compile_args.executable;
-        _ = api.PJRT_LoadedExecutable_Destroy.?(&destroy_args);
-    }
-
-    const executable = executableFromC(compile_args.executable);
-    try std.testing.expectEqual(compiler.ShardingKind.partitioned, executable.plan.parameter_shardings[0].kind);
-    try std.testing.expectEqual(compiler.ShardingKind.partitioned, executable.plan.output_shardings[0].kind);
-    try std.testing.expectEqualStrings("mesh", executable.plan.parameter_shardings[0].mesh_name);
-    try std.testing.expectEqualStrings("mesh", executable.plan.output_shardings[0].mesh_name);
-    try std.testing.expectEqualSlices(i32, &.{ 0, 1 }, executable.plan.parameter_shardings[0].device_assignment);
-    try std.testing.expectEqualSlices(i32, &.{ 0, 1 }, executable.plan.output_shardings[0].device_assignment);
+    const err = api.PJRT_Client_Compile.?(&compile_args) orelse return error.TestUnexpectedResult;
+    defer destroyError(api, err);
+    try std.testing.expectEqualStrings("compile options require more devices than the client exposes", errorMessage(api, err));
 }
 
 test "compile unsupported op returns detailed PJRT diagnostic" {
@@ -2928,7 +3056,7 @@ test "compile unsupported op returns detailed PJRT diagnostic" {
     const module_text =
         \\sdy.mesh @mesh = <["x"=2]>
         \\func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
-        \\  %0 = "stablehlo.reduce_precision"(%arg0) <{exponent_bits = 8 : i32, mantissa_bits = 23 : i32}> {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{"x"}]>]>} : (tensor<4xf32>) -> tensor<4xf32>
+        \\  %0 = "stablehlo.optimization_barrier"(%arg0) {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{"x"}]>]>} : (tensor<4xf32>) -> tensor<4xf32>
         \\  return %0 : tensor<4xf32>
         \\}
     ;
@@ -2954,7 +3082,7 @@ test "compile unsupported op returns detailed PJRT diagnostic" {
     try std.testing.expectEqual(@as(c.PJRT_Error_Code, @intCast(c.PJRT_Error_Code_UNIMPLEMENTED)), code_args.code);
 
     const message = errorMessage(api, err);
-    try std.testing.expect(std.mem.indexOf(u8, message, "op=reduce_precision") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "op=optimization_barrier") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "dtype=f32") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "rank=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "sharding=sdy.sharding_per_value") != null);

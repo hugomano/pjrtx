@@ -25,7 +25,7 @@ zig_test(
     main = "runtime.zig",
     deps = [
         "//src/backend",
-        "//src/backend/synthetic:synthetic",
+        "//src/backend:registry",
         "//src/core",
     ],
 )

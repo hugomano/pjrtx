@@ -20,19 +20,16 @@
 #include "mlx/version.h"
 
 struct PjrtxMlxMetalBuffer {
-  std::vector<uint8_t> host;
   std::unique_ptr<mlx::core::array> array;
   uint64_t byte_size;
   int dtype;
   std::vector<int64_t> dims;
   int device_ordinal;
 
-  PjrtxMlxMetalBuffer(std::vector<uint8_t> host_,
-                      std::unique_ptr<mlx::core::array> array_,
+  PjrtxMlxMetalBuffer(std::unique_ptr<mlx::core::array> array_,
                       uint64_t byte_size_, int dtype_,
                       std::vector<int64_t> dims_, int device_ordinal_)
-      : host(std::move(host_)),
-        array(std::move(array_)),
+      : array(std::move(array_)),
         byte_size(byte_size_),
         dtype(dtype_),
         dims(std::move(dims_)),
@@ -47,6 +44,10 @@ bool is_valid_binary_u8_op(int op) {
     case PJRTX_MLX_METAL_U8_BINARY_SUBTRACT:
     case PJRTX_MLX_METAL_U8_BINARY_MULTIPLY:
     case PJRTX_MLX_METAL_U8_BINARY_DIVIDE:
+    case PJRTX_MLX_METAL_BINARY_MAXIMUM:
+    case PJRTX_MLX_METAL_BINARY_MINIMUM:
+    case PJRTX_MLX_METAL_BINARY_POWER:
+    case PJRTX_MLX_METAL_BINARY_REMAINDER:
       return true;
     default:
       return false;
@@ -60,6 +61,15 @@ bool is_valid_unary_op(int op) {
     case PJRTX_MLX_METAL_UNARY_TANH:
     case PJRTX_MLX_METAL_UNARY_SQRT:
     case PJRTX_MLX_METAL_UNARY_RSQRT:
+    case PJRTX_MLX_METAL_UNARY_ABS:
+    case PJRTX_MLX_METAL_UNARY_CEIL:
+    case PJRTX_MLX_METAL_UNARY_FLOOR:
+    case PJRTX_MLX_METAL_UNARY_LOG:
+    case PJRTX_MLX_METAL_UNARY_LOG1P:
+    case PJRTX_MLX_METAL_UNARY_LOGISTIC:
+    case PJRTX_MLX_METAL_UNARY_SIN:
+    case PJRTX_MLX_METAL_UNARY_COS:
+    case PJRTX_MLX_METAL_UNARY_SIGN:
       return true;
     default:
       return false;
@@ -72,6 +82,12 @@ size_t dtype_size(int dtype) {
       return sizeof(uint8_t);
     case PJRTX_MLX_METAL_DTYPE_U8:
       return sizeof(uint8_t);
+    case PJRTX_MLX_METAL_DTYPE_S8:
+      return sizeof(int8_t);
+    case PJRTX_MLX_METAL_DTYPE_S32:
+      return sizeof(int32_t);
+    case PJRTX_MLX_METAL_DTYPE_U32:
+      return sizeof(uint32_t);
     case PJRTX_MLX_METAL_DTYPE_F32:
       return sizeof(float);
     default:
@@ -234,20 +250,45 @@ mlx::core::Shape mlx_shape(const std::vector<int64_t>& dims) {
   return shape;
 }
 
-std::unique_ptr<mlx::core::array> make_mlx_array(const std::vector<uint8_t>& host,
+std::unique_ptr<mlx::core::array> make_mlx_array(const uint8_t* host,
+                                                 uint64_t byte_size,
                                                  int dtype,
                                                  const std::vector<int64_t>& dims) {
   const auto shape = mlx_shape(dims);
   switch (dtype) {
-    case PJRTX_MLX_METAL_DTYPE_PRED:
+    case PJRTX_MLX_METAL_DTYPE_PRED: {
+      std::vector<uint8_t> values(byte_size);
+      std::memcpy(values.data(), host, static_cast<size_t>(byte_size));
       return std::make_unique<mlx::core::array>(
-          host.begin(), shape, mlx::core::bool_);
-    case PJRTX_MLX_METAL_DTYPE_U8:
+          values.begin(), shape, mlx::core::bool_);
+    }
+    case PJRTX_MLX_METAL_DTYPE_U8: {
+      std::vector<uint8_t> values(byte_size);
+      std::memcpy(values.data(), host, static_cast<size_t>(byte_size));
       return std::make_unique<mlx::core::array>(
-          host.begin(), shape, mlx::core::uint8);
+          values.begin(), shape, mlx::core::uint8);
+    }
+    case PJRTX_MLX_METAL_DTYPE_S8: {
+      std::vector<int8_t> values(byte_size);
+      std::memcpy(values.data(), host, static_cast<size_t>(byte_size));
+      return std::make_unique<mlx::core::array>(
+          values.begin(), shape, mlx::core::int8);
+    }
+    case PJRTX_MLX_METAL_DTYPE_S32: {
+      std::vector<int32_t> values(byte_size / sizeof(int32_t));
+      std::memcpy(values.data(), host, static_cast<size_t>(byte_size));
+      return std::make_unique<mlx::core::array>(
+          values.begin(), shape, mlx::core::int32);
+    }
+    case PJRTX_MLX_METAL_DTYPE_U32: {
+      std::vector<uint32_t> values(byte_size / sizeof(uint32_t));
+      std::memcpy(values.data(), host, static_cast<size_t>(byte_size));
+      return std::make_unique<mlx::core::array>(
+          values.begin(), shape, mlx::core::uint32);
+    }
     case PJRTX_MLX_METAL_DTYPE_F32: {
-      std::vector<float> values(host.size() / sizeof(float));
-      std::memcpy(values.data(), host.data(), host.size());
+      std::vector<float> values(byte_size / sizeof(float));
+      std::memcpy(values.data(), host, static_cast<size_t>(byte_size));
       return std::make_unique<mlx::core::array>(
           values.begin(), shape, mlx::core::float32);
     }
@@ -311,6 +352,14 @@ mlx::core::array mlx_binary_array(const mlx::core::array& lhs,
       return dtype == PJRTX_MLX_METAL_DTYPE_U8
                  ? mlx::core::floor_divide(lhs, rhs, device)
                  : mlx::core::divide(lhs, rhs, device);
+    case PJRTX_MLX_METAL_BINARY_MAXIMUM:
+      return mlx::core::maximum(lhs, rhs, device);
+    case PJRTX_MLX_METAL_BINARY_MINIMUM:
+      return mlx::core::minimum(lhs, rhs, device);
+    case PJRTX_MLX_METAL_BINARY_POWER:
+      return mlx::core::power(lhs, rhs, device);
+    case PJRTX_MLX_METAL_BINARY_REMAINDER:
+      return mlx::core::remainder(lhs, rhs, device);
     default:
       throw std::invalid_argument("unknown PjRTx MLX binary op");
   }
@@ -329,6 +378,24 @@ mlx::core::array mlx_unary_array(const mlx::core::array& src, int op,
       return mlx::core::sqrt(src, device);
     case PJRTX_MLX_METAL_UNARY_RSQRT:
       return mlx::core::rsqrt(src, device);
+    case PJRTX_MLX_METAL_UNARY_ABS:
+      return mlx::core::abs(src, device);
+    case PJRTX_MLX_METAL_UNARY_CEIL:
+      return mlx::core::ceil(src, device);
+    case PJRTX_MLX_METAL_UNARY_FLOOR:
+      return mlx::core::floor(src, device);
+    case PJRTX_MLX_METAL_UNARY_LOG:
+      return mlx::core::log(src, device);
+    case PJRTX_MLX_METAL_UNARY_LOG1P:
+      return mlx::core::log1p(src, device);
+    case PJRTX_MLX_METAL_UNARY_LOGISTIC:
+      return mlx::core::sigmoid(src, device);
+    case PJRTX_MLX_METAL_UNARY_SIN:
+      return mlx::core::sin(src, device);
+    case PJRTX_MLX_METAL_UNARY_COS:
+      return mlx::core::cos(src, device);
+    case PJRTX_MLX_METAL_UNARY_SIGN:
+      return mlx::core::sign(src, device);
     default:
       throw std::invalid_argument("unknown PjRTx MLX unary op");
   }
@@ -342,15 +409,6 @@ void eval_on_device(mlx::core::array& array, const mlx::core::Device& device) {
   mlx::core::eval(array);
   mlx::core::synchronize(mlx::core::default_stream(device));
   array.wait();
-}
-
-std::vector<uint8_t> copy_array_bytes(mlx::core::array& array,
-                                      uint64_t byte_size,
-                                      const mlx::core::Device& device) {
-  eval_on_device(array, device);
-  std::vector<uint8_t> host(byte_size);
-  std::memcpy(host.data(), array.data<uint8_t>(), host.size());
-  return host;
 }
 
 bool dot_general_is_matmul_like(const std::vector<int64_t>& lhs_dims,
@@ -480,18 +538,19 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_from_host_typed(
     }
 
     const auto* bytes = static_cast<const uint8_t*>(data);
-    std::vector<uint8_t> host(bytes, bytes + byte_size);
     std::unique_ptr<mlx::core::array> array;
     try {
-      array = make_mlx_array(host, dtype, shape);
+      array = make_mlx_array(bytes, byte_size, dtype, shape);
     } catch (const std::exception&) {
       array.reset();
     } catch (...) {
       array.reset();
     }
-    return new PjrtxMlxMetalBuffer(std::move(host), std::move(array),
-                                   byte_size, dtype, std::move(shape),
-                                   device_ordinal);
+    if (array == nullptr) {
+      return nullptr;
+    }
+    return new PjrtxMlxMetalBuffer(std::move(array), byte_size, dtype,
+                                   std::move(shape), device_ordinal);
   } catch (const std::exception&) {
     return nullptr;
   } catch (...) {
@@ -505,9 +564,13 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_clone(PjrtxMlxMetalBuffer* src) {
   }
 
   try {
-    return pjrtx_mlx_metal_buffer_from_host_typed(
-        src->device_ordinal, src->host.data(), src->host.size(), src->dtype,
-        src->dims.data(), src->dims.size());
+    if (src->array == nullptr) {
+      return nullptr;
+    }
+    auto array = std::make_unique<mlx::core::array>(*src->array);
+    return new PjrtxMlxMetalBuffer(std::move(array), src->byte_size,
+                                   src->dtype, src->dims,
+                                   src->device_ordinal);
   } catch (const std::exception&) {
     return nullptr;
   } catch (...) {
@@ -551,13 +614,9 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_binary(
 
   try {
     auto out = mlx_binary_array(*lhs->array, *rhs->array, op, lhs->dtype, device);
-    eval_on_device(out, device);
-    std::vector<uint8_t> host(lhs->byte_size);
-    std::memcpy(host.data(), out.data<uint8_t>(), host.size());
     auto array = std::make_unique<mlx::core::array>(std::move(out));
-    return new PjrtxMlxMetalBuffer(std::move(host), std::move(array),
-                                   lhs->byte_size, lhs->dtype, lhs->dims,
-                                   lhs->device_ordinal);
+    return new PjrtxMlxMetalBuffer(std::move(array), lhs->byte_size,
+                                   lhs->dtype, lhs->dims, lhs->device_ordinal);
   } catch (const std::exception&) {
     return nullptr;
   } catch (...) {
@@ -582,13 +641,35 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_unary(
 
   try {
     auto out = mlx_unary_array(*src->array, op, device);
-    eval_on_device(out, device);
-    std::vector<uint8_t> host(src->byte_size);
-    std::memcpy(host.data(), out.data<uint8_t>(), host.size());
     auto array = std::make_unique<mlx::core::array>(std::move(out));
-    return new PjrtxMlxMetalBuffer(std::move(host), std::move(array),
-                                   src->byte_size, src->dtype, src->dims,
-                                   src->device_ordinal);
+    return new PjrtxMlxMetalBuffer(std::move(array), src->byte_size, src->dtype,
+                                   src->dims, src->device_ordinal);
+  } catch (const std::exception&) {
+    return nullptr;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_reshape(
+    PjrtxMlxMetalBuffer* src, const int64_t* dims, uint64_t rank) {
+  if (src == nullptr || (rank > 0 && dims == nullptr) || src->array == nullptr) {
+    return nullptr;
+  }
+  std::vector<int64_t> out_dims(dims, dims + rank);
+  const uint64_t byte_size = byte_size_for_shape(src->dtype, out_dims);
+  if (byte_size == 0 || byte_size != src->byte_size) {
+    return nullptr;
+  }
+  const mlx::core::Device device(mlx::core::Device::gpu, src->device_ordinal);
+  if (!mlx::core::is_available(device)) {
+    return nullptr;
+  }
+  try {
+    auto out = mlx::core::reshape(*src->array, mlx_shape(out_dims), device);
+    auto array = std::make_unique<mlx::core::array>(std::move(out));
+    return new PjrtxMlxMetalBuffer(std::move(array), byte_size, src->dtype,
+                                   std::move(out_dims), src->device_ordinal);
   } catch (const std::exception&) {
     return nullptr;
   } catch (...) {
@@ -618,13 +699,10 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_transpose(
       mlx_axes.push_back(static_cast<int>(axis));
     }
     auto out = mlx::core::transpose(*src->array, std::move(mlx_axes), device);
-    eval_on_device(out, device);
-    std::vector<uint8_t> host(src->byte_size);
-    std::memcpy(host.data(), out.data<uint8_t>(), host.size());
     auto array = std::make_unique<mlx::core::array>(std::move(out));
-    return new PjrtxMlxMetalBuffer(
-        std::move(host), std::move(array), src->byte_size, src->dtype,
-        permuted_dims(src->dims, axes), src->device_ordinal);
+    return new PjrtxMlxMetalBuffer(std::move(array), src->byte_size,
+                                   src->dtype, permuted_dims(src->dims, axes),
+                                   src->device_ordinal);
   } catch (const std::exception&) {
     return nullptr;
   } catch (...) {
@@ -657,13 +735,10 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_broadcast_in_dim(
         *src->array, mlx_shape(expanded_broadcast_dims(src->dims, axes, out_dims.size())),
         device);
     auto out = mlx::core::broadcast_to(reshaped, mlx_shape(out_dims), device);
-    eval_on_device(out, device);
     uint64_t byte_size = byte_size_for_shape(src->dtype, out_dims);
-    std::vector<uint8_t> host(byte_size);
-    std::memcpy(host.data(), out.data<uint8_t>(), host.size());
     auto array = std::make_unique<mlx::core::array>(std::move(out));
-    return new PjrtxMlxMetalBuffer(std::move(host), std::move(array), byte_size,
-                                   src->dtype, std::move(out_dims),
+    return new PjrtxMlxMetalBuffer(std::move(array), byte_size, src->dtype,
+                                   std::move(out_dims),
                                    src->device_ordinal);
   } catch (const std::exception&) {
     return nullptr;
@@ -699,12 +774,9 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_slice(
   try {
     auto out = mlx::core::slice(*src->array, mlx_shape(start), mlx_shape(stop),
                                 mlx_shape(step), device);
-    eval_on_device(out, device);
-    std::vector<uint8_t> host(byte_size);
-    std::memcpy(host.data(), out.data<uint8_t>(), host.size());
     auto array = std::make_unique<mlx::core::array>(std::move(out));
-    return new PjrtxMlxMetalBuffer(std::move(host), std::move(array), byte_size,
-                                   src->dtype, std::move(out_dims),
+    return new PjrtxMlxMetalBuffer(std::move(array), byte_size, src->dtype,
+                                   std::move(out_dims),
                                    src->device_ordinal);
   } catch (const std::exception&) {
     return nullptr;
@@ -741,12 +813,9 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_concatenate(
     arrays.push_back(*rhs->array);
     auto out = mlx::core::concatenate(std::move(arrays),
                                       static_cast<int>(dimension), device);
-    eval_on_device(out, device);
-    std::vector<uint8_t> host(byte_size);
-    std::memcpy(host.data(), out.data<uint8_t>(), host.size());
     auto array = std::make_unique<mlx::core::array>(std::move(out));
-    return new PjrtxMlxMetalBuffer(std::move(host), std::move(array), byte_size,
-                                   lhs->dtype, std::move(out_dims),
+    return new PjrtxMlxMetalBuffer(std::move(array), byte_size, lhs->dtype,
+                                   std::move(out_dims),
                                    lhs->device_ordinal);
   } catch (const std::exception&) {
     return nullptr;
@@ -798,10 +867,9 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_dot_general(
   }
   try {
     auto out = mlx::core::matmul(*lhs->array, *rhs->array, device);
-    auto host = copy_array_bytes(out, byte_size, device);
     auto array = std::make_unique<mlx::core::array>(std::move(out));
-    return new PjrtxMlxMetalBuffer(std::move(host), std::move(array),
-                                   byte_size, PJRTX_MLX_METAL_DTYPE_F32,
+    return new PjrtxMlxMetalBuffer(std::move(array), byte_size,
+                                   PJRTX_MLX_METAL_DTYPE_F32,
                                    std::move(out_dims), lhs->device_ordinal);
   } catch (const std::exception&) {
     return nullptr;
@@ -837,10 +905,9 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_reduce(
         op == PJRTX_MLX_METAL_REDUCE_SUM
             ? mlx::core::sum(*src->array, axes, false, device)
             : mlx::core::max(*src->array, axes, false, device);
-    auto host = copy_array_bytes(out, byte_size, device);
     auto array = std::make_unique<mlx::core::array>(std::move(out));
-    return new PjrtxMlxMetalBuffer(std::move(host), std::move(array),
-                                   byte_size, src->dtype, std::move(out_dims),
+    return new PjrtxMlxMetalBuffer(std::move(array), byte_size, src->dtype,
+                                   std::move(out_dims),
                                    src->device_ordinal);
   } catch (const std::exception&) {
     return nullptr;
@@ -871,10 +938,9 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_compare(
   }
   try {
     auto out = mlx_compare_array(*lhs->array, *rhs->array, direction, device);
-    auto host = copy_array_bytes(out, byte_size, device);
     auto array = std::make_unique<mlx::core::array>(std::move(out));
-    return new PjrtxMlxMetalBuffer(std::move(host), std::move(array),
-                                   byte_size, PJRTX_MLX_METAL_DTYPE_PRED,
+    return new PjrtxMlxMetalBuffer(std::move(array), byte_size,
+                                   PJRTX_MLX_METAL_DTYPE_PRED,
                                    std::move(out_dims), lhs->device_ordinal);
   } catch (const std::exception&) {
     return nullptr;
@@ -908,11 +974,9 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_select(
   try {
     auto out = mlx::core::where(*pred->array, *on_true->array, *on_false->array,
                                 device);
-    auto host = copy_array_bytes(out, byte_size, device);
     auto array = std::make_unique<mlx::core::array>(std::move(out));
-    return new PjrtxMlxMetalBuffer(std::move(host), std::move(array),
-                                   byte_size, on_true->dtype,
-                                   std::move(out_dims),
+    return new PjrtxMlxMetalBuffer(std::move(array), byte_size,
+                                   on_true->dtype, std::move(out_dims),
                                    on_true->device_ordinal);
   } catch (const std::exception&) {
     return nullptr;
@@ -928,6 +992,10 @@ uint64_t pjrtx_mlx_metal_buffer_size(PjrtxMlxMetalBuffer* buffer) {
   return buffer->byte_size;
 }
 
+int pjrtx_mlx_metal_buffer_has_host_shadow(PjrtxMlxMetalBuffer* buffer) {
+  return buffer == nullptr ? 0 : 0;
+}
+
 int pjrtx_mlx_metal_buffer_copy_to_host(PjrtxMlxMetalBuffer* buffer, void* dst,
                                         uint64_t dst_size) {
   if (buffer == nullptr || dst == nullptr || dst_size < buffer->byte_size) {
@@ -935,15 +1003,14 @@ int pjrtx_mlx_metal_buffer_copy_to_host(PjrtxMlxMetalBuffer* buffer, void* dst,
   }
 
   try {
-    if (buffer->array != nullptr) {
-      const mlx::core::Device device(mlx::core::Device::gpu,
-                                     buffer->device_ordinal);
-      eval_on_device(*buffer->array, device);
-      std::memcpy(dst, buffer->array->data<uint8_t>(),
-                  static_cast<size_t>(buffer->byte_size));
-      return 1;
+    if (buffer->array == nullptr) {
+      return 0;
     }
-    std::memcpy(dst, buffer->host.data(),
+    const mlx::core::Device device(mlx::core::Device::gpu,
+                                   buffer->device_ordinal);
+    auto contiguous = mlx::core::contiguous(*buffer->array, false, device);
+    eval_on_device(contiguous, device);
+    std::memcpy(dst, contiguous.data<uint8_t>(),
                 static_cast<size_t>(buffer->byte_size));
     return 1;
   } catch (const std::exception&) {

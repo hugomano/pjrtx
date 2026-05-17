@@ -68,6 +68,9 @@ pub const Operation = struct {
     dimension: ?i64 = null,
     iota_dimension: ?i64 = null,
     dimensions: []const i64 = &.{},
+    tuple_index: ?i64 = null,
+    lower: ?bool = null,
+    custom_call_target: []const u8 = &.{},
     reduce_dimensions: []const i64 = &.{},
     lhs_batch_dimensions: []const i64 = &.{},
     rhs_batch_dimensions: []const i64 = &.{},
@@ -98,6 +101,7 @@ pub const Operation = struct {
         allocator.free(self.start_indices_batching_dims);
         allocator.free(self.start_index_map);
         allocator.free(self.dimensions);
+        allocator.free(self.custom_call_target);
         allocator.free(self.reduce_dimensions);
         allocator.free(self.lhs_batch_dimensions);
         allocator.free(self.rhs_batch_dimensions);
@@ -668,6 +672,22 @@ fn instructionKindFromStablehlo(name: []const u8) PlanInstructionKind {
     if (std.mem.eql(u8, name, "compare")) return .compare;
     if (std.mem.eql(u8, name, "select")) return .select;
     if (std.mem.eql(u8, name, "clamp")) return .clamp;
+    if (std.mem.eql(u8, name, "cholesky")) return .cholesky;
+    if (std.mem.eql(u8, name, "complex")) return .complex;
+    if (std.mem.eql(u8, name, "convolution")) return .convolution;
+    if (std.mem.eql(u8, name, "custom_call")) return .custom_call;
+    if (std.mem.eql(u8, name, "fft")) return .fft;
+    if (std.mem.eql(u8, name, "get_tuple_element")) return .get_tuple_element;
+    if (std.mem.eql(u8, name, "imag")) return .imag;
+    if (std.mem.eql(u8, name, "partition_id")) return .partition_id;
+    if (std.mem.eql(u8, name, "real")) return .real;
+    if (std.mem.eql(u8, name, "reduce_precision")) return .reduce_precision;
+    if (std.mem.eql(u8, name, "rng")) return .rng;
+    if (std.mem.eql(u8, name, "rng_bit_generator")) return .rng_bit_generator;
+    if (std.mem.eql(u8, name, "scatter")) return .scatter;
+    if (std.mem.eql(u8, name, "triangular_solve")) return .triangular_solve;
+    if (std.mem.eql(u8, name, "tuple")) return .tuple;
+    if (std.mem.eql(u8, name, "while")) return .while_;
     return .unsupported;
 }
 
@@ -743,6 +763,12 @@ fn isUnaryKind(kind: PlanInstructionKind) bool {
         .reverse,
         .reduce_sum,
         .reduce_max,
+        .cholesky,
+        .fft,
+        .get_tuple_element,
+        .imag,
+        .real,
+        .reduce_precision,
         => true,
         else => false,
     };
@@ -770,6 +796,9 @@ fn isBinaryKind(kind: PlanInstructionKind) bool {
         .compare,
         .gather,
         .pad,
+        .complex,
+        .convolution,
+        .triangular_solve,
         => true,
         else => false,
     };
@@ -838,8 +867,10 @@ fn instructionInputs(allocator: std.mem.Allocator, kind: PlanInstructionKind, op
     }
     if (op.inputs.len != 0 or kind == .constant) return allocator.dupe(ValueId, op.inputs);
     return switch (kind) {
-        .constant, .iota => &.{},
+        .constant, .iota, .partition_id => &.{},
         .select, .clamp => allocator.dupe(ValueId, &.{ .{ .index = 0 }, .{ .index = 1 }, .{ .index = 2 } }),
+        .rng => allocator.dupe(ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+        .custom_call, .rng_bit_generator, .scatter, .tuple, .while_ => allocator.dupe(ValueId, op.inputs),
         else => if (isUnaryKind(kind))
             allocator.dupe(ValueId, &.{.{ .index = 0 }})
         else if (isBinaryKind(kind))
@@ -882,6 +913,7 @@ fn freeInstructions(allocator: std.mem.Allocator, instructions: []PlanInstructio
         if (instruction.start_indices_batching_dims) |dims| allocator.free(dims);
         if (instruction.start_index_map) |dims| allocator.free(dims);
         if (instruction.dimensions) |dimensions| allocator.free(dimensions);
+        if (instruction.custom_call_target) |target| allocator.free(target);
         if (instruction.reduce_dimensions) |reduce_dimensions| allocator.free(reduce_dimensions);
         if (instruction.lhs_batch_dimensions) |dims| allocator.free(dims);
         if (instruction.rhs_batch_dimensions) |dims| allocator.free(dims);
@@ -931,8 +963,10 @@ fn makePlanInstruction(
     errdefer if (start_indices_batching_dims) |owned| allocator.free(owned);
     const start_index_map = if (kind == .gather) try allocator.dupe(i64, op.start_index_map) else null;
     errdefer if (start_index_map) |owned| allocator.free(owned);
-    const dimensions = if (kind == .reverse) try allocator.dupe(i64, op.dimensions) else null;
+    const dimensions = if (kind == .reverse or kind == .fft) try allocator.dupe(i64, op.dimensions) else null;
     errdefer if (dimensions) |owned| allocator.free(owned);
+    const custom_call_target = if (kind == .custom_call) try allocator.dupe(u8, op.custom_call_target) else null;
+    errdefer if (custom_call_target) |owned| allocator.free(owned);
     const reduce_dimensions = if (kind == .reduce_sum or kind == .reduce_max) try allocator.dupe(i64, op.reduce_dimensions) else null;
     errdefer if (reduce_dimensions) |owned| allocator.free(owned);
     const lhs_batch_dimensions = if (kind == .dot_general) try allocator.dupe(i64, op.lhs_batch_dimensions) else null;
@@ -969,6 +1003,9 @@ fn makePlanInstruction(
         .dimension = if (kind == .concatenate) op.dimension else null,
         .iota_dimension = if (kind == .iota) op.iota_dimension else null,
         .dimensions = dimensions,
+        .tuple_index = if (kind == .get_tuple_element) op.tuple_index else null,
+        .lower = if (kind == .cholesky) op.lower else null,
+        .custom_call_target = custom_call_target,
         .reduce_dimensions = reduce_dimensions,
         .lhs_batch_dimensions = lhs_batch_dimensions,
         .rhs_batch_dimensions = rhs_batch_dimensions,
@@ -996,9 +1033,10 @@ fn lowerAnalysisOpsToPlan(allocator: std.mem.Allocator, ops: []const Operation, 
 
 fn expectedInputCount(kind: PlanInstructionKind) ?usize {
     return switch (kind) {
-        .constant, .iota => 0,
-        .dynamic_slice, .dynamic_update_slice, .concatenate => null,
+        .constant, .iota, .partition_id => 0,
+        .dynamic_slice, .dynamic_update_slice, .concatenate, .custom_call, .rng_bit_generator, .scatter, .tuple, .while_ => null,
         .select, .clamp => 3,
+        .rng => null,
         .unsupported => null,
         else => if (isUnaryKind(kind)) 1 else if (isBinaryKind(kind)) 2 else null,
     };
@@ -1072,7 +1110,7 @@ fn verifyInstructionDescriptors(
                 return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "constant instruction must carry literal bytes", "constant");
             }
         },
-        .copy_arg0, .negate, .exp, .expm1, .tanh, .sqrt, .rsqrt, .abs, .cbrt, .ceil, .floor, .log, .log1p, .logistic, .sine, .cosine, .not_, .sign, .round_nearest_afz, .round_nearest_even, .popcnt, .count_leading_zeros => {
+        .copy_arg0, .negate, .exp, .expm1, .tanh, .sqrt, .rsqrt, .abs, .cbrt, .ceil, .floor, .log, .log1p, .logistic, .sine, .cosine, .not_, .sign, .round_nearest_afz, .round_nearest_even, .popcnt, .count_leading_zeros, .reduce_precision => {
             if (!sameTypeAndShape(plan.values[instruction.inputs[0].index].descriptor, output)) {
                 return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "unary instruction must preserve input dtype and shape", "shape-type");
             }
@@ -1182,6 +1220,39 @@ fn verifyInstructionDescriptors(
             }
         },
         .iota => {},
+        .partition_id => {
+            if (descriptorKnown(output) and output.dims.len != 0) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "partition_id output must be scalar", "shape-type");
+            }
+            if (descriptorKnown(output) and output.element_type != .u32 and output.element_type != .s32) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "partition_id output must be u32 or s32", "shape-type");
+            }
+        },
+        .cholesky => {
+            const input = plan.values[instruction.inputs[0].index].descriptor;
+            if (descriptorKnown(input) and descriptorKnown(output) and !sameTypeAndShape(input, output)) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "cholesky output must match input dtype and shape", "shape-type");
+            }
+            if (descriptorKnown(output) and output.element_type != .f32) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "cholesky bootstrap lowering supports f32 tensors only", "cholesky");
+            }
+            if (descriptorKnown(output) and output.dims.len < 2) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "cholesky requires rank >= 2", "shape");
+            }
+        },
+        .triangular_solve => {
+            const rhs = plan.values[instruction.inputs[1].index].descriptor;
+            if (descriptorKnown(rhs) and descriptorKnown(output) and !sameTypeAndShape(rhs, output)) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "triangular_solve output must match rhs dtype and shape", "shape-type");
+            }
+        },
+        .rng => {},
+        .rng_bit_generator => {
+            if (instruction.outputs.len != 2) {
+                return failPlanVerification(writer, pass_name, instruction_index, null, "rng_bit_generator must produce state and random bits", "random");
+            }
+        },
+        .complex, .real, .imag, .fft, .convolution, .scatter, .custom_call, .get_tuple_element, .tuple, .while_ => {},
         .unsupported => {},
     }
 
@@ -1241,8 +1312,8 @@ pub fn verifyExecutablePlan(
         if (expectedInputCount(instruction.kind)) |expected_inputs| if (instruction.inputs.len != expected_inputs) {
             return failPlanVerification(writer, pass_name, instruction_index, null, "instruction input arity mismatch", "instruction-arity");
         };
-        if (instruction.outputs.len != 1) {
-            return failPlanVerification(writer, pass_name, instruction_index, null, "bootstrap instructions must produce one value", "instruction-arity");
+        if (instruction.outputs.len == 0) {
+            return failPlanVerification(writer, pass_name, instruction_index, null, "instructions must produce at least one value", "instruction-arity");
         }
         for (instruction.inputs) |input| {
             if (!valueInPlan(plan, input)) {
@@ -1343,6 +1414,22 @@ fn stablehloOpSupported(name: []const u8) bool {
         "gather",
         "reduce",
         "dot_general",
+        "cholesky",
+        "complex",
+        "convolution",
+        "custom_call",
+        "fft",
+        "get_tuple_element",
+        "imag",
+        "partition_id",
+        "real",
+        "reduce_precision",
+        "rng",
+        "rng_bit_generator",
+        "scatter",
+        "triangular_solve",
+        "tuple",
+        "while",
     };
     for (supported) |candidate| {
         if (std.mem.eql(u8, name, candidate)) return true;
@@ -1459,6 +1546,16 @@ fn intListAttribute(allocator: std.mem.Allocator, attr: mlir.MlirAttribute) ![]c
 fn intAttribute(attr: mlir.MlirAttribute) ?i64 {
     if (mlir.mlirAttributeIsNull(attr) or !mlir.mlirAttributeIsAInteger(attr)) return null;
     return mlir.mlirIntegerAttrGetValueInt(attr);
+}
+
+fn boolAttribute(attr: mlir.MlirAttribute) ?bool {
+    if (mlir.mlirAttributeIsNull(attr) or !mlir.mlirAttributeIsABool(attr)) return null;
+    return mlir.mlirBoolAttrGetValue(attr);
+}
+
+fn stringAttribute(allocator: std.mem.Allocator, attr: mlir.MlirAttribute) ![]const u8 {
+    if (mlir.mlirAttributeIsNull(attr) or !mlir.mlirAttributeIsAString(attr)) return allocator.dupe(u8, &.{});
+    return allocator.dupe(u8, mlirStringSlice(mlir.mlirStringAttrGetValue(attr)));
 }
 
 fn resultOrOperandType(op: mlir.MlirOperation) mlir.MlirType {
@@ -1873,10 +1970,26 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
         null;
     const dimensions = if (std.mem.eql(u8, short_name, "reverse"))
         try intListAttribute(builder.allocator, getOperationAttribute(op, "dimensions"))
+    else if (std.mem.eql(u8, short_name, "fft"))
+        try intListAttribute(builder.allocator, getOperationAttribute(op, "fft_length"))
     else
         try builder.allocator.dupe(i64, &.{});
     var owns_dimensions = true;
     errdefer if (owns_dimensions) builder.allocator.free(dimensions);
+    const tuple_index = if (std.mem.eql(u8, short_name, "get_tuple_element"))
+        intAttribute(getOperationAttribute(op, "index"))
+    else
+        null;
+    const lower = if (std.mem.eql(u8, short_name, "cholesky"))
+        boolAttribute(getOperationAttribute(op, "lower"))
+    else
+        null;
+    const custom_call_target = if (std.mem.eql(u8, short_name, "custom_call"))
+        try stringAttribute(builder.allocator, getOperationAttribute(op, "call_target_name"))
+    else
+        try builder.allocator.dupe(u8, &.{});
+    var owns_custom_call_target = true;
+    errdefer if (owns_custom_call_target) builder.allocator.free(custom_call_target);
     const reduce_dimensions = if (std.mem.startsWith(u8, short_name, "reduce_"))
         try intListAttribute(builder.allocator, getOperationAttribute(op, "dimensions"))
     else
@@ -1946,6 +2059,9 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
         .dimension = dimension,
         .iota_dimension = iota_dimension,
         .dimensions = dimensions,
+        .tuple_index = tuple_index,
+        .lower = lower,
+        .custom_call_target = custom_call_target,
         .reduce_dimensions = reduce_dimensions,
         .lhs_batch_dimensions = lhs_batch_dimensions,
         .rhs_batch_dimensions = rhs_batch_dimensions,
@@ -1977,6 +2093,7 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
         owns_start_indices_batching_dims = false;
         owns_start_index_map = false;
         owns_dimensions = false;
+        owns_custom_call_target = false;
         owns_reduce_dimensions = false;
         owns_lhs_batch_dimensions = false;
         owns_rhs_batch_dimensions = false;
@@ -2007,6 +2124,7 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
     owns_start_indices_batching_dims = false;
     owns_start_index_map = false;
     owns_dimensions = false;
+    owns_custom_call_target = false;
     owns_reduce_dimensions = false;
     owns_lhs_batch_dimensions = false;
     owns_rhs_batch_dimensions = false;
@@ -2634,6 +2752,35 @@ test "executable plan lowers concatenate with dimension and result shape" {
     try std.testing.expectEqual(@as(?i64, 1), plan.instructions[0].dimension);
 }
 
+test "executable plan lowers heavy random and structural StableHLO op shells" {
+    const module_text =
+        \\module {
+        \\  func.func @main(%arg0: tensor<2x2xf32>) -> tensor<2x2xf32> {
+        \\    %0 = "stablehlo.reduce_precision"(%arg0) <{exponent_bits = 8 : i32, mantissa_bits = 23 : i32}> : (tensor<2x2xf32>) -> tensor<2x2xf32>
+        \\    %1 = "stablehlo.cholesky"(%0) <{lower = true}> : (tensor<2x2xf32>) -> tensor<2x2xf32>
+        \\    %2 = "stablehlo.custom_call"(%1) {call_target_name = "pjrtx.test"} : (tensor<2x2xf32>) -> tensor<2x2xf32>
+        \\    return %2 : tensor<2x2xf32>
+        \\  }
+        \\}
+    ;
+    var reader: std.Io.Reader = .fixed(module_text);
+    var diagnostics = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    var analysis = try analyzeProgramFromReader(std.testing.allocator, "mlir", &reader, &diagnostics.writer);
+    defer analysis.deinit();
+
+    var plan = try makeExecutablePlan(std.testing.allocator, .{}, analysis);
+    defer plan.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), plan.instructions.len);
+    try std.testing.expectEqual(PlanInstructionKind.reduce_precision, plan.instructions[0].kind);
+    try std.testing.expectEqual(PlanInstructionKind.cholesky, plan.instructions[1].kind);
+    try std.testing.expectEqual(@as(?bool, true), plan.instructions[1].lower);
+    try std.testing.expectEqual(PlanInstructionKind.custom_call, plan.instructions[2].kind);
+    try std.testing.expectEqualStrings("pjrtx.test", plan.instructions[2].custom_call_target.?);
+}
+
 test "analyze stablehlo text registers dialects and supported ops" {
     const module_text =
         \\module {
@@ -2688,7 +2835,7 @@ test "analyze stablehlo text reports unsupported op with location dtype rank and
     const module_text =
         \\sdy.mesh @mesh = <["x"=2]>
         \\func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
-        \\  %0 = "stablehlo.reduce_precision"(%arg0) <{exponent_bits = 8 : i32, mantissa_bits = 23 : i32}> {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{"x"}]>]>} : (tensor<4xf32>) -> tensor<4xf32>
+        \\  %0 = "stablehlo.optimization_barrier"(%arg0) {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{"x"}]>]>} : (tensor<4xf32>) -> tensor<4xf32>
         \\  return %0 : tensor<4xf32>
         \\}
     ;
@@ -2701,7 +2848,7 @@ test "analyze stablehlo text reports unsupported op with location dtype rank and
         analyzeProgramFromReader(std.testing.allocator, "mlir", &reader, &diagnostics.writer),
     );
     const text = diagnostics.writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, text, "op=reduce_precision") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "op=optimization_barrier") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "dtype=f32") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "rank=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "sharding=sdy.sharding_per_value") != null);

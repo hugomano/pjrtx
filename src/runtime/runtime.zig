@@ -3027,8 +3027,8 @@ fn backendStartHandles(allocator: std.mem.Allocator, start_buffers: []const *Buf
 fn supportedGatherAxisForRuntime(collapsed_slice_dims: []const i64, start_index_map: []const i64, slice_sizes: []const i64) ?i64 {
     if (collapsed_slice_dims.len != 1 or start_index_map.len != 1) return null;
     const axis = start_index_map[0];
-    if (axis != 0 or collapsed_slice_dims[0] != axis) return null;
-    if (slice_sizes.len == 0 or slice_sizes[@intCast(axis)] != 1) return null;
+    if (axis < 0 or collapsed_slice_dims[0] != axis) return null;
+    if (slice_sizes.len == 0 or axis >= @as(i64, @intCast(slice_sizes.len)) or slice_sizes[@intCast(axis)] != 1) return null;
     return axis;
 }
 

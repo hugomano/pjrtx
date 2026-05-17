@@ -1257,12 +1257,13 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_gather_axis(
     uint64_t output_rank) {
   if (operand == nullptr || indices == nullptr || output_dims == nullptr ||
       operand->byte_size == 0 || indices->byte_size == 0 ||
-      operand->device_ordinal != indices->device_ordinal || axis != 0) {
+      operand->device_ordinal != indices->device_ordinal) {
     return nullptr;
   }
   std::vector<int64_t> out_dims(output_dims, output_dims + output_rank);
   const uint64_t byte_size = byte_size_for_shape(operand->dtype, out_dims);
-  if (byte_size == 0) {
+  if (byte_size == 0 || axis < 0 ||
+      static_cast<size_t>(axis) >= operand->dims.size()) {
     return nullptr;
   }
 

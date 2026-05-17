@@ -56,7 +56,8 @@ def main() -> int:
     i32_a = np.arange(8, dtype=np.int32)
     i32_b = np.arange(10, 18, dtype=np.int32)
     i32_shift = np.full((8,), 1, dtype=np.int32)
-    gather_indices = np.array([2, 0], dtype=np.int32)
+    gather_indices = np.array([2, -1], dtype=np.int32)
+    column_indices = np.array([3, 1], dtype=np.int32)
     floor = np.full((3, 4), 0.25, dtype=np.float32)
     tiny = np.full((3, 4), 0.01, dtype=np.float32)
     clip_lo = np.full((3, 4), -0.25, dtype=np.float32)
@@ -78,6 +79,7 @@ def main() -> int:
     run_case(jax, "bitwise_int", lambda x, y, shift: (x & y) ^ (x << shift), i32_a, i32_b, i32_shift)
     run_case(jax, "sort", lambda x: jnp.sort(x, axis=1), f32_a)
     run_case(jax, "axis0_gather", lambda x, i: x[i], f32_a, gather_indices)
+    run_case(jax, "axis1_gather", lambda x, i: x[:, i], f32_a, column_indices)
 
     print(f"JAX backend: {jax.default_backend()}")
     print("PjRTx JAX op suite: passed")

@@ -537,6 +537,38 @@ int main() {
     pjrtx_mlx_metal_buffer_destroy(gather_indices);
     pjrtx_mlx_metal_buffer_destroy(gather_operand);
 
+    const int32_t gather_axis1_indices_input[] = {1, 0};
+    const int64_t gather_axis1_output_dims[] = {3, 2};
+    PjrtxMlxMetalBuffer* gather_axis1_operand =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, gather_operand_input,
+            sizeof(gather_operand_input), PJRTX_MLX_METAL_DTYPE_F32,
+            gather_operand_dims, 2);
+    PjrtxMlxMetalBuffer* gather_axis1_indices =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, gather_axis1_indices_input,
+            sizeof(gather_axis1_indices_input), PJRTX_MLX_METAL_DTYPE_S32,
+            gather_indices_dims, 1);
+    assert(gather_axis1_operand != nullptr);
+    assert(gather_axis1_indices != nullptr);
+    PjrtxMlxMetalBuffer* gathered_axis1 = pjrtx_mlx_metal_buffer_gather_axis(
+        gather_axis1_operand, gather_axis1_indices, 1, 1,
+        gather_axis1_output_dims, 2);
+    assert(gathered_axis1 != nullptr);
+    float gather_axis1_output[6] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               gathered_axis1, gather_axis1_output,
+               sizeof(gather_axis1_output)) == 1);
+    {
+      const float expected[] = {2.0f, 1.0f, 4.0f, 3.0f, 6.0f, 5.0f};
+      for (int i = 0; i < 6; ++i) {
+        assert(near(gather_axis1_output[i], expected[i]));
+      }
+    }
+    pjrtx_mlx_metal_buffer_destroy(gathered_axis1);
+    pjrtx_mlx_metal_buffer_destroy(gather_axis1_indices);
+    pjrtx_mlx_metal_buffer_destroy(gather_axis1_operand);
+
     const int64_t sort_dims[] = {2, 3};
     const float sort_input[] = {3.0f, 1.0f, 2.0f, 6.0f, 4.0f, 5.0f};
     PjrtxMlxMetalBuffer* sort_buffer = pjrtx_mlx_metal_buffer_from_host_typed(

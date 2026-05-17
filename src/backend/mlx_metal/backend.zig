@@ -799,13 +799,7 @@ fn instructionLoweringIssue(plan: *const core.ExecutablePlan, instruction: core.
             .detail = "concatenate lowering requires a dimension",
             .feature = "mlx-concatenate",
         } else null,
-        .gather => if (supportedGatherAxis(instruction) == null) .{
-            .instruction_index = instruction_index,
-            .value_id = output_id,
-            .op = instruction.kind,
-            .detail = "gather lowering currently supports collapsed axis-0 embedding gathers only",
-            .feature = "mlx-gather-axis0",
-        } else null,
+        .gather => validateGatherLowering(plan, instruction, instruction_index, output_id),
         .sort => validateSortLowering(instruction, instruction_index, output_id),
         .dot_general => validateDotGeneralLowering(plan, instruction, instruction_index, output_id),
         .reduce_sum, .reduce_max => validateReduceLowering(plan, instruction, instruction_index, output_id),
@@ -971,6 +965,77 @@ fn validatePadLowering(plan: *const core.ExecutablePlan, instruction: core.PlanI
             .feature = "mlx-pad",
         };
     }
+    return null;
+}
+
+fn validateGatherLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+    const operand = inputDescriptor(plan, instruction, 0) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
+        .op = instruction.kind,
+        .detail = "gather operand is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const indices = inputDescriptor(plan, instruction, 1) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 1) instruction.inputs[1] else output_id,
+        .op = instruction.kind,
+        .detail = "gather indices are outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const output = plan.values[output_id.index].descriptor;
+    const axis = supportedGatherAxis(instruction) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "gather lowering currently supports one collapsed gathered axis",
+        .feature = "mlx-gather-single-axis",
+    };
+    if (axis < 0 or axis >= @as(i64, @intCast(operand.dims.len))) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "gather axis is outside the operand rank",
+        .feature = "mlx-gather-axis",
+    };
+    if (operand.element_type != output.element_type or !isSupportedInteger(indices.element_type)) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "gather lowering requires matching operand/output dtypes and integer indices",
+        .feature = "mlx-gather-types",
+    };
+    const slice_sizes = instruction.slice_sizes orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "gather lowering requires static slice sizes",
+        .feature = "mlx-gather-slice-sizes",
+    };
+    if (slice_sizes.len != operand.dims.len) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "gather slice size rank must match operand rank",
+        .feature = "mlx-gather-slice-sizes",
+    };
+    for (slice_sizes, operand.dims, 0..) |slice_size, operand_dim, dim_index| {
+        if (dim_index == @as(usize, @intCast(axis))) continue;
+        if (slice_size != operand_dim) return .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "gather lowering supports full slices on non-gathered axes only",
+            .feature = "mlx-gather-slice-shape",
+        };
+    }
+    if (!gatherOutputShapeMatchesTake(operand.dims, indices.dims, instruction.index_vector_dim orelse 0, axis, output.dims)) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "gather output shape must match MLX take semantics for the gathered axis",
+        .feature = "mlx-gather-output-shape",
+    };
     return null;
 }
 
@@ -1270,9 +1335,36 @@ fn supportedGatherAxis(instruction: core.PlanInstruction) ?i64 {
     const collapsed_slice_dims = instruction.collapsed_slice_dims orelse return null;
     if (start_index_map.len != 1 or collapsed_slice_dims.len != 1) return null;
     const axis = start_index_map[0];
-    if (axis != 0 or collapsed_slice_dims[0] != axis) return null;
-    if (slice_sizes.len == 0 or slice_sizes[@intCast(axis)] != 1) return null;
+    if (axis < 0 or collapsed_slice_dims[0] != axis) return null;
+    if (slice_sizes.len == 0 or axis >= @as(i64, @intCast(slice_sizes.len)) or slice_sizes[@intCast(axis)] != 1) return null;
     return axis;
+}
+
+fn gatherOutputShapeMatchesTake(operand_dims: []const i64, indices_dims: []const i64, index_vector_dim: i64, axis: i64, output_dims: []const i64) bool {
+    if (axis < 0 or axis >= @as(i64, @intCast(operand_dims.len))) return false;
+    var expected_rank: usize = operand_dims.len - 1;
+    for (indices_dims, 0..) |dim, dim_index| {
+        if (index_vector_dim >= 0 and dim_index == @as(usize, @intCast(index_vector_dim)) and dim == 1) continue;
+        expected_rank += 1;
+    }
+    if (output_dims.len != expected_rank) return false;
+
+    var out_index: usize = 0;
+    for (operand_dims[0..@intCast(axis)]) |dim| {
+        if (output_dims[out_index] != dim) return false;
+        out_index += 1;
+    }
+    for (indices_dims, 0..) |dim, dim_index| {
+        if (index_vector_dim >= 0 and dim_index == @as(usize, @intCast(index_vector_dim)) and dim == 1) continue;
+        if (output_dims[out_index] != dim) return false;
+        out_index += 1;
+    }
+    const axis_index: usize = @intCast(axis);
+    for (operand_dims[axis_index + 1 ..]) |dim| {
+        if (output_dims[out_index] != dim) return false;
+        out_index += 1;
+    }
+    return out_index == output_dims.len;
 }
 
 fn executableBinaryOp(instruction_kind: core.PlanInstructionKind) ?core.ElementwiseBinaryOp {
@@ -1805,7 +1897,7 @@ test "mlx metal backend executable rejects unsupported gather form during loweri
             .inputs = try allocator.dupe(core.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
             .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
             .dims = try allocator.dupe(i64, &output_dims),
-            .start_index_map = try allocator.dupe(i64, &.{1}),
+            .start_index_map = try allocator.dupe(i64, &.{ 0, 1 }),
             .collapsed_slice_dims = try allocator.dupe(i64, &.{1}),
             .slice_sizes = try allocator.dupe(i64, &.{ 4, 1 }),
             .index_vector_dim = 1,
@@ -1813,11 +1905,13 @@ test "mlx metal backend executable rejects unsupported gather form during loweri
     };
     defer plan.deinit();
 
-    try std.testing.expect((try b.compileExecutable(allocator, &plan, &assignment)) == null);
+    const maybe_executable = try b.compileExecutable(allocator, &plan, &assignment);
+    if (maybe_executable) |executable| b.destroyExecutable(executable);
+    try std.testing.expect(maybe_executable == null);
     var diagnostics = std.Io.Writer.Allocating.init(allocator);
     defer diagnostics.deinit();
     try b.writeExecutableLoweringDiagnostic(&plan, &assignment, &diagnostics.writer);
     const message = diagnostics.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, message, "op=gather") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "feature=mlx-gather-axis0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "feature=mlx-gather-single-axis") != null);
 }

@@ -52,7 +52,7 @@ PJRTX_BACKEND=metal_mlx PJRTX_TRACE=1 bazel run //tests/jax:jax_plugin_smoke
 `//tests/jax:jax_op_suite` compares the currently lowered PjRTx fast path
 against JAX CPU for repeated `jax.jit` execution of elementwise float chains,
 reshape/transpose/broadcast, reductions, matmul, clipping via min/max, integer
-bitwise ops, StableHLO sort regions, and restricted axis-0 gather forms. The
+bitwise ops, StableHLO sort regions, and restricted single-axis gather forms. The
 suite asserts repeated execution against the MLX Metal device fast path with no
 runtime fallback.
 
@@ -210,7 +210,7 @@ execution.
   MLX-supported numeric dtypes,
   reductions, `dot_general`, dtype casts, StableHLO `iota`, StableHLO `clamp`,
   shape/view ops, StableHLO `reverse`, dynamic slice, dynamic update-slice,
-  constant edge padding, restricted axis-0 gather, and ascending/descending
+  constant edge padding, restricted single-axis gather, and ascending/descending
   StableHLO `sort` now run through MLX core operations on the GPU device when
   MLX arrays and Metal devices are available. StableHLO interior padding and
   general gather/scatter metadata still require broader backend legalization before they

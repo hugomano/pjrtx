@@ -30,11 +30,6 @@ const PjrtxError = struct {
     message: []u8,
 };
 
-const Event = struct {
-    ready: bool = true,
-    err: ?*PjrtxError = null,
-};
-
 const DeviceAttributes = struct {
     attrs: [5]c.PJRT_NamedValue,
 };
@@ -320,37 +315,45 @@ fn pjrtPluginAttributes(args: [*c]c.PJRT_Plugin_Attributes_Args) callconv(.c) ?*
 }
 
 fn eventCreateReady() ?*c.PJRT_Event {
-    const event = allocator.create(Event) catch return null;
-    event.* = .{};
+    const event = allocator.create(runtime.Event) catch return null;
+    event.* = runtime.Event.ready();
+    return @ptrCast(event);
+}
+
+fn eventCreateFailed(message: []const u8) ?*c.PJRT_Event {
+    const event = allocator.create(runtime.Event) catch return null;
+    event.* = runtime.Event.failed(message);
     return @ptrCast(event);
 }
 
 fn pjrtEventDestroy(args: [*c]c.PJRT_Event_Destroy_Args) callconv(.c) ?*c.PJRT_Error {
-    if (args[0].event) |event| allocator.destroy(@as(*Event, @ptrCast(@alignCast(event))));
+    if (args[0].event) |event| allocator.destroy(@as(*runtime.Event, @ptrCast(@alignCast(event))));
     return null;
 }
 
 fn pjrtEventIsReady(args: [*c]c.PJRT_Event_IsReady_Args) callconv(.c) ?*c.PJRT_Error {
-    const event: *Event = @ptrCast(@alignCast(args[0].event.?));
-    args[0].is_ready = event.ready;
+    const event: *runtime.Event = @ptrCast(@alignCast(args[0].event.?));
+    args[0].is_ready = event.isReady();
     return null;
 }
 
 fn pjrtEventError(args: [*c]c.PJRT_Event_Error_Args) callconv(.c) ?*c.PJRT_Error {
-    const event: *Event = @ptrCast(@alignCast(args[0].event.?));
-    if (event.err) |err| return @ptrCast(err);
+    const event: *runtime.Event = @ptrCast(@alignCast(args[0].event.?));
+    if (event.state == .failed) return makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, event.message);
     return null;
 }
 
 fn pjrtEventAwait(args: [*c]c.PJRT_Event_Await_Args) callconv(.c) ?*c.PJRT_Error {
-    const event: *Event = @ptrCast(@alignCast(args[0].event.?));
-    event.ready = true;
-    if (event.err) |err| return @ptrCast(err);
+    const event: *runtime.Event = @ptrCast(@alignCast(args[0].event.?));
+    if (event.state == .pending) event.state = .ready;
+    if (event.state == .failed) return makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, event.message);
     return null;
 }
 
 fn pjrtEventOnReady(args: [*c]c.PJRT_Event_OnReady_Args) callconv(.c) ?*c.PJRT_Error {
-    if (args[0].callback) |callback| callback(null, args[0].user_arg);
+    const event: *runtime.Event = @ptrCast(@alignCast(args[0].event.?));
+    const maybe_error = if (event.state == .failed) makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, event.message) else null;
+    if (args[0].callback) |callback| callback(maybe_error, args[0].user_arg);
     return null;
 }
 
@@ -529,9 +532,22 @@ fn pjrtClientCompile(args: [*c]c.PJRT_Client_Compile_Args) callconv(.c) ?*c.PJRT
     errdefer allocator.free(output_memory_kind_sizes);
     fillMemoryKindArrays(output_memory_kinds, output_memory_kind_sizes);
 
-    const fingerprint_value = std.hash.Wyhash.hash(0, optimized_program);
+    var fingerprint_hasher = std.hash.Wyhash.init(0);
+    fingerprint_hasher.update(optimized_program);
+    fingerprint_hasher.update(@tagName(client.backend_kind));
+    fingerprint_hasher.update(std.mem.asBytes(&plan.options.num_replicas));
+    fingerprint_hasher.update(std.mem.asBytes(&plan.options.num_partitions));
+    fingerprint_hasher.update(std.mem.asBytes(&plan.options.use_shardy_partitioner));
+    fingerprint_hasher.update(std.mem.sliceAsBytes(plan.options.device_assignment));
+    for (plan.values) |value| {
+        fingerprint_hasher.update(std.mem.asBytes(&value.descriptor.element_type));
+        fingerprint_hasher.update(std.mem.sliceAsBytes(value.descriptor.dims));
+        fingerprint_hasher.update(std.mem.asBytes(&value.descriptor.layout));
+    }
+    const fingerprint_value = fingerprint_hasher.final();
     const fingerprint = std.fmt.allocPrint(allocator, "pjrtx-{x}", .{fingerprint_value}) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable fingerprint");
     errdefer allocator.free(fingerprint);
+    const cache_hit = client.recordExecutableCompile(fingerprint) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to update executable cache");
 
     const plan_ptr = allocator.create(compiler.ExecutablePlan) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable plan storage");
     plan_ptr.* = plan;
@@ -571,13 +587,14 @@ fn pjrtClientCompile(args: [*c]c.PJRT_Client_Compile_Args) callconv(.c) ?*c.PJRT
     };
     args[0].executable = @ptrCast(executable);
     trace(
-        "event=compile backend={s} devices={d} values={d} instructions={d} outputs={d} backend_executable={d} lowered={d} fallback={d} elapsed_us={d}",
+        "event=compile backend={s} devices={d} values={d} instructions={d} outputs={d} cache_hit={d} backend_executable={d} lowered={d} fallback={d} elapsed_us={d}",
         .{
             @tagName(client.backend_kind),
             plan_ptr.options.numDevices(),
             plan_ptr.values.len,
             plan_ptr.instructions.len,
             plan_ptr.output_ids.len,
+            @intFromBool(cache_hit),
             @intFromBool(graph.backend_executable != null),
             graph.lowering.lowered_instruction_count,
             graph.lowering.fallback_instruction_count,
@@ -779,8 +796,10 @@ fn deviceDefaultMemory(args: [*c]c.PJRT_Device_DefaultMemory_Args) callconv(.c) 
 }
 
 fn deviceMemoryStats(args: [*c]c.PJRT_Device_MemoryStats_Args) callconv(.c) ?*c.PJRT_Error {
-    args[0].bytes_in_use = 0;
-    args[0].peak_bytes_in_use = 0;
+    const device = deviceFromC(args[0].device);
+    const stats = device.default_memory.stats;
+    args[0].bytes_in_use = @intCast(stats.bytes_in_use);
+    args[0].peak_bytes_in_use = @intCast(stats.peak_bytes_in_use);
     args[0].peak_bytes_in_use_is_set = true;
     return null;
 }
@@ -1006,6 +1025,8 @@ fn graphExecuteError(err: runtime.GraphExecuteError) ?*c.PJRT_Error {
         error.UnsupportedElementType => makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "executable graph contains an operation unsupported for this element type"),
         error.ShapeMismatch => makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "executable graph shape validation failed during execution"),
         error.UnsupportedRuntimeFeature => makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "executable graph is not fully lowered to the MLX backend executable"),
+        error.BufferDeleted => makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, "execute attempted to use a deleted buffer"),
+        error.BufferDonated => makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, "execute attempted to use a donated buffer"),
         error.Internal => makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute executable graph"),
     };
 }
@@ -1708,7 +1729,7 @@ fn bufferOnDeviceSize(args: [*c]c.PJRT_Buffer_OnDeviceSizeInBytes_Args) callconv
 }
 
 fn bufferDelete(args: [*c]c.PJRT_Buffer_Delete_Args) callconv(.c) ?*c.PJRT_Error {
-    bufferFromC(args[0].buffer).deleted = true;
+    bufferFromC(args[0].buffer).markDeleted();
     return null;
 }
 
@@ -1733,6 +1754,7 @@ fn bufferDynamicDimensionIndices(args: [*c]c.PJRT_Buffer_DynamicDimensionIndices
 fn bufferToHost(args: [*c]c.PJRT_Buffer_ToHostBuffer_Args) callconv(.c) ?*c.PJRT_Error {
     const trace_start_ns = nowNs();
     const buffer = bufferFromC(args[0].src);
+    buffer.ensureUsable() catch return makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, "buffer has been deleted or donated");
     if (args[0].dst == null) {
         args[0].dst_size = buffer.byte_size;
         return null;
@@ -1757,7 +1779,12 @@ fn bufferToHost(args: [*c]c.PJRT_Buffer_ToHostBuffer_Args) callconv(.c) ?*c.PJRT
 }
 
 fn bufferReadyEvent(args: [*c]c.PJRT_Buffer_ReadyEvent_Args) callconv(.c) ?*c.PJRT_Error {
-    args[0].event = eventCreateReady();
+    const buffer = bufferFromC(args[0].buffer);
+    args[0].event = switch (buffer.state) {
+        .live => eventCreateReady(),
+        .deleted => eventCreateFailed("buffer has been deleted"),
+        .donated => eventCreateFailed("buffer has been donated"),
+    };
     return null;
 }
 

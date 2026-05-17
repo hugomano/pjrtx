@@ -253,6 +253,7 @@ const CompiledExecutable = struct {
     plan: *const core.ExecutablePlan,
     device_local_hardware_ids: []i32,
     constant_handles: []?backend.BufferHandle,
+    program: backend.Program,
 };
 
 const LoweringIssue = struct {
@@ -262,6 +263,70 @@ const LoweringIssue = struct {
     detail: []const u8,
     feature: []const u8 = "mlx-backend-executable",
 };
+
+fn buildBackendProgram(allocator: std.mem.Allocator, plan: *const core.ExecutablePlan) !backend.Program {
+    var nodes = try allocator.alloc(backend.ProgramNode, plan.instructions.len);
+    errdefer allocator.free(nodes);
+    var initialized_nodes: usize = 0;
+    errdefer {
+        for (nodes[0..initialized_nodes]) |node| {
+            allocator.free(node.inputs);
+            allocator.free(node.outputs);
+        }
+    }
+
+    const last_uses = try allocator.alloc(usize, plan.values.len);
+    errdefer allocator.free(last_uses);
+    @memset(last_uses, 0);
+
+    const output_values = try allocator.alloc(bool, plan.values.len);
+    errdefer allocator.free(output_values);
+    @memset(output_values, false);
+    for (plan.output_ids) |output_id| {
+        if (output_id.index < output_values.len) output_values[output_id.index] = true;
+    }
+
+    for (plan.instructions, 0..) |instruction, instruction_index| {
+        for (instruction.inputs) |input_id| {
+            if (input_id.index < last_uses.len) last_uses[input_id.index] = instruction_index;
+        }
+        nodes[instruction_index] = .{
+            .instruction_index = instruction_index,
+            .kind = programNodeKind(instruction.kind),
+            .inputs = try allocator.dupe(core.ValueId, instruction.inputs),
+            .outputs = try allocator.dupe(core.ValueId, instruction.outputs),
+            .materializes = instructionMaterializes(instruction.kind),
+        };
+        initialized_nodes += 1;
+    }
+
+    return .{
+        .allocator = allocator,
+        .nodes = nodes,
+        .last_uses = last_uses,
+        .output_values = output_values,
+    };
+}
+
+fn programNodeKind(instruction_kind: core.PlanInstructionKind) backend.ProgramNodeKind {
+    return switch (instruction_kind) {
+        .constant => .constant,
+        .copy_arg0 => .parameter,
+        .reshape, .transpose, .broadcast_in_dim, .slice => .view,
+        .add, .subtract, .multiply, .divide, .maximum, .minimum, .power, .atan2, .remainder, .and_, .or_, .xor, .shift_left, .shift_right_arithmetic, .shift_right_logical, .negate, .exp, .expm1, .tanh, .sqrt, .rsqrt, .abs, .ceil, .floor, .log, .log1p, .logistic, .sine, .cosine, .not_, .sign, .is_finite, .round_nearest_even, .compare, .select, .clamp => .elementwise,
+        .reduce_sum, .reduce_max => .reduction,
+        .dot_general => .matmul,
+        .sort, .gather, .dynamic_slice, .dynamic_update_slice, .pad, .reverse, .concatenate, .iota, .convert, .reduce_precision => .materialize,
+        else => .library_call,
+    };
+}
+
+fn instructionMaterializes(instruction_kind: core.PlanInstructionKind) bool {
+    return switch (instruction_kind) {
+        .reshape, .transpose, .broadcast_in_dim, .slice => false,
+        else => true,
+    };
+}
 
 fn compileExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator, plan: *const core.ExecutablePlan, device_local_hardware_ids: []const i32) backend.Error!?backend.ExecutableHandle {
     if (executableLoweringIssue(plan, device_local_hardware_ids)) |_| return null;
@@ -274,6 +339,8 @@ fn compileExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
     errdefer allocator.free(constant_handles);
     @memset(constant_handles, null);
     errdefer destroyConstantHandles(backend_impl, constant_handles);
+    var program = try buildBackendProgram(allocator, plan);
+    errdefer program.deinit();
 
     for (device_local_hardware_ids, 0..) |local_hardware_id, device_index| {
         for (plan.instructions, 0..) |instruction, instruction_index| {
@@ -296,6 +363,7 @@ fn compileExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
         .plan = plan,
         .device_local_hardware_ids = ids,
         .constant_handles = constant_handles,
+        .program = program,
     };
     return @ptrCast(executable);
 }
@@ -331,7 +399,9 @@ fn executeExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
         parameter_index += 1;
     }
 
-    for (plan.instructions, 0..) |instruction, instruction_index| {
+    for (executable.program.nodes) |node| {
+        const instruction_index = node.instruction_index;
+        const instruction = plan.instructions[instruction_index];
         if (instruction.outputs.len != 1) return null;
         const output_id = instruction.outputs[0];
         if (output_id.index >= value_handles.len) return error.CommandSubmissionFailed;
@@ -497,6 +567,7 @@ fn executeExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
         }
         value_handles[output_id.index] = next;
         value_owned[output_id.index] = true;
+        releaseDeadInputs(backend_impl, &executable.program, value_handles, value_owned, instruction.inputs, instruction_index);
     }
 
     const outputs = try allocator.alloc(backend.ExecutableOutput, plan.output_ids.len);
@@ -528,10 +599,30 @@ fn executeExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
 
 fn destroyExecutable(backend_impl: backend.Backend, executable_handle: backend.ExecutableHandle) void {
     const executable: *CompiledExecutable = @ptrCast(@alignCast(executable_handle));
+    executable.program.deinit();
     destroyConstantHandles(backend_impl, executable.constant_handles);
     executable.allocator.free(executable.constant_handles);
     executable.allocator.free(executable.device_local_hardware_ids);
     executable.allocator.destroy(executable);
+}
+
+fn releaseDeadInputs(
+    backend_impl: backend.Backend,
+    program: *const backend.Program,
+    value_handles: []?backend.BufferHandle,
+    value_owned: []bool,
+    input_ids: []const core.ValueId,
+    instruction_index: usize,
+) void {
+    for (input_ids) |input_id| {
+        if (input_id.index >= value_handles.len or input_id.index >= program.last_uses.len) continue;
+        if (program.output_values[input_id.index]) continue;
+        if (program.last_uses[input_id.index] != instruction_index) continue;
+        if (!value_owned[input_id.index]) continue;
+        if (value_handles[input_id.index]) |old| destroyBuffer(backend_impl, old);
+        value_handles[input_id.index] = null;
+        value_owned[input_id.index] = false;
+    }
 }
 
 fn destroyConstantHandles(backend_impl: backend.Backend, constant_handles: []?backend.BufferHandle) void {
@@ -979,12 +1070,12 @@ fn validateCompareLowering(plan: *const core.ExecutablePlan, instruction: core.P
         .feature = "mlx-executable-values",
     };
     const output = plan.values[output_id.index].descriptor;
-    if (lhs.element_type != .f32 or rhs.element_type != .f32 or output.element_type != .pred or !dimsEqual(lhs.dims, rhs.dims) or !dimsEqual(lhs.dims, output.dims)) return .{
+    if (lhs.element_type != rhs.element_type or !isSupportedComparable(lhs.element_type) or output.element_type != .pred or !dimsEqual(lhs.dims, rhs.dims) or !dimsEqual(lhs.dims, output.dims)) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
         .op = instruction.kind,
-        .detail = "compare lowering currently supports same-shape f32 inputs and pred outputs only",
-        .feature = "mlx-compare-f32",
+        .detail = "compare lowering requires same-shape MLX-supported numeric inputs and pred outputs",
+        .feature = "mlx-compare",
     };
     return null;
 }
@@ -1094,6 +1185,10 @@ fn isSupportedInteger(element_type: core.BufferType) bool {
         .s8, .s32, .u8, .u32 => true,
         else => false,
     };
+}
+
+fn isSupportedComparable(element_type: core.BufferType) bool {
+    return isSupportedFloat(element_type) or isSupportedInteger(element_type);
 }
 
 fn dotGeneralIsMatmulLike(lhs_dims: []const i64, rhs_dims: []const i64, lhs_batch: []const i64, rhs_batch: []const i64, lhs_contract: []const i64, rhs_contract: []const i64, output_dims: []const i64) bool {
@@ -1406,6 +1501,13 @@ test "mlx metal backend executable runs resident device buffers" {
 
     const executable = (try b.compileExecutable(allocator, &plan, &.{local_hardware_id})) orelse return error.TestUnexpectedResult;
     defer b.destroyExecutable(executable);
+    const compiled: *CompiledExecutable = @ptrCast(@alignCast(executable));
+    try std.testing.expectEqual(@as(usize, 2), compiled.program.nodes.len);
+    try std.testing.expectEqual(backend.ProgramNodeKind.constant, compiled.program.nodes[0].kind);
+    try std.testing.expectEqual(backend.ProgramNodeKind.elementwise, compiled.program.nodes[1].kind);
+    try std.testing.expect(compiled.program.nodes[0].materializes);
+    try std.testing.expectEqual(@as(usize, 1), compiled.program.last_uses[1]);
+    try std.testing.expect(compiled.program.output_values[2]);
 
     const lhs = (try b.bufferFromHost(local_hardware_id, .u8, &dims, &.{ 1, 2, 3, 4 })) orelse return error.TestUnexpectedResult;
     defer b.destroyBuffer(lhs);

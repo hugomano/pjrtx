@@ -21,6 +21,43 @@ pub const ExecutableOutput = struct {
     byte_size: usize,
 };
 
+pub const ProgramNodeKind = enum {
+    constant,
+    parameter,
+    view,
+    elementwise,
+    reduction,
+    matmul,
+    library_call,
+    materialize,
+};
+
+pub const ProgramNode = struct {
+    instruction_index: usize,
+    kind: ProgramNodeKind,
+    inputs: []const core.ValueId,
+    outputs: []const core.ValueId,
+    materializes: bool = true,
+};
+
+pub const Program = struct {
+    allocator: std.mem.Allocator,
+    nodes: []ProgramNode,
+    last_uses: []usize,
+    output_values: []bool,
+
+    pub fn deinit(self: *Program) void {
+        for (self.nodes) |node| {
+            self.allocator.free(node.inputs);
+            self.allocator.free(node.outputs);
+        }
+        self.allocator.free(self.output_values);
+        self.allocator.free(self.last_uses);
+        self.allocator.free(self.nodes);
+        self.* = undefined;
+    }
+};
+
 pub const Capabilities = struct {
     kind: core.BackendKind,
     name: []const u8,

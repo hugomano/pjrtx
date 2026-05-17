@@ -31,6 +31,7 @@ pub const Memory = struct {
     debug_string: []const u8,
     addressable_device_ids: []const i32,
     addressable_devices: []*Device,
+    stats: MemoryStats = .{},
 };
 
 pub const Topology = struct {
@@ -43,6 +44,89 @@ pub const Topology = struct {
     }
 };
 
+pub const MemoryStats = struct {
+    capacity_bytes: u64 = 0,
+    bytes_in_use: u64 = 0,
+    peak_bytes_in_use: u64 = 0,
+    host_to_device_bytes: u64 = 0,
+    device_to_host_bytes: u64 = 0,
+    executable_cache_hits: u64 = 0,
+    executable_cache_misses: u64 = 0,
+
+    pub fn retain(self: *MemoryStats, bytes: usize) void {
+        self.bytes_in_use +|= @as(u64, @intCast(bytes));
+        self.peak_bytes_in_use = @max(self.peak_bytes_in_use, self.bytes_in_use);
+    }
+
+    pub fn release(self: *MemoryStats, bytes: usize) void {
+        const amount: u64 = @intCast(bytes);
+        self.bytes_in_use = if (amount > self.bytes_in_use) 0 else self.bytes_in_use - amount;
+    }
+};
+
+pub const EventState = enum {
+    pending,
+    ready,
+    failed,
+};
+
+pub const Event = struct {
+    state: EventState = .ready,
+    message: []const u8 = "",
+
+    pub fn ready() Event {
+        return .{ .state = .ready };
+    }
+
+    pub fn failed(message: []const u8) Event {
+        return .{ .state = .failed, .message = message };
+    }
+
+    pub fn isReady(self: Event) bool {
+        return self.state != .pending;
+    }
+};
+
+pub const BufferState = enum {
+    live,
+    deleted,
+    donated,
+};
+
+pub const ExecutableCacheStats = struct {
+    hits: u64 = 0,
+    misses: u64 = 0,
+};
+
+pub const ExecutableCache = struct {
+    allocator: std.mem.Allocator,
+    fingerprints: std.StringHashMapUnmanaged(void) = .empty,
+    stats: ExecutableCacheStats = .{},
+
+    pub fn init(allocator: std.mem.Allocator) ExecutableCache {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *ExecutableCache) void {
+        var it = self.fingerprints.keyIterator();
+        while (it.next()) |key| self.allocator.free(key.*);
+        self.fingerprints.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn recordCompile(self: *ExecutableCache, fingerprint: []const u8) !bool {
+        if (self.fingerprints.contains(fingerprint)) {
+            self.stats.hits += 1;
+            return true;
+        }
+        const owned = try self.allocator.dupe(u8, fingerprint);
+        errdefer self.allocator.free(owned);
+        try self.fingerprints.put(self.allocator, owned, {});
+        self.stats.misses += 1;
+        return false;
+    }
+};
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     backend: backend_api.Backend,
@@ -52,6 +136,7 @@ pub const Client = struct {
     device_handles: []*Device,
     memory_handles: []*Memory,
     topology: Topology,
+    executable_cache: ExecutableCache,
 
     pub fn init(allocator: std.mem.Allocator, backend_impl: backend_api.Backend, device_count: usize) !*Client {
         if (device_count == 0 or device_count > MAX_DEVICES) return error.InvalidDeviceCount;
@@ -119,6 +204,7 @@ pub const Client = struct {
                 .debug_string = memory_debug_string,
                 .addressable_device_ids = ids,
                 .addressable_devices = memory_devices,
+                .stats = .{ .capacity_bytes = descriptor.memory_bytes },
             };
             devices[i].addressable_memories[0] = &memories[i];
             memories[i].addressable_devices[0] = &devices[i];
@@ -140,11 +226,13 @@ pub const Client = struct {
                 .num_replicas = 1,
                 .num_partitions = @intCast(descriptors.len),
             },
+            .executable_cache = ExecutableCache.init(allocator),
         };
         return client;
     }
 
     pub fn deinit(self: *Client) void {
+        self.executable_cache.deinit();
         for (self.devices) |device| {
             self.allocator.free(device.addressable_memories);
             self.allocator.free(device.name);
@@ -175,6 +263,14 @@ pub const Client = struct {
             if (memory.id == id) return memory;
         }
         return null;
+    }
+
+    pub fn recordExecutableCompile(self: *Client, fingerprint: []const u8) !bool {
+        const hit = try self.executable_cache.recordCompile(fingerprint);
+        for (self.memories) |*memory| {
+            if (hit) memory.stats.executable_cache_hits += 1 else memory.stats.executable_cache_misses += 1;
+        }
+        return hit;
     }
 };
 
@@ -307,6 +403,7 @@ pub const ExecutableGraph = struct {
         if (device_index >= self.device_ids.len or device_index >= client.devices.len) return error.InvalidArgument;
         if (plan.instructions.len == 0) return error.UnsupportedRuntimeFeature;
         if (arguments.len < plan.parameter_shardings.len) return error.InvalidArgument;
+        for (arguments) |argument| argument.ensureUsable() catch |err| return mapBufferError(err);
         if (self.tryExecuteBackendExecutable(allocator, client, device_index, arguments) catch |err| return err) |outputs| {
             return outputs;
         }
@@ -367,6 +464,7 @@ pub const ExecutableGraph = struct {
         var argument_handles = try allocator.alloc(backend_api.BufferHandle, arguments.len);
         defer allocator.free(argument_handles);
         for (arguments, 0..) |argument, i| {
+            argument.ensureUsable() catch |err| return mapBufferError(err);
             argument_handles[i] = argument.backend_buffer orelse return null;
         }
 
@@ -653,6 +751,8 @@ pub const GraphExecuteError = error{
     UnsupportedElementType,
     ShapeMismatch,
     UnsupportedRuntimeFeature,
+    BufferDeleted,
+    BufferDonated,
     Internal,
 };
 
@@ -681,6 +781,8 @@ fn mapBufferError(err: anyerror) GraphExecuteError {
         error.ShapeMismatch => error.ShapeMismatch,
         error.InvalidArgument => error.InvalidArgument,
         error.UnsupportedRuntimeFeature => error.UnsupportedRuntimeFeature,
+        error.BufferDeleted => error.BufferDeleted,
+        error.BufferDonated => error.BufferDonated,
         else => error.Internal,
     };
 }
@@ -748,7 +850,10 @@ pub const Buffer = struct {
     byte_size: usize,
     bytes: []u8,
     backend_buffer: ?backend_api.BufferHandle = null,
+    state: BufferState = .live,
     deleted: bool = false,
+    accounted_bytes: usize = 0,
+    ready_event: Event = Event.ready(),
 
     fn initBackendOnly(
         allocator: std.mem.Allocator,
@@ -783,7 +888,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initHostCopyForBackend(
@@ -823,7 +928,8 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
-        return buffer;
+        memory.stats.host_to_device_bytes += @intCast(src.len);
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initDeviceCopy(
@@ -831,6 +937,7 @@ pub const Buffer = struct {
         src: *Buffer,
         shard_index: usize,
     ) !*Buffer {
+        try src.ensureUsable();
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
 
@@ -861,7 +968,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initPartitionId(
@@ -912,7 +1019,7 @@ pub const Buffer = struct {
             .backend_buffer = backend_buffer,
         };
         if (backend_buffer != null) allocator.free(bytes);
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initCholesky(
@@ -991,7 +1098,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initRngUniform(
@@ -1060,7 +1167,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initRngBits(
@@ -1109,7 +1216,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initRngStateUpdate(
@@ -1156,7 +1263,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initElementwiseBinary(
@@ -1301,7 +1408,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = null,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initU8Add(
@@ -1463,7 +1570,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = null,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initReshape(
@@ -1504,7 +1611,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = null,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initTranspose(
@@ -1569,7 +1676,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = null,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initBroadcastInDim(
@@ -1635,7 +1742,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = null,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initSlice(
@@ -1702,7 +1809,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = null,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initConcatenate(
@@ -1784,7 +1891,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = null,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initDotGeneral(
@@ -1833,7 +1940,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = null,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initReduce(
@@ -1880,7 +1987,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = null,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initCompare(
@@ -1930,7 +2037,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = null,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initSelect(
@@ -1981,7 +2088,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = null,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initConvert(
@@ -2034,7 +2141,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initIota(
@@ -2103,7 +2210,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initReverse(
@@ -2161,7 +2268,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initClamp(
@@ -2221,7 +2328,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initDynamicSlice(
@@ -2331,7 +2438,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initPad(
@@ -2399,7 +2506,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initGather(
@@ -2501,7 +2608,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initSort(
@@ -2560,7 +2667,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 
     pub fn initU8Unary(
@@ -2574,6 +2681,7 @@ pub const Buffer = struct {
     }
 
     pub fn deinit(self: *Buffer) void {
+        if (self.accounted_bytes != 0) self.memory.stats.release(self.accounted_bytes);
         if (self.backend_buffer) |backend_buffer| self.backend.destroyBuffer(backend_buffer);
         self.allocator.free(self.bytes);
         self.allocator.free(self.dims);
@@ -2581,16 +2689,45 @@ pub const Buffer = struct {
     }
 
     pub fn copyToHost(self: *Buffer, dst: []u8) !void {
+        try self.ensureUsable();
         if (dst.len < self.byte_size) return error.DestinationTooSmall;
         if (self.backend_buffer) |backend_buffer| {
             self.backend.copyToHost(backend_buffer, dst) catch return error.BackendBufferCopyFailed;
+            self.memory.stats.device_to_host_bytes += @intCast(self.byte_size);
             return;
         }
         @memcpy(dst[0..self.byte_size], self.bytes[0..self.byte_size]);
+        self.memory.stats.device_to_host_bytes += @intCast(self.byte_size);
     }
 
     pub fn hasBackendStorage(self: *const Buffer) bool {
         return self.backend_buffer != null;
+    }
+
+    pub fn markDeleted(self: *Buffer) void {
+        self.state = .deleted;
+        self.deleted = true;
+        self.ready_event = Event.failed("buffer has been deleted");
+    }
+
+    pub fn markDonated(self: *Buffer) void {
+        self.state = .donated;
+        self.deleted = true;
+        self.ready_event = Event.failed("buffer has been donated");
+    }
+
+    pub fn ensureUsable(self: *const Buffer) !void {
+        return switch (self.state) {
+            .live => {},
+            .deleted => error.BufferDeleted,
+            .donated => error.BufferDonated,
+        };
+    }
+
+    fn accountDeviceBytes(self: *Buffer) *Buffer {
+        self.accounted_bytes = self.byte_size;
+        self.memory.stats.retain(self.accounted_bytes);
+        return self;
     }
 
     pub fn initBackendHandle(
@@ -2628,7 +2765,7 @@ pub const Buffer = struct {
             .bytes = bytes,
             .backend_buffer = backend_buffer,
         };
-        return buffer;
+        return buffer.accountDeviceBytes();
     }
 };
 
@@ -3279,6 +3416,49 @@ test "buffer keeps shard/device/memory ownership metadata" {
     const negated = try Buffer.initU8Unary(std.testing.allocator, .negate, buffer, 0);
     defer negated.deinit();
     try expectBufferBytes(negated, &.{ 255, 254, 253, 252 });
+}
+
+test "buffer lifecycle rejects deleted and donated buffers" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+
+    const dims = [_]i64{4};
+    const data = [_]u8{ 1, 2, 3, 4 };
+    const deleted = try initHostCopyForTest(.u8, &dims, &client.devices[0], &client.memories[0], 0, &data);
+    defer deleted.deinit();
+    deleted.markDeleted();
+    try std.testing.expectEqual(BufferState.deleted, deleted.state);
+    try std.testing.expect(deleted.deleted);
+    try std.testing.expectError(error.BufferDeleted, deleted.ensureUsable());
+
+    const donated = try initHostCopyForTest(.u8, &dims, &client.devices[0], &client.memories[0], 0, &data);
+    defer donated.deinit();
+    donated.markDonated();
+    try std.testing.expectEqual(BufferState.donated, donated.state);
+    try std.testing.expect(donated.deleted);
+    try std.testing.expectError(error.BufferDonated, donated.ensureUsable());
+}
+
+test "client records executable cache hits and memory byte accounting" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+
+    try std.testing.expect(!try client.recordExecutableCompile("same-program"));
+    try std.testing.expect(try client.recordExecutableCompile("same-program"));
+    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.misses);
+    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.hits);
+
+    const dims = [_]i64{4};
+    const data = [_]u8{ 1, 2, 3, 4 };
+    const before = client.memories[0].stats.bytes_in_use;
+    {
+        const buffer = try initHostCopyForTest(.u8, &dims, &client.devices[0], &client.memories[0], 0, &data);
+        defer buffer.deinit();
+        try std.testing.expectEqual(before + data.len, client.memories[0].stats.bytes_in_use);
+        try std.testing.expect(client.memories[0].stats.peak_bytes_in_use >= client.memories[0].stats.bytes_in_use);
+        try std.testing.expect(client.memories[0].stats.host_to_device_bytes >= data.len);
+    }
+    try std.testing.expectEqual(before, client.memories[0].stats.bytes_in_use);
 }
 
 test "buffer elementwise arithmetic supports f32 execution" {

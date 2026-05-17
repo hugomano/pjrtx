@@ -29,6 +29,8 @@ path. The hermetic Python graph pins `jax` and `jaxlib`.
 
 ```sh
 bazel run //tests/jax:jax_plugin_smoke
+PJRTX_BACKEND=metal_mlx PJRTX_TRACE=1 bazel run //tests/jax:jax_op_suite
+PJRTX_BACKEND=metal_mlx PJRTX_TRACE=1 bazel run //tests/jax:jax_llama_like_inference
 # or, as an explicit manual test:
 bazel test //tests/jax:jax_plugin_smoke_test --test_output=streamed
 ```
@@ -46,6 +48,13 @@ device-to-host timing/byte counters while running the sandbox:
 ```sh
 PJRTX_BACKEND=metal_mlx PJRTX_TRACE=1 bazel run //tests/jax:jax_plugin_smoke
 ```
+
+`//tests/jax:jax_op_suite` compares the currently lowered PjRTx fast path
+against JAX CPU for repeated `jax.jit` execution of elementwise float chains,
+reshape/transpose/broadcast, reductions, matmul, clipping via min/max, integer
+bitwise ops, StableHLO sort regions, and restricted axis-0 gather forms. The
+suite asserts repeated execution against the MLX Metal device fast path with no
+runtime fallback.
 
 The default `.bazelrc` uses:
 
@@ -137,11 +146,14 @@ Compile now materializes a runtime `ExecutableGraph` from the PjRTx plan and
 asks the selected backend to compile an opaque backend executable. Execution
 enters through that graph per device. PJRT compile uses device-only lowering:
 the whole program must legalize to an MLX backend executable, and execute only
-dispatches opaque backend buffer handles through that executable. The old
-backend-neutral operation interpreter remains available only as an explicit
-runtime test mode. New llama-facing work should broaden backend legalization so
-devices enqueue MLX kernels, collectives, custom calls, DMA copies, or library
-calls directly without pretending every op is a buffer allocation.
+dispatches opaque backend buffer handles through that executable. Runtime
+tracks buffer lifecycle (`live`, `deleted`, `donated`), readiness events,
+device-memory byte accounting, host/device transfer counters, and executable
+cache hit/miss metadata. The old backend-neutral operation interpreter remains
+available only as an explicit runtime test mode. New llama-facing work should
+broaden backend legalization so devices enqueue MLX kernels, collectives,
+custom calls, DMA copies, or library calls directly without pretending every op
+is a buffer allocation.
 
 Backend legalization is validated before the plugin accepts a compiled program.
 Failures are reported through `std.Io.Writer` diagnostics with the lowering
@@ -154,12 +166,13 @@ execution.
 
 - `src/runtime`: explicit client/device/memory/topology/buffer/executable-graph
   ownership model, including stable PJRT handle arrays, per-device graph nodes,
-  and backend-neutral buffer
-  placement/storage split. Buffers are moving to backend-owned storage as the
-  source of truth; host memory is an ingress/egress transfer medium, not a
-  runtime cache. Operations are not modeled as buffers in the compiler contract:
-  PjRTx plans contain logical values and instructions, while runtime buffers are
-  only materialized storage for placed value shards.
+  backend-neutral buffer placement/storage split, executable cache metadata,
+  strict buffer deletion/donation state, readiness events, and memory/transfer
+  accounting. Buffers are moving to backend-owned storage as the source of
+  truth; host memory is an ingress/egress transfer medium, not a runtime cache.
+  Operations are not modeled as buffers in the compiler contract: PjRTx plans
+  contain logical values and instructions, while runtime buffers are only
+  materialized storage for placed value shards.
 - `third_party/mlx`: pinned MLX vendor module at
   `ml-explore/mlx@7b7c12407f85b494e3e6d1cd3888650d224f362c`, exposing only
   core headers plus a Metal-first runtime target. The runtime target vendors
@@ -185,16 +198,22 @@ execution.
   StableHLO `convert` lowers to MLX `astype` through the backend vtable, so
   dtype casts on resident buffers stay on device. `bitcast_convert` is kept out
   of the fast path until the backend has an explicit dtype reinterpretation API.
-  MLX backend executables keep compile-time constants resident as device arrays
-  and clone those handles during execute, which is the first weight-residency
-  path. Elementwise arithmetic, extra unary/binary math (`atan2`, `expm1`,
-  `is_finite`, nearest-even `round`), logical/bitwise ops, compare/select,
+  MLX backend executables lower into an explicit backend program with nodes,
+  backend value ids, liveness metadata, output-value retention, resident
+  constants, and per-device hardware assignments. The execute path still walks
+  this program in schedule order, but it now releases dead intermediates and
+  gives MLX lazy fusion a concrete graph boundary to attach to next. Compile-time
+  constants stay resident as device arrays and clone those handles during
+  execute, which is the first weight-residency path. Elementwise arithmetic,
+  extra unary/binary math (`atan2`, `expm1`,
+  `is_finite`, nearest-even `round`), logical/bitwise ops, compare/select for
+  MLX-supported numeric dtypes,
   reductions, `dot_general`, dtype casts, StableHLO `iota`, StableHLO `clamp`,
   shape/view ops, StableHLO `reverse`, dynamic slice, dynamic update-slice,
   constant edge padding, restricted axis-0 gather, and ascending/descending
   StableHLO `sort` now run through MLX core operations on the GPU device when
-  MLX arrays and Metal devices are available. StableHLO interior padding and general
-  gather/scatter metadata still require broader backend legalization before they
+  MLX arrays and Metal devices are available. StableHLO interior padding and
+  general gather/scatter metadata still require broader backend legalization before they
   enter the fast path.
   The PjRTx C shim no longer builds direct Metal arithmetic kernels or calls
   host `xcrun`.
@@ -216,8 +235,8 @@ execution.
   interop, and invalid StableHLO portable artifacts. JAX-provided VHLO/StableHLO
   portable artifacts are deserialized at the StableHLO frontend boundary before
   later PjRTx-owned compiler stages run. The transform path is back on:
-  Shardy propagation is gated on Shardy usage, then canonicalize/CSE/canonicalize
-  runs through the MLIR pass manager.
+  Shardy propagation is gated on Shardy usage, then inline/canonicalize/CSE/
+  canonicalize runs through the MLIR pass manager.
 - `src/plugin`: Zig shared library exporting `GetPjrtApi` and a PJRT API table
   with plugin attributes, errors, events, client/device/memory enumeration,
   host buffer copies, compile skeleton, loaded executable metadata, and

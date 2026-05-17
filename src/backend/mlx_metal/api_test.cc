@@ -497,8 +497,28 @@ int main() {
             gather_indices_dims, 1);
     assert(gather_operand != nullptr);
     assert(gather_indices != nullptr);
+    const int32_t gather_zero_input[] = {0, 0};
+    const int32_t gather_bound_input[] = {3, 3};
+    PjrtxMlxMetalBuffer* gather_zero =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, gather_zero_input, sizeof(gather_zero_input),
+            PJRTX_MLX_METAL_DTYPE_S32, gather_indices_dims, 1);
+    PjrtxMlxMetalBuffer* gather_bound =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, gather_bound_input, sizeof(gather_bound_input),
+            PJRTX_MLX_METAL_DTYPE_S32, gather_indices_dims, 1);
+    assert(gather_zero != nullptr);
+    assert(gather_bound != nullptr);
+    PjrtxMlxMetalBuffer* gather_negative_mask = pjrtx_mlx_metal_buffer_compare(
+        gather_indices, gather_zero, PJRTX_MLX_METAL_COMPARE_LT,
+        gather_indices_dims, 1);
+    assert(gather_negative_mask != nullptr);
+    PjrtxMlxMetalBuffer* gather_normalized_indices = pjrtx_mlx_metal_buffer_select(
+        gather_negative_mask, gather_bound, gather_indices, gather_indices_dims,
+        1);
+    assert(gather_normalized_indices != nullptr);
     PjrtxMlxMetalBuffer* gathered = pjrtx_mlx_metal_buffer_gather_axis(
-        gather_operand, gather_indices, 0, 1, gather_output_dims, 2);
+        gather_operand, gather_normalized_indices, 0, 1, gather_output_dims, 2);
     assert(gathered != nullptr);
     float gather_output[4] = {};
     assert(pjrtx_mlx_metal_buffer_copy_to_host(
@@ -510,6 +530,10 @@ int main() {
       }
     }
     pjrtx_mlx_metal_buffer_destroy(gathered);
+    pjrtx_mlx_metal_buffer_destroy(gather_normalized_indices);
+    pjrtx_mlx_metal_buffer_destroy(gather_negative_mask);
+    pjrtx_mlx_metal_buffer_destroy(gather_bound);
+    pjrtx_mlx_metal_buffer_destroy(gather_zero);
     pjrtx_mlx_metal_buffer_destroy(gather_indices);
     pjrtx_mlx_metal_buffer_destroy(gather_operand);
 

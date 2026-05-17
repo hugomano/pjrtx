@@ -1424,8 +1424,7 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_compare(
     const int64_t* output_dims, uint64_t output_rank) {
   if (lhs == nullptr || rhs == nullptr || output_dims == nullptr ||
       lhs->byte_size != rhs->byte_size || lhs->dtype != rhs->dtype ||
-      lhs->dims != rhs->dims || lhs->device_ordinal != rhs->device_ordinal ||
-      lhs->dtype != PJRTX_MLX_METAL_DTYPE_F32) {
+      lhs->dims != rhs->dims || lhs->device_ordinal != rhs->device_ordinal) {
     return nullptr;
   }
   std::vector<int64_t> out_dims(output_dims, output_dims + output_rank);

@@ -373,6 +373,7 @@ fn runMlirCanonicalization(session: *MlirSession, writer: *std.Io.Writer) Analyz
     mlir.mlirPassManagerEnableVerifier(session.pass_manager, true);
 
     if (uses_shardy) try addPipeline(session.pass_manager, "sdy-propagation-pipeline", writer);
+    try addPipeline(session.pass_manager, "inline", writer);
     try addPipeline(session.pass_manager, "canonicalize", writer);
     try addPipeline(session.pass_manager, "cse", writer);
     try addPipeline(session.pass_manager, "canonicalize", writer);
@@ -1733,13 +1734,32 @@ fn operationHasAttributeNamed(op: mlir.MlirOperation, name: []const u8) bool {
 }
 
 fn valueIdsForOperands(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation) ![]const ValueId {
-    const count: usize = @intCast(mlir.mlirOperationGetNumOperands(op));
+    return valueIdsForOperandsLimit(builder, op, @intCast(mlir.mlirOperationGetNumOperands(op)));
+}
+
+fn valueIdsForOperandsLimit(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation, count: usize) ![]const ValueId {
     const ids = try builder.allocator.alloc(ValueId, count);
     errdefer builder.allocator.free(ids);
     var index: isize = 0;
     while (index < @as(isize, @intCast(count))) : (index += 1) {
         const operand = mlir.mlirOperationGetOperand(op, index);
-        ids[@intCast(index)] = builder.lookupValue(operand) orelse return error.InvalidStablehloModule;
+        ids[@intCast(index)] = builder.lookupValue(operand) orelse blk: {
+            var owner_name: []const u8 = "<none>";
+            if (mlir.mlirValueIsAOpResult(operand)) {
+                const owner = mlir.mlirOpResultGetOwner(operand);
+                owner_name = operationName(owner);
+                if (std.mem.eql(u8, owner_name, "stablehlo.constant") or std.mem.eql(u8, owner_name, "sdy.constant")) {
+                    try analyzeStablehloOperationFromCapi(builder, owner, "stablehlo.constant");
+                    if (builder.lookupValue(operand)) |id| break :blk id;
+                }
+            }
+            const loc = mlirLocationLineColumn(mlir.mlirOperationGetLocation(op));
+            try builder.diagnostic_writer.print(
+                "invalid StableHLO module: loc={d}:{d} op={s} operand={d} owner={s} detail=\"operand does not reference a previously registered top-level value\" feature=value-graph",
+                .{ loc.line, loc.column, operationName(op), index, owner_name },
+            );
+            return error.InvalidStablehloModule;
+        };
     }
     return ids;
 }
@@ -1879,6 +1899,7 @@ fn reduceKindFromRegion(op: mlir.MlirOperation) []const u8 {
 }
 
 fn compareDirectionFromSortRegion(op: mlir.MlirOperation) ?core.CompareOp {
+    var last_compare: ?core.CompareOp = null;
     const n_regions = mlir.mlirOperationGetNumRegions(op);
     var region_index: isize = 0;
     while (region_index < n_regions) : (region_index += 1) {
@@ -1887,12 +1908,12 @@ fn compareDirectionFromSortRegion(op: mlir.MlirOperation) ?core.CompareOp {
             var child = mlir.mlirBlockGetFirstOperation(block);
             while (!mlir.mlirOperationIsNull(child)) : (child = mlir.mlirOperationGetNextInBlock(child)) {
                 if (std.mem.eql(u8, operationName(child), "stablehlo.compare")) {
-                    return compareDirectionFromAttr(getOperationAttribute(child, "comparison_direction"));
+                    last_compare = compareDirectionFromAttr(getOperationAttribute(child, "comparison_direction"));
                 }
             }
         }
     }
-    return null;
+    return last_compare;
 }
 
 fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation, op_name: []const u8) AnalyzeError!void {
@@ -2035,7 +2056,8 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
         compareDirectionFromSortRegion(op)
     else
         null;
-    const inputs = try valueIdsForOperands(builder, op);
+    const input_count = if (std.mem.startsWith(u8, short_name, "reduce_")) @as(usize, 1) else @as(usize, @intCast(mlir.mlirOperationGetNumOperands(op)));
+    const inputs = try valueIdsForOperandsLimit(builder, op, input_count);
     var owns_inputs = true;
     errdefer if (owns_inputs) builder.allocator.free(inputs);
     const value_role: ValueRole = if (std.mem.eql(u8, short_name, "constant")) .constant else .instruction_result;
@@ -2333,6 +2355,9 @@ fn visitOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation)
             builder.saw_manual_computation = true;
             builder.manual_line = loc.line;
             builder.manual_column = loc.column;
+        } else if (std.mem.eql(u8, short_name, "constant")) {
+            try analyzeStablehloOperationFromCapi(builder, op, "stablehlo.constant");
+            recurse_children = false;
         } else if (std.mem.eql(u8, short_name, "return")) {
             builder.saw_sdy_return = true;
         } else if (!std.mem.eql(u8, short_name, "mesh") and

@@ -21,11 +21,35 @@ py_binary(
     deps = ["@jax_sandbox_deps//jax:pkg"],
 )
 
+py_binary(
+    name = "jax_op_suite",
+    srcs = [
+        "jax_op_suite.py",
+        "jax_plugin_smoke.py",
+    ],
+    data = ["//src/plugin:pjrtx_metal_plugin"],
+    main = "jax_op_suite.py",
+    deps = ["@jax_sandbox_deps//jax:pkg"],
+)
+
 py_test(
     name = "jax_plugin_smoke_test",
     srcs = ["jax_plugin_smoke.py"],
     data = ["//src/plugin:pjrtx_metal_plugin"],
     main = "jax_plugin_smoke.py",
+    tags = ["manual"],
+    deps = ["@jax_sandbox_deps//jax:pkg"],
+)
+
+py_test(
+    name = "jax_op_suite_test",
+    srcs = [
+        "jax_op_suite.py",
+        "jax_plugin_smoke.py",
+    ],
+    data = ["//src/plugin:pjrtx_metal_plugin"],
+    env = {"PJRTX_BACKEND": "metal_mlx"},
+    main = "jax_op_suite.py",
     tags = ["manual"],
     deps = ["@jax_sandbox_deps//jax:pkg"],
 )

@@ -246,6 +246,7 @@ pub const PlanInstructionKind = enum {
     concatenate,
     iota,
     gather,
+    sort,
     dot_general,
     reduce_sum,
     reduce_max,

@@ -40,6 +40,13 @@ backend:
 PJRTX_BACKEND=metal_mlx bazel run //tests/jax:jax_plugin_smoke
 ```
 
+Set `PJRTX_TRACE=1` to print one-line compile, host-to-device, execute, and
+device-to-host timing/byte counters while running the sandbox:
+
+```sh
+PJRTX_BACKEND=metal_mlx PJRTX_TRACE=1 bazel run //tests/jax:jax_plugin_smoke
+```
+
 The default `.bazelrc` uses:
 
 ```sh
@@ -126,12 +133,15 @@ The compiler contract keeps these concepts separate:
   memory is only an explicit transfer source/sink at PJRT boundaries, never a
   persistent mirror of device storage.
 
-Compile now materializes a runtime `ExecutableGraph` from the PjRTx plan.
-Execution enters through that graph per device, then dispatches through
-backend-neutral runtime operations. The next lowering step is to legalize graph
-nodes into backend command fragments so devices enqueue MLX kernels, collectives,
-custom calls, DMA copies, or library calls directly without pretending every op
-is a buffer allocation.
+Compile now materializes a runtime `ExecutableGraph` from the PjRTx plan and
+asks the selected backend to compile an opaque backend executable. Execution
+enters through that graph per device; when all inputs are already backend
+buffers, runtime dispatches the backend executable directly and wraps opaque
+backend output handles back into PJRT buffers. If a program is not legalized to a
+backend executable yet, the graph falls back to backend-neutral runtime
+operations. The next lowering step is to broaden backend legalization so devices
+enqueue MLX kernels, collectives, custom calls, DMA copies, or library calls
+directly without pretending every op is a buffer allocation.
 
 ## Current Status
 
@@ -156,20 +166,30 @@ is a buffer allocation.
   Metal header target and linked against the sandboxed macOS SDK framework
   slices. No host Xcode SDK paths are used.
 - `src/backend`: a Zig backend vtable/interface plus backend-specific package
-  directories. `src/backend/mlx_metal` owns the small private C ABI shim over vendored MLX
+  directories. Backends expose opaque buffer handles and opaque executable
+  handles. `src/backend/mlx_metal` owns the small private C ABI shim over vendored MLX
   Metal headers and MLX device APIs. It copies MLX Metal device names and
   recommended working-set sizes into plain C structs so Zig never owns
   C++/Objective-C objects. The same shim exposes opaque buffers that keep MLX
   arrays only; host bytes are transient at `buffer_from_host` and
   `copy_to_host`. There is no persistent host shadow in the MLX backend. The
-  typed constructor preserves dtype and shape metadata for the MLX array path.
-  Elementwise `u8` and `f32`
-  arithmetic plus f32 unary math, transpose, broadcast-in-dim, slice, and
-  concatenate now run through
-  `mlx::core::{add,subtract,multiply,divide,floor_divide,negative,exp,tanh,sqrt,rsqrt,transpose,reshape,broadcast_to,slice,concatenate}`
-  on the GPU device using MLX's runtime Metal JIT when an MLX array and Metal
-  device are available. The PjRTx C shim no longer builds direct Metal arithmetic
-  kernels or calls host `xcrun`.
+  typed constructor preserves dtype and shape metadata for the MLX array path,
+  including `s8`, `u8`, `s32`, `u32`, `f16`, `bf16`, and `f32` host imports.
+  StableHLO `convert` lowers to MLX `astype` through the backend vtable, so
+  dtype casts on resident buffers stay on device. `bitcast_convert` is kept out
+  of the fast path until the backend has an explicit dtype reinterpretation API.
+  MLX backend executables keep compile-time constants resident as device arrays
+  and clone those handles during execute, which is the first weight-residency
+  path. Elementwise arithmetic, common unary math, compare/select, reductions,
+  `dot_general`, dtype casts, shape/view ops, StableHLO `reverse`, dynamic
+  slice, dynamic update-slice, constant edge padding, restricted axis-0 gather,
+  and ascending/descending StableHLO `sort` now run
+  through MLX core operations on the GPU device when MLX arrays and Metal
+  devices are available. StableHLO interior padding and general gather/scatter
+  metadata still require broader backend legalization before they enter the fast
+  path.
+  The PjRTx C shim no longer builds direct Metal arithmetic kernels or calls
+  host `xcrun`.
 - `src/compiler`: compile-option parsing and executable-plan construction for
   replicas, partitions, device assignment, and Shardy metadata. Program
   ingestion now flows through `std.Io.Reader`, parses and verifies MLIR through
@@ -195,16 +215,21 @@ is a buffer allocation.
   host buffer copies, compile skeleton, loaded executable metadata, and
   per-device execute plumbing. Compile builds a runtime executable graph from
   the compiler plan; execute calls that graph for each selected device and no
-  longer owns instruction scheduling in the PJRT adapter. Bootstrap graph
-  execution currently lowers through runtime buffer operations: empty bootstrap
-  programs copy arg0, linear
+  longer owns instruction scheduling in the PJRT adapter. When the MLX backend
+  can compile the plan and all inputs are device buffers, execution dispatches
+  the backend executable directly. The runtime graph falls back to
+  backend-neutral buffer operations only for unsupported backend executable
+  fragments. Bootstrap graph execution supports: empty bootstrap programs copy
+  arg0, linear
   StableHLO arithmetic chains execute the bootstrap `u8` and `f32` elementwise
   paths for matching buffers, StableHLO reshape preserves bytes while updating
   buffer dimensions and typed MLX metadata, StableHLO transpose performs dense
   row-major layout permutation, StableHLO broadcast-in-dim expands dense buffers
   with explicit output dimensions, StableHLO slice performs dense strided
-  slicing with explicit bounds, StableHLO concatenate joins two dense buffers
-  along the compiled dimension, StableHLO `reduce_precision` is an identity
+  slicing with explicit bounds, StableHLO `reverse` flips compiled axes,
+  StableHLO concatenate joins two dense buffers along the compiled dimension,
+  StableHLO `sort` uses the comparator direction parsed from the StableHLO
+  region, StableHLO `reduce_precision` is an identity
   device copy, `partition_id` materializes scalar partition ids, deterministic
   bootstrap `rng`/`rng_bit_generator` paths exist for tests, and f32 dense
   `cholesky` currently has a correctness implementation that must move behind a
@@ -220,6 +245,9 @@ is a buffer allocation.
   the bootstrap text compile
   options form used by the compiler tests:
   `replicas=2; partitions=2; use_shardy=true; assignment=0,1,2,3`.
+  Optional `PJRTX_TRACE=1` instrumentation prints `pjrtx_trace` lines for
+  compile, H2D, execute, and D2H events, including byte counts, device count,
+  backend-executable eligibility, and elapsed microseconds.
 
 The plugin target currently produces:
 
@@ -229,13 +257,14 @@ bazel-bin/src/plugin/libpjrtx_metal_plugin.dylib
 
 ## Next Implementation Steps
 
-- Finish the runtime cutover to device-only storage. Runtime buffers should keep
-  backend handles live across instruction chains, never cache host mirrors, and
-  hand backend-native operations to MLX without synchronizing after every op.
-- Expand the MLX backend implementation for the LLM hot path: f32 binary/unary
-  math, compare/select, reductions, matmul-like `dot_general`, shape/view ops,
-  and then backend-native gather/pad/dynamic-slice/update where MLX exposes the
-  right primitive.
+- Finish the backend-executable cutover. Runtime buffers now keep backend
+  handles live across supported instruction chains; the next step is to move
+  more graph fragments into MLX executable legalization and make the fallback
+  path test-only for unsupported features.
+- Expand the MLX backend implementation for the remaining LLM hot path:
+  general gather, interior pad lowering, scatter, custom comparator sort/top-k,
+  and custom-call
+  hooks where MLX exposes the right primitive.
 - Add a backend legalization/pipeline stage to turn PjRTx value graphs into
   per-device command fragments: memory placement, layout, tiling/shard planning,
   async dependencies, fusion candidate groups, and final backend kernel/library

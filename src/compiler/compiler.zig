@@ -666,6 +666,7 @@ fn instructionKindFromStablehlo(name: []const u8) PlanInstructionKind {
     if (std.mem.eql(u8, name, "concatenate")) return .concatenate;
     if (std.mem.eql(u8, name, "iota")) return .iota;
     if (std.mem.eql(u8, name, "gather")) return .gather;
+    if (std.mem.eql(u8, name, "sort")) return .sort;
     if (std.mem.eql(u8, name, "dot_general")) return .dot_general;
     if (std.mem.eql(u8, name, "reduce_sum")) return .reduce_sum;
     if (std.mem.eql(u8, name, "reduce_max")) return .reduce_max;
@@ -760,6 +761,7 @@ fn isUnaryKind(kind: PlanInstructionKind) bool {
         .transpose,
         .broadcast_in_dim,
         .slice,
+        .sort,
         .reverse,
         .reduce_sum,
         .reduce_max,
@@ -1000,7 +1002,7 @@ fn makePlanInstruction(
         .start_indices_batching_dims = start_indices_batching_dims,
         .start_index_map = start_index_map,
         .index_vector_dim = if (kind == .gather) op.index_vector_dim else null,
-        .dimension = if (kind == .concatenate) op.dimension else null,
+        .dimension = if (kind == .concatenate or kind == .sort) op.dimension else null,
         .iota_dimension = if (kind == .iota) op.iota_dimension else null,
         .dimensions = dimensions,
         .tuple_index = if (kind == .get_tuple_element) op.tuple_index else null,
@@ -1011,7 +1013,7 @@ fn makePlanInstruction(
         .rhs_batch_dimensions = rhs_batch_dimensions,
         .lhs_contracting_dimensions = lhs_contracting_dimensions,
         .rhs_contracting_dimensions = rhs_contracting_dimensions,
-        .compare_direction = if (kind == .compare) op.compare_direction else null,
+        .compare_direction = if (kind == .compare or kind == .sort) op.compare_direction else null,
         .literal = literal,
     };
 }
@@ -1155,7 +1157,7 @@ fn verifyInstructionDescriptors(
                 return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "reshape must preserve dense byte size", "shape-type");
             }
         },
-        .transpose, .broadcast_in_dim, .slice, .dynamic_slice, .dynamic_update_slice, .pad, .reverse, .gather => {
+        .transpose, .broadcast_in_dim, .slice, .dynamic_slice, .dynamic_update_slice, .pad, .reverse, .gather, .sort => {
             const input = plan.values[instruction.inputs[0].index].descriptor;
             if (descriptorKnown(input) and descriptorKnown(output) and input.element_type != output.element_type) {
                 return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "view instruction must preserve dtype", "shape-type");
@@ -1412,6 +1414,7 @@ fn stablehloOpSupported(name: []const u8) bool {
         "concatenate",
         "iota",
         "gather",
+        "sort",
         "reduce",
         "dot_general",
         "cholesky",
@@ -1875,6 +1878,23 @@ fn reduceKindFromRegion(op: mlir.MlirOperation) []const u8 {
     return "reduce";
 }
 
+fn compareDirectionFromSortRegion(op: mlir.MlirOperation) ?core.CompareOp {
+    const n_regions = mlir.mlirOperationGetNumRegions(op);
+    var region_index: isize = 0;
+    while (region_index < n_regions) : (region_index += 1) {
+        var block = mlir.mlirRegionGetFirstBlock(mlir.mlirOperationGetRegion(op, region_index));
+        while (!mlir.mlirBlockIsNull(block)) : (block = mlir.mlirBlockGetNextInRegion(block)) {
+            var child = mlir.mlirBlockGetFirstOperation(block);
+            while (!mlir.mlirOperationIsNull(child)) : (child = mlir.mlirOperationGetNextInBlock(child)) {
+                if (std.mem.eql(u8, operationName(child), "stablehlo.compare")) {
+                    return compareDirectionFromAttr(getOperationAttribute(child, "comparison_direction"));
+                }
+            }
+        }
+    }
+    return null;
+}
+
 fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation, op_name: []const u8) AnalyzeError!void {
     builder.saw_program_body = true;
     try addDialect(&builder.dialects, builder.allocator, .stablehlo);
@@ -1960,7 +1980,7 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
     var owns_start_index_map = true;
     errdefer if (owns_start_index_map) builder.allocator.free(start_index_map);
     const index_vector_dim = if (std.mem.eql(u8, short_name, "gather")) stablehloGatherIndexVectorDim(gather_dimensions) else null;
-    const dimension = if (std.mem.eql(u8, short_name, "concatenate"))
+    const dimension = if (std.mem.eql(u8, short_name, "concatenate") or std.mem.eql(u8, short_name, "sort"))
         intAttribute(getOperationAttribute(op, "dimension"))
     else
         null;
@@ -2009,7 +2029,12 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
     const rhs_contracting_dimensions = if (std.mem.eql(u8, short_name, "dot_general")) try stablehloDotDims(builder.allocator, dot_dimensions, "rhs_contract") else try builder.allocator.dupe(i64, &.{});
     var owns_rhs_contracting_dimensions = true;
     errdefer if (owns_rhs_contracting_dimensions) builder.allocator.free(rhs_contracting_dimensions);
-    const compare_direction = if (std.mem.eql(u8, short_name, "compare")) compareDirectionFromAttr(getOperationAttribute(op, "comparison_direction")) else null;
+    const compare_direction = if (std.mem.eql(u8, short_name, "compare"))
+        compareDirectionFromAttr(getOperationAttribute(op, "comparison_direction"))
+    else if (std.mem.eql(u8, short_name, "sort"))
+        compareDirectionFromSortRegion(op)
+    else
+        null;
     const inputs = try valueIdsForOperands(builder, op);
     var owns_inputs = true;
     errdefer if (owns_inputs) builder.allocator.free(inputs);
@@ -2750,6 +2775,36 @@ test "executable plan lowers concatenate with dimension and result shape" {
     try std.testing.expectEqual(PlanInstructionKind.concatenate, plan.instructions[0].kind);
     try std.testing.expectEqualSlices(i64, &.{ 2, 5 }, plan.instructions[0].dims.?);
     try std.testing.expectEqual(@as(?i64, 1), plan.instructions[0].dimension);
+}
+
+test "executable plan lowers sort with dimension and comparator direction" {
+    const module_text =
+        \\module {
+        \\  func.func @main(%arg0: tensor<2x3xf32>) -> tensor<2x3xf32> {
+        \\    %0 = "stablehlo.sort"(%arg0) ({
+        \\    ^bb0(%lhs: tensor<f32>, %rhs: tensor<f32>):
+        \\      %pred = stablehlo.compare  LT, %lhs, %rhs,  FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+        \\      stablehlo.return %pred : tensor<i1>
+        \\    }) {dimension = 1 : i64, is_stable = true} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+        \\    return %0 : tensor<2x3xf32>
+        \\  }
+        \\}
+    ;
+    var reader: std.Io.Reader = .fixed(module_text);
+    var diagnostics = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    var analysis = try analyzeProgramFromReader(std.testing.allocator, "mlir", &reader, &diagnostics.writer);
+    defer analysis.deinit();
+
+    var plan = try makeExecutablePlan(std.testing.allocator, .{}, analysis);
+    defer plan.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), plan.instructions.len);
+    try std.testing.expectEqual(PlanInstructionKind.sort, plan.instructions[0].kind);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, plan.instructions[0].dims.?);
+    try std.testing.expectEqual(@as(?i64, 1), plan.instructions[0].dimension);
+    try std.testing.expectEqual(core.CompareOp.lt, plan.instructions[0].compare_direction.?);
 }
 
 test "executable plan lowers heavy random and structural StableHLO op shells" {

@@ -197,8 +197,11 @@ pub const GraphNode = struct {
 
 pub const ExecutableGraph = struct {
     allocator: std.mem.Allocator,
+    backend: backend_api.Backend,
     device_ids: []i32,
+    device_local_hardware_ids: []i32,
     nodes: []GraphNode,
+    backend_executable: ?backend_api.ExecutableHandle = null,
 
     pub fn init(allocator: std.mem.Allocator, client: *const Client, plan: *const core.ExecutablePlan) !ExecutableGraph {
         const device_count = plan.options.numDevices();
@@ -206,12 +209,15 @@ pub const ExecutableGraph = struct {
 
         const device_ids = try allocator.alloc(i32, device_count);
         errdefer allocator.free(device_ids);
+        const device_local_hardware_ids = try allocator.alloc(i32, device_count);
+        errdefer allocator.free(device_local_hardware_ids);
         for (device_ids, 0..) |*device_id, i| {
             device_id.* = if (plan.options.device_assignment.len != 0)
                 plan.options.device_assignment[i]
             else
                 client.devices[i].id;
-            if (client.lookupDevice(device_id.*) == null) return error.InvalidGraph;
+            const device = client.lookupDevice(device_id.*) orelse return error.InvalidGraph;
+            device_local_hardware_ids[i] = device.local_hardware_id;
         }
 
         const node_count = std.math.mul(usize, plan.instructions.len, device_count) catch return error.InvalidGraph;
@@ -231,14 +237,22 @@ pub const ExecutableGraph = struct {
             }
         }
 
+        const backend_executable = client.backend.compileExecutable(allocator, plan, device_local_hardware_ids) catch null;
+        errdefer if (backend_executable) |handle| client.backend.destroyExecutable(handle);
+
         return .{
             .allocator = allocator,
+            .backend = client.backend,
             .device_ids = device_ids,
+            .device_local_hardware_ids = device_local_hardware_ids,
             .nodes = nodes,
+            .backend_executable = backend_executable,
         };
     }
 
     pub fn deinit(self: *ExecutableGraph) void {
+        if (self.backend_executable) |handle| self.backend.destroyExecutable(handle);
+        self.allocator.free(self.device_local_hardware_ids);
         self.allocator.free(self.nodes);
         self.allocator.free(self.device_ids);
         self.* = undefined;
@@ -255,6 +269,9 @@ pub const ExecutableGraph = struct {
         if (device_index >= self.device_ids.len or device_index >= client.devices.len) return error.InvalidArgument;
         if (plan.instructions.len == 0) return error.UnsupportedRuntimeFeature;
         if (arguments.len < plan.parameter_shardings.len) return error.InvalidArgument;
+        if (self.tryExecuteBackendExecutable(allocator, client, device_index, arguments) catch |err| return err) |outputs| {
+            return outputs;
+        }
 
         var value_buffers = try allocator.alloc(?*Buffer, plan.values.len);
         defer allocator.free(value_buffers);
@@ -297,6 +314,53 @@ pub const ExecutableGraph = struct {
             initialized_outputs += 1;
         }
 
+        return outputs;
+    }
+
+    fn tryExecuteBackendExecutable(
+        self: *const ExecutableGraph,
+        allocator: std.mem.Allocator,
+        client: *Client,
+        device_index: usize,
+        arguments: []const *Buffer,
+    ) GraphExecuteError!?[]*Buffer {
+        const backend_executable = self.backend_executable orelse return null;
+        var argument_handles = try allocator.alloc(backend_api.BufferHandle, arguments.len);
+        defer allocator.free(argument_handles);
+        for (arguments, 0..) |argument, i| {
+            argument_handles[i] = argument.backend_buffer orelse return null;
+        }
+
+        const backend_outputs = client.backend.executeExecutable(allocator, backend_executable, device_index, argument_handles) catch |err| return mapBufferError(err);
+        const owned_backend_outputs = backend_outputs orelse return null;
+        defer allocator.free(owned_backend_outputs);
+
+        const outputs = try allocator.alloc(*Buffer, owned_backend_outputs.len);
+        errdefer allocator.free(outputs);
+        var initialized: usize = 0;
+        errdefer {
+            for (outputs[0..initialized]) |buffer| buffer.deinit();
+            for (owned_backend_outputs[initialized..]) |output| client.backend.destroyBuffer(output.handle);
+        }
+
+        const device = &client.devices[device_index];
+        const memory = device.default_memory;
+        for (owned_backend_outputs, 0..) |output, i| {
+            outputs[i] = Buffer.initBackendHandle(
+                allocator,
+                client.backend,
+                output.element_type,
+                output.dims,
+                device,
+                memory,
+                device_index,
+                output.byte_size,
+                output.handle,
+            ) catch |err| {
+                return mapBufferError(err);
+            };
+            initialized += 1;
+        }
         return outputs;
     }
 
@@ -395,13 +459,14 @@ pub const ExecutableGraph = struct {
                 instruction.dims orelse plan.values[output_id.index].descriptor.dims,
                 device_index,
             ) catch |err| return mapBufferError(err),
-            .convert, .bitcast_convert => Buffer.initConvert(
+            .convert => Buffer.initConvert(
                 allocator,
                 value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
                 plan.values[output_id.index].descriptor.element_type,
                 instruction.dims orelse plan.values[output_id.index].descriptor.dims,
                 device_index,
             ) catch |err| return mapBufferError(err),
+            .bitcast_convert => return error.UnsupportedRuntimeFeature,
             .iota => blk: {
                 const descriptor = plan.values[output_id.index].descriptor;
                 const device = &client.devices[device_index];
@@ -497,6 +562,14 @@ pub const ExecutableGraph = struct {
                 instruction.index_vector_dim orelse 0,
                 instruction.slice_sizes orelse &.{},
                 instruction.dims orelse &.{},
+                device_index,
+            ) catch |err| return mapBufferError(err),
+            .sort => Buffer.initSort(
+                allocator,
+                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
+                instruction.dimension orelse return error.InvalidArgument,
+                instruction.dims orelse &.{},
+                instruction.compare_direction orelse .lt,
                 device_index,
             ) catch |err| return mapBufferError(err),
             .compare => Buffer.initCompare(
@@ -1882,6 +1955,13 @@ pub const Buffer = struct {
     ) !*Buffer {
         if (!std.mem.eql(i64, src.dims, output_dims)) return error.ShapeMismatch;
         if (src.element_type.byteSize() == 0 or output_type.byteSize() == 0) return error.UnsupportedElementType;
+        const output_size = denseByteSize(output_type, output_dims);
+        if (src.backend_buffer) |src_backend| {
+            if (src.backend.convert(src_backend, output_type) catch null) |backend_buffer| {
+                return initBackendOnly(allocator, src, output_type, output_dims, output_size, backend_buffer, shard_index);
+            }
+            if (src.bytes.len == 0) return error.UnsupportedRuntimeFeature;
+        }
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
@@ -1889,7 +1969,6 @@ pub const Buffer = struct {
         const dims = try allocator.dupe(i64, output_dims);
         errdefer allocator.free(dims);
 
-        const output_size = denseByteSize(output_type, output_dims);
         const bytes = try allocator.alloc(u8, output_size);
         errdefer allocator.free(bytes);
 
@@ -1983,6 +2062,12 @@ pub const Buffer = struct {
         if (!std.mem.eql(i64, src.dims, output_dims)) return error.ShapeMismatch;
         const element_size = src.element_type.byteSize();
         if (element_size == 0) return error.UnsupportedElementType;
+        if (src.backend_buffer) |src_backend| {
+            if (src.backend.reverse(src_backend, dimensions, output_dims) catch null) |backend_buffer| {
+                return initBackendOnly(allocator, src, src.element_type, output_dims, src.byte_size, backend_buffer, shard_index);
+            }
+            if (src.bytes.len == 0) return error.UnsupportedRuntimeFeature;
+        }
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
@@ -2084,6 +2169,16 @@ pub const Buffer = struct {
         shard_index: usize,
     ) !*Buffer {
         if (start_buffers.len != src.dims.len or slice_sizes.len != src.dims.len) return error.ShapeMismatch;
+        if (src.backend_buffer) |src_backend| {
+            const start_handles = try backendStartHandles(allocator, start_buffers);
+            defer allocator.free(start_handles);
+            if (start_handles.len == start_buffers.len) {
+                if (src.backend.dynamicSlice(src_backend, start_handles, slice_sizes, output_dims) catch null) |backend_buffer| {
+                    return initBackendOnly(allocator, src, src.element_type, output_dims, denseByteSize(src.element_type, output_dims), backend_buffer, shard_index);
+                }
+            }
+            if (src.bytes.len == 0) return error.UnsupportedRuntimeFeature;
+        }
         var starts = try allocator.alloc(i64, start_buffers.len);
         defer allocator.free(starts);
         var limits = try allocator.alloc(i64, start_buffers.len);
@@ -2113,6 +2208,16 @@ pub const Buffer = struct {
         if (!std.mem.eql(i64, src.dims, output_dims) or src.dims.len != update.dims.len or start_buffers.len != src.dims.len) return error.ShapeMismatch;
         const element_size = src.element_type.byteSize();
         if (element_size == 0) return error.UnsupportedElementType;
+        if (src.backend_buffer != null and update.backend_buffer != null) {
+            const start_handles = try backendStartHandles(allocator, start_buffers);
+            defer allocator.free(start_handles);
+            if (start_handles.len == start_buffers.len) {
+                if (src.backend.dynamicUpdateSlice(src.backend_buffer.?, update.backend_buffer.?, start_handles, output_dims) catch null) |backend_buffer| {
+                    return initBackendOnly(allocator, src, src.element_type, output_dims, denseByteSize(src.element_type, output_dims), backend_buffer, shard_index);
+                }
+            }
+            if (src.bytes.len == 0 or update.bytes.len == 0) return error.UnsupportedRuntimeFeature;
+        }
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
@@ -2180,6 +2285,12 @@ pub const Buffer = struct {
         if (edge_padding_low.len != rank or edge_padding_high.len != rank or interior_padding.len != rank or output_dims.len != rank) return error.ShapeMismatch;
         const element_size = src.element_type.byteSize();
         if (element_size == 0) return error.UnsupportedElementType;
+        if (src.backend_buffer != null and padding_value.backend_buffer != null) {
+            if (src.backend.pad(src.backend_buffer.?, padding_value.backend_buffer.?, edge_padding_low, edge_padding_high, interior_padding, output_dims) catch null) |backend_buffer| {
+                return initBackendOnly(allocator, src, src.element_type, output_dims, denseByteSize(src.element_type, output_dims), backend_buffer, shard_index);
+            }
+            if (src.bytes.len == 0 or padding_value.bytes.len == 0) return error.UnsupportedRuntimeFeature;
+        }
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
@@ -2249,6 +2360,14 @@ pub const Buffer = struct {
         if (index_vector_dim < 0) return error.ShapeMismatch;
 
         const element_size = operand.element_type.byteSize();
+        if (operand.backend_buffer != null and indices.backend_buffer != null) {
+            if (supportedGatherAxisForRuntime(collapsed_slice_dims, start_index_map, slice_sizes)) |gather_axis| {
+                if (operand.backend.gatherAxis(operand.backend_buffer.?, indices.backend_buffer.?, gather_axis, index_vector_dim, output_dims) catch null) |backend_buffer| {
+                    return initBackendOnly(allocator, operand, operand.element_type, output_dims, denseByteSize(operand.element_type, output_dims), backend_buffer, shard_index);
+                }
+            }
+            if (operand.bytes.len == 0 or indices.bytes.len == 0) return error.UnsupportedRuntimeFeature;
+        }
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
         const dims = try allocator.dupe(i64, output_dims);
@@ -2321,6 +2440,65 @@ pub const Buffer = struct {
         return buffer;
     }
 
+    pub fn initSort(
+        allocator: std.mem.Allocator,
+        src: *Buffer,
+        dimension: i64,
+        output_dims: []const i64,
+        direction: CompareOp,
+        shard_index: usize,
+    ) !*Buffer {
+        if (!std.mem.eql(i64, src.dims, output_dims)) return error.ShapeMismatch;
+        if (dimension < 0 or dimension >= @as(i64, @intCast(src.dims.len))) return error.ShapeMismatch;
+        const element_size = src.element_type.byteSize();
+        if (element_size == 0) return error.UnsupportedElementType;
+        const ascending = switch (direction) {
+            .lt, .le => true,
+            .gt, .ge => false,
+            else => return error.UnsupportedElementType,
+        };
+        if (src.backend_buffer) |src_backend| {
+            if (src.backend.sort(src_backend, dimension, output_dims) catch null) |sorted_backend| {
+                if (ascending) {
+                    return initBackendOnly(allocator, src, src.element_type, output_dims, src.byte_size, sorted_backend, shard_index);
+                }
+                const reverse_dimensions = [_]i64{dimension};
+                if (src.backend.reverse(sorted_backend, &reverse_dimensions, output_dims) catch null) |backend_buffer| {
+                    src.backend.destroyBuffer(sorted_backend);
+                    return initBackendOnly(allocator, src, src.element_type, output_dims, src.byte_size, backend_buffer, shard_index);
+                }
+                src.backend.destroyBuffer(sorted_backend);
+            }
+            if (src.bytes.len == 0) return error.UnsupportedRuntimeFeature;
+        }
+
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+        const dims = try allocator.dupe(i64, output_dims);
+        errdefer allocator.free(dims);
+        const bytes = try allocator.dupe(u8, src.bytes);
+        errdefer allocator.free(bytes);
+        try sortDenseBytes(allocator, src.element_type, bytes, output_dims, @intCast(dimension), ascending);
+        const backend_buffer = if (ascending) src.backend.bufferFromHost(src.device.local_hardware_id, src.element_type, output_dims, bytes) catch null else null;
+        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = src.backend,
+            .backend_kind = src.backend_kind,
+            .element_type = src.element_type,
+            .dims = dims,
+            .device_id = src.device_id,
+            .memory_id = src.memory_id,
+            .device = src.device,
+            .memory = src.memory,
+            .shard_index = shard_index,
+            .byte_size = bytes.len,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer;
+    }
+
     pub fn initU8Unary(
         allocator: std.mem.Allocator,
         op: ElementwiseUnaryOp,
@@ -2349,6 +2527,44 @@ pub const Buffer = struct {
 
     pub fn hasBackendStorage(self: *const Buffer) bool {
         return self.backend_buffer != null;
+    }
+
+    pub fn initBackendHandle(
+        allocator: std.mem.Allocator,
+        backend_impl: backend_api.Backend,
+        element_type: BufferType,
+        dims_: []const i64,
+        device: *Device,
+        memory: *Memory,
+        shard_index: usize,
+        byte_size: usize,
+        backend_buffer: backend_api.BufferHandle,
+    ) !*Buffer {
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+
+        const dims = try allocator.dupe(i64, dims_);
+        errdefer allocator.free(dims);
+
+        const bytes = try allocator.alloc(u8, 0);
+        errdefer allocator.free(bytes);
+
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = backend_impl,
+            .backend_kind = backend_impl.kind(),
+            .element_type = element_type,
+            .dims = dims,
+            .device_id = device.id,
+            .memory_id = memory.id,
+            .device = device,
+            .memory = memory,
+            .shard_index = shard_index,
+            .byte_size = byte_size,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer;
     }
 };
 
@@ -2593,6 +2809,72 @@ fn scalarIndexAt(buffer: *const Buffer, index: usize) i64 {
         .f32 => @intFromFloat(readF32LE(buffer.bytes, index)),
         else => 0,
     };
+}
+
+fn backendStartHandles(allocator: std.mem.Allocator, start_buffers: []const *Buffer) ![]backend_api.BufferHandle {
+    for (start_buffers) |start_buffer| {
+        if (start_buffer.backend_buffer == null) return allocator.alloc(backend_api.BufferHandle, 0);
+    }
+    const handles = try allocator.alloc(backend_api.BufferHandle, start_buffers.len);
+    errdefer allocator.free(handles);
+    for (start_buffers, 0..) |start_buffer, index| {
+        handles[index] = start_buffer.backend_buffer.?;
+    }
+    return handles;
+}
+
+fn supportedGatherAxisForRuntime(collapsed_slice_dims: []const i64, start_index_map: []const i64, slice_sizes: []const i64) ?i64 {
+    if (collapsed_slice_dims.len != 1 or start_index_map.len != 1) return null;
+    const axis = start_index_map[0];
+    if (axis != 0 or collapsed_slice_dims[0] != axis) return null;
+    if (slice_sizes.len == 0 or slice_sizes[@intCast(axis)] != 1) return null;
+    return axis;
+}
+
+fn sortDenseBytes(allocator: std.mem.Allocator, element_type: BufferType, bytes: []u8, dims: []const i64, axis: usize, ascending: bool) !void {
+    if (axis >= dims.len or dims[axis] < 0) return error.ShapeMismatch;
+    const element_size = element_type.byteSize();
+    if (element_size == 0) return error.UnsupportedElementType;
+    const axis_len: usize = @intCast(dims[axis]);
+    if (axis_len <= 1) return;
+
+    const strides = try rowMajorStrides(allocator, dims);
+    defer allocator.free(strides);
+    const element_count = bytes.len / element_size;
+    const coords = try allocator.alloc(usize, dims.len);
+    defer allocator.free(coords);
+    const line = try allocator.alloc(usize, axis_len);
+    defer allocator.free(line);
+    const scratch = try allocator.alloc(u8, axis_len * element_size);
+    defer allocator.free(scratch);
+
+    for (0..element_count) |base_index| {
+        unravelIndex(base_index, dims, strides, coords);
+        if (coords[axis] != 0) continue;
+        for (0..axis_len) |i| {
+            line[i] = base_index + i * strides[axis];
+        }
+        std.mem.sort(usize, line, SortContext{ .bytes = bytes, .element_type = element_type, .ascending = ascending }, lessSortIndex);
+        for (line, 0..) |src_index, i| {
+            @memcpy(scratch[i * element_size ..][0..element_size], bytes[src_index * element_size ..][0..element_size]);
+        }
+        for (0..axis_len) |i| {
+            const dst_index = base_index + i * strides[axis];
+            @memcpy(bytes[dst_index * element_size ..][0..element_size], scratch[i * element_size ..][0..element_size]);
+        }
+    }
+}
+
+const SortContext = struct {
+    bytes: []const u8,
+    element_type: BufferType,
+    ascending: bool,
+};
+
+fn lessSortIndex(context: SortContext, lhs: usize, rhs: usize) bool {
+    const lhs_value = readScalarAsF64(context.element_type, context.bytes, lhs);
+    const rhs_value = readScalarAsF64(context.element_type, context.bytes, rhs);
+    return if (context.ascending) lhs_value < rhs_value else lhs_value > rhs_value;
 }
 
 fn axisInList(axis: usize, axes: []const i64) bool {
@@ -2840,6 +3122,7 @@ test "executable graph executes through runtime buffers" {
 
     var graph = try ExecutableGraph.init(allocator, client, &plan);
     defer graph.deinit();
+    try std.testing.expect(graph.backend_executable != null);
 
     const lhs_data = [_]u8{ 1, 2, 3, 4 };
     const rhs_data = [_]u8{ 10, 20, 30, 40 };
@@ -2922,6 +3205,130 @@ test "buffer elementwise arithmetic supports f32 execution" {
     const negated = try Buffer.initElementwiseUnary(std.testing.allocator, .negate, lhs, 0);
     defer negated.deinit();
     try expectBufferF32(negated, &.{ -1.5, 2.0 });
+}
+
+test "buffer convert uses backend astype for resident buffers" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+
+    const dims = [_]i64{2};
+    const input = [_]u8{ 1, 255 };
+    const source = try initHostCopyForTest(.u8, &dims, &client.devices[0], &client.memories[0], 0, &input);
+    defer source.deinit();
+
+    const converted = try Buffer.initConvert(std.testing.allocator, source, .f32, &dims, 0);
+    defer converted.deinit();
+    try std.testing.expect(converted.backend_buffer != null);
+    try std.testing.expectEqual(@as(usize, 0), converted.bytes.len);
+    try expectBufferF32(converted, &.{ 1.0, 255.0 });
+}
+
+test "buffer movement ops use resident mlx backend paths" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+
+    const dims = [_]i64{ 3, 4 };
+    const values = [_]f32{
+        1.0, 2.0,  3.0,  4.0,
+        5.0, 6.0,  7.0,  8.0,
+        9.0, 10.0, 11.0, 12.0,
+    };
+    const source = try initHostCopyForTest(.f32, &dims, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&values));
+    defer source.deinit();
+
+    const start0: i32 = 1;
+    const start1: i32 = 1;
+    const start0_buffer = try initHostCopyForTest(.s32, &.{}, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&start0));
+    defer start0_buffer.deinit();
+    const start1_buffer = try initHostCopyForTest(.s32, &.{}, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&start1));
+    defer start1_buffer.deinit();
+
+    const slice_dims = [_]i64{ 2, 2 };
+    const sliced = try Buffer.initDynamicSlice(std.testing.allocator, source, &.{ start0_buffer, start1_buffer }, &slice_dims, &slice_dims, 0);
+    defer sliced.deinit();
+    try std.testing.expect(sliced.backend_buffer != null);
+    try std.testing.expectEqual(@as(usize, 0), sliced.bytes.len);
+    try expectBufferF32(sliced, &.{ 6.0, 7.0, 10.0, 11.0 });
+
+    const update_values = [_]f32{ 100.0, 101.0, 102.0, 103.0 };
+    const update = try initHostCopyForTest(.f32, &slice_dims, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&update_values));
+    defer update.deinit();
+    const updated = try Buffer.initDynamicUpdateSlice(std.testing.allocator, source, update, &.{ start0_buffer, start1_buffer }, &dims, 0);
+    defer updated.deinit();
+    try std.testing.expect(updated.backend_buffer != null);
+    try std.testing.expectEqual(@as(usize, 0), updated.bytes.len);
+    try expectBufferF32(updated, &.{
+        1.0, 2.0,   3.0,   4.0,
+        5.0, 100.0, 101.0, 8.0,
+        9.0, 102.0, 103.0, 12.0,
+    });
+
+    const pad_input_dims = [_]i64{2};
+    const pad_output_dims = [_]i64{5};
+    const pad_input_values = [_]f32{ 2.0, 3.0 };
+    const pad_value: f32 = 0.0;
+    const pad_input = try initHostCopyForTest(.f32, &pad_input_dims, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&pad_input_values));
+    defer pad_input.deinit();
+    const pad_value_buffer = try initHostCopyForTest(.f32, &.{}, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&pad_value));
+    defer pad_value_buffer.deinit();
+    const padded = try Buffer.initPad(std.testing.allocator, pad_input, pad_value_buffer, &.{1}, &.{2}, &.{0}, &pad_output_dims, 0);
+    defer padded.deinit();
+    try std.testing.expect(padded.backend_buffer != null);
+    try std.testing.expectEqual(@as(usize, 0), padded.bytes.len);
+    try expectBufferF32(padded, &.{ 0.0, 2.0, 3.0, 0.0, 0.0 });
+
+    const reverse_dims = [_]i64{ 2, 3 };
+    const reverse_values = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0 };
+    const reverse_source = try initHostCopyForTest(.f32, &reverse_dims, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&reverse_values));
+    defer reverse_source.deinit();
+    const reversed = try Buffer.initReverse(std.testing.allocator, reverse_source, &.{1}, &reverse_dims, 0);
+    defer reversed.deinit();
+    try std.testing.expect(reversed.backend_buffer != null);
+    try std.testing.expectEqual(@as(usize, 0), reversed.bytes.len);
+    try expectBufferF32(reversed, &.{ 3.0, 2.0, 1.0, 6.0, 5.0, 4.0 });
+
+    const gather_operand_dims = [_]i64{ 3, 2 };
+    const gather_output_dims = [_]i64{ 2, 2 };
+    const gather_operand_values = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0 };
+    const gather_indices_values = [_]i32{ 2, 0 };
+    const gather_operand = try initHostCopyForTest(.f32, &gather_operand_dims, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&gather_operand_values));
+    defer gather_operand.deinit();
+    const gather_indices = try initHostCopyForTest(.s32, &.{2}, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&gather_indices_values));
+    defer gather_indices.deinit();
+    const gathered = try Buffer.initGather(
+        std.testing.allocator,
+        gather_operand,
+        gather_indices,
+        &.{1},
+        &.{0},
+        &.{},
+        &.{},
+        &.{0},
+        1,
+        &.{ 1, 2 },
+        &gather_output_dims,
+        0,
+    );
+    defer gathered.deinit();
+    try std.testing.expect(gathered.backend_buffer != null);
+    try std.testing.expectEqual(@as(usize, 0), gathered.bytes.len);
+    try expectBufferF32(gathered, &.{ 5.0, 6.0, 1.0, 2.0 });
+
+    const sort_dims = [_]i64{ 2, 3 };
+    const sort_values = [_]f32{ 3.0, 1.0, 2.0, 6.0, 4.0, 5.0 };
+    const sort_source = try initHostCopyForTest(.f32, &sort_dims, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&sort_values));
+    defer sort_source.deinit();
+    const sorted = try Buffer.initSort(std.testing.allocator, sort_source, 1, &sort_dims, .lt, 0);
+    defer sorted.deinit();
+    try std.testing.expect(sorted.backend_buffer != null);
+    try std.testing.expectEqual(@as(usize, 0), sorted.bytes.len);
+    try expectBufferF32(sorted, &.{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0 });
+
+    const reverse_sorted = try Buffer.initSort(std.testing.allocator, sort_source, 1, &sort_dims, .gt, 0);
+    defer reverse_sorted.deinit();
+    try std.testing.expect(reverse_sorted.backend_buffer != null);
+    try std.testing.expectEqual(@as(usize, 0), reverse_sorted.bytes.len);
+    try expectBufferF32(reverse_sorted, &.{ 3.0, 2.0, 1.0, 6.0, 5.0, 4.0 });
 }
 
 test "buffer elementwise unary math supports f32 execution" {

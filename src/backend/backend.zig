@@ -2,6 +2,7 @@ const std = @import("std");
 const core = @import("src/core");
 
 pub const BufferHandle = *anyopaque;
+pub const ExecutableHandle = *anyopaque;
 
 pub const Error = error{
     InvalidDeviceCount,
@@ -11,6 +12,13 @@ pub const Error = error{
     CommandSubmissionFailed,
     BufferCopyFailed,
     OutOfMemory,
+};
+
+pub const ExecutableOutput = struct {
+    handle: BufferHandle,
+    element_type: core.BufferType,
+    dims: []const i64,
+    byte_size: usize,
 };
 
 pub const Capabilities = struct {
@@ -32,17 +40,27 @@ pub const Backend = struct {
         releaseDeviceDescriptors: *const fn (backend: Backend, allocator: std.mem.Allocator, descriptors: []core.DeviceDescriptor) void,
         bufferFromHost: *const fn (backend: Backend, device_local_hardware_id: i32, element_type: core.BufferType, dims: []const i64, src: []const u8) Error!?BufferHandle,
         cloneBuffer: *const fn (backend: Backend, src: BufferHandle) Error!?BufferHandle,
+        convert: *const fn (backend: Backend, src: BufferHandle, output_type: core.BufferType) Error!?BufferHandle,
         binary: *const fn (backend: Backend, lhs: BufferHandle, rhs: BufferHandle, op: core.ElementwiseBinaryOp) Error!?BufferHandle,
         unary: *const fn (backend: Backend, src: BufferHandle, op: core.ElementwiseUnaryOp) Error!?BufferHandle,
         reshape: *const fn (backend: Backend, src: BufferHandle, dims: []const i64) Error!?BufferHandle,
         transpose: *const fn (backend: Backend, src: BufferHandle, permutation: []const i64) Error!?BufferHandle,
         broadcastInDim: *const fn (backend: Backend, src: BufferHandle, broadcast_dimensions: []const i64, output_dims: []const i64) Error!?BufferHandle,
         slice: *const fn (backend: Backend, src: BufferHandle, start_indices: []const i64, limit_indices: []const i64, strides: []const i64, output_dims: []const i64) Error!?BufferHandle,
+        dynamicSlice: *const fn (backend: Backend, src: BufferHandle, start_buffers: []const BufferHandle, slice_sizes: []const i64, output_dims: []const i64) Error!?BufferHandle,
+        dynamicUpdateSlice: *const fn (backend: Backend, src: BufferHandle, update: BufferHandle, start_buffers: []const BufferHandle, output_dims: []const i64) Error!?BufferHandle,
+        pad: *const fn (backend: Backend, src: BufferHandle, padding_value: BufferHandle, edge_padding_low: []const i64, edge_padding_high: []const i64, interior_padding: []const i64, output_dims: []const i64) Error!?BufferHandle,
+        reverse: *const fn (backend: Backend, src: BufferHandle, dimensions: []const i64, output_dims: []const i64) Error!?BufferHandle,
         concatenate: *const fn (backend: Backend, lhs: BufferHandle, rhs: BufferHandle, dimension: i64, output_dims: []const i64) Error!?BufferHandle,
+        gatherAxis: *const fn (backend: Backend, operand: BufferHandle, indices: BufferHandle, axis: i64, index_vector_dim: i64, output_dims: []const i64) Error!?BufferHandle,
+        sort: *const fn (backend: Backend, src: BufferHandle, dimension: i64, output_dims: []const i64) Error!?BufferHandle,
         dotGeneral: *const fn (backend: Backend, lhs: BufferHandle, rhs: BufferHandle, lhs_batch_dimensions: []const i64, rhs_batch_dimensions: []const i64, lhs_contracting_dimensions: []const i64, rhs_contracting_dimensions: []const i64, output_dims: []const i64) Error!?BufferHandle,
         reduce: *const fn (backend: Backend, src: BufferHandle, op: core.PlanInstructionKind, dimensions: []const i64, output_dims: []const i64) Error!?BufferHandle,
         compare: *const fn (backend: Backend, lhs: BufferHandle, rhs: BufferHandle, direction: core.CompareOp, output_dims: []const i64) Error!?BufferHandle,
         select: *const fn (backend: Backend, pred: BufferHandle, on_true: BufferHandle, on_false: BufferHandle, output_dims: []const i64) Error!?BufferHandle,
+        compileExecutable: *const fn (backend: Backend, allocator: std.mem.Allocator, plan: *const core.ExecutablePlan, device_local_hardware_ids: []const i32) Error!?ExecutableHandle,
+        executeExecutable: *const fn (backend: Backend, allocator: std.mem.Allocator, executable: ExecutableHandle, device_index: usize, arguments: []const BufferHandle) Error!?[]ExecutableOutput,
+        destroyExecutable: *const fn (backend: Backend, executable: ExecutableHandle) void,
         copyToHost: *const fn (backend: Backend, src: BufferHandle, dst: []u8) Error!void,
         destroyBuffer: *const fn (backend: Backend, buffer: BufferHandle) void,
     };
@@ -71,6 +89,10 @@ pub const Backend = struct {
         return self.vtable.cloneBuffer(self, src);
     }
 
+    pub fn convert(self: Backend, src: BufferHandle, output_type: core.BufferType) Error!?BufferHandle {
+        return self.vtable.convert(self, src, output_type);
+    }
+
     pub fn binary(self: Backend, lhs: BufferHandle, rhs: BufferHandle, op: core.ElementwiseBinaryOp) Error!?BufferHandle {
         return self.vtable.binary(self, lhs, rhs, op);
     }
@@ -95,8 +117,32 @@ pub const Backend = struct {
         return self.vtable.slice(self, src, start_indices, limit_indices, strides, output_dims);
     }
 
+    pub fn dynamicSlice(self: Backend, src: BufferHandle, start_buffers: []const BufferHandle, slice_sizes: []const i64, output_dims: []const i64) Error!?BufferHandle {
+        return self.vtable.dynamicSlice(self, src, start_buffers, slice_sizes, output_dims);
+    }
+
+    pub fn dynamicUpdateSlice(self: Backend, src: BufferHandle, update: BufferHandle, start_buffers: []const BufferHandle, output_dims: []const i64) Error!?BufferHandle {
+        return self.vtable.dynamicUpdateSlice(self, src, update, start_buffers, output_dims);
+    }
+
+    pub fn pad(self: Backend, src: BufferHandle, padding_value: BufferHandle, edge_padding_low: []const i64, edge_padding_high: []const i64, interior_padding: []const i64, output_dims: []const i64) Error!?BufferHandle {
+        return self.vtable.pad(self, src, padding_value, edge_padding_low, edge_padding_high, interior_padding, output_dims);
+    }
+
+    pub fn reverse(self: Backend, src: BufferHandle, dimensions: []const i64, output_dims: []const i64) Error!?BufferHandle {
+        return self.vtable.reverse(self, src, dimensions, output_dims);
+    }
+
     pub fn concatenate(self: Backend, lhs: BufferHandle, rhs: BufferHandle, dimension: i64, output_dims: []const i64) Error!?BufferHandle {
         return self.vtable.concatenate(self, lhs, rhs, dimension, output_dims);
+    }
+
+    pub fn gatherAxis(self: Backend, operand: BufferHandle, indices: BufferHandle, axis: i64, index_vector_dim: i64, output_dims: []const i64) Error!?BufferHandle {
+        return self.vtable.gatherAxis(self, operand, indices, axis, index_vector_dim, output_dims);
+    }
+
+    pub fn sort(self: Backend, src: BufferHandle, dimension: i64, output_dims: []const i64) Error!?BufferHandle {
+        return self.vtable.sort(self, src, dimension, output_dims);
     }
 
     pub fn dotGeneral(self: Backend, lhs: BufferHandle, rhs: BufferHandle, lhs_batch_dimensions: []const i64, rhs_batch_dimensions: []const i64, lhs_contracting_dimensions: []const i64, rhs_contracting_dimensions: []const i64, output_dims: []const i64) Error!?BufferHandle {
@@ -113,6 +159,18 @@ pub const Backend = struct {
 
     pub fn select(self: Backend, pred: BufferHandle, on_true: BufferHandle, on_false: BufferHandle, output_dims: []const i64) Error!?BufferHandle {
         return self.vtable.select(self, pred, on_true, on_false, output_dims);
+    }
+
+    pub fn compileExecutable(self: Backend, allocator: std.mem.Allocator, plan: *const core.ExecutablePlan, device_local_hardware_ids: []const i32) Error!?ExecutableHandle {
+        return self.vtable.compileExecutable(self, allocator, plan, device_local_hardware_ids);
+    }
+
+    pub fn executeExecutable(self: Backend, allocator: std.mem.Allocator, executable: ExecutableHandle, device_index: usize, arguments: []const BufferHandle) Error!?[]ExecutableOutput {
+        return self.vtable.executeExecutable(self, allocator, executable, device_index, arguments);
+    }
+
+    pub fn destroyExecutable(self: Backend, executable: ExecutableHandle) void {
+        self.vtable.destroyExecutable(self, executable);
     }
 
     pub fn copyToHost(self: Backend, src: BufferHandle, dst: []u8) Error!void {

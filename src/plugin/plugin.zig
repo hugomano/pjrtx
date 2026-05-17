@@ -16,6 +16,14 @@ const stablehlo_version = [_]i64{ 1, 0, 0 };
 const backend_option = "pjrtx_backend";
 const default_memory_kind = "device";
 
+const MachTimebaseInfo = extern struct {
+    numer: u32,
+    denom: u32,
+};
+
+extern "c" fn mach_absolute_time() u64;
+extern "c" fn mach_timebase_info(info: *MachTimebaseInfo) c_int;
+
 const PjrtxError = struct {
     base: c.PJRT_Error,
     code: c.PJRT_Error_Code,
@@ -37,7 +45,7 @@ const SerializedTopology = struct {
 
 const Executable = struct {
     client: *runtime.Client,
-    plan: compiler.ExecutablePlan,
+    plan: *compiler.ExecutablePlan,
     graph: runtime.ExecutableGraph,
     logical_ids: []c.PJRT_LogicalDeviceIds,
     optimized_program: []u8,
@@ -59,6 +67,7 @@ const Executable = struct {
         allocator.free(self.optimized_program);
         allocator.free(self.logical_ids);
         self.plan.deinit();
+        allocator.destroy(self.plan);
         allocator.destroy(self);
     }
 };
@@ -219,6 +228,28 @@ fn initAttrs() void {
 const ClientCreateConfig = struct {
     backend_kind: runtime.BackendKind = .metal_mlx,
 };
+
+fn traceEnabled() bool {
+    const value = std.c.getenv("PJRTX_TRACE") orelse return false;
+    const text = std.mem.span(value);
+    return text.len != 0 and !std.mem.eql(u8, text, "0") and !std.ascii.eqlIgnoreCase(text, "false");
+}
+
+fn nowNs() u64 {
+    var info: MachTimebaseInfo = undefined;
+    if (mach_timebase_info(&info) != 0 or info.denom == 0) return mach_absolute_time();
+    const ticks: u128 = mach_absolute_time();
+    return @intCast((ticks * info.numer) / info.denom);
+}
+
+fn elapsedUs(start_ns: u64) u64 {
+    return @intCast((nowNs() -| start_ns) / 1000);
+}
+
+fn trace(comptime fmt: []const u8, args: anytype) void {
+    if (!traceEnabled()) return;
+    std.debug.print("pjrtx_trace " ++ fmt ++ "\n", args);
+}
 
 fn clientCreateConfigFromArgs(args: c.PJRT_Client_Create_Args) !ClientCreateConfig {
     var config: ClientCreateConfig = .{};
@@ -402,6 +433,7 @@ fn pjrtClientAddressableMemories(args: [*c]c.PJRT_Client_AddressableMemories_Arg
 }
 
 fn pjrtClientCompile(args: [*c]c.PJRT_Client_Compile_Args) callconv(.c) ?*c.PJRT_Error {
+    const trace_start_ns = nowNs();
     const client = clientFromC(args[0].client);
     var options: compiler.CompileOptions = .{
         .num_partitions = @intCast(client.devices.len),
@@ -454,7 +486,8 @@ fn pjrtClientCompile(args: [*c]c.PJRT_Client_Compile_Args) callconv(.c) ?*c.PJRT
         compiler.makeExecutablePlan(allocator, options, owned_analysis) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable plan")
     else
         compiler.makeReplicatedPlan(allocator, options, 1, 1) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable plan");
-    errdefer plan.deinit();
+    var plan_moved = false;
+    errdefer if (!plan_moved) plan.deinit();
 
     var plan_diagnostics = std.Io.Writer.Allocating.init(allocator);
     defer plan_diagnostics.deinit();
@@ -500,7 +533,15 @@ fn pjrtClientCompile(args: [*c]c.PJRT_Client_Compile_Args) callconv(.c) ?*c.PJRT
     const fingerprint = std.fmt.allocPrint(allocator, "pjrtx-{x}", .{fingerprint_value}) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable fingerprint");
     errdefer allocator.free(fingerprint);
 
-    var graph = runtime.ExecutableGraph.init(allocator, client, &plan) catch {
+    const plan_ptr = allocator.create(compiler.ExecutablePlan) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable plan storage");
+    plan_ptr.* = plan;
+    plan_moved = true;
+    errdefer {
+        plan_ptr.deinit();
+        allocator.destroy(plan_ptr);
+    }
+
+    var graph = runtime.ExecutableGraph.init(allocator, client, plan_ptr) catch {
         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to build executable graph");
     };
     errdefer graph.deinit();
@@ -508,7 +549,7 @@ fn pjrtClientCompile(args: [*c]c.PJRT_Client_Compile_Args) callconv(.c) ?*c.PJRT
     const executable = allocator.create(Executable) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable");
     executable.* = .{
         .client = client,
-        .plan = plan,
+        .plan = plan_ptr,
         .graph = graph,
         .logical_ids = logical_ids,
         .optimized_program = optimized_program,
@@ -519,6 +560,18 @@ fn pjrtClientCompile(args: [*c]c.PJRT_Client_Compile_Args) callconv(.c) ?*c.PJRT
         .fingerprint = fingerprint,
     };
     args[0].executable = @ptrCast(executable);
+    trace(
+        "event=compile backend={s} devices={d} values={d} instructions={d} outputs={d} backend_executable={d} elapsed_us={d}",
+        .{
+            @tagName(client.backend_kind),
+            plan_ptr.options.numDevices(),
+            plan_ptr.values.len,
+            plan_ptr.instructions.len,
+            plan_ptr.output_ids.len,
+            @intFromBool(graph.backend_executable != null),
+            elapsedUs(trace_start_ns),
+        },
+    );
     return null;
 }
 
@@ -533,6 +586,7 @@ fn pjrtClientDefaultDeviceAssignment(args: [*c]c.PJRT_Client_DefaultDeviceAssign
 }
 
 fn pjrtClientBufferFromHostBuffer(args: [*c]c.PJRT_Client_BufferFromHostBuffer_Args) callconv(.c) ?*c.PJRT_Error {
+    const trace_start_ns = nowNs();
     const client = clientFromC(args[0].client);
     const device = if (args[0].device) |dev| deviceFromC(dev) else &client.devices[0];
     const memory = if (args[0].memory) |mem| memoryFromC(mem) else &client.memories[@intCast(device.default_memory_id)];
@@ -544,6 +598,17 @@ fn pjrtClientBufferFromHostBuffer(args: [*c]c.PJRT_Client_BufferFromHostBuffer_A
     };
     args[0].buffer = @ptrCast(buffer);
     args[0].done_with_host_buffer = eventCreateReady();
+    trace(
+        "event=h2d bytes={d} dtype={s} rank={d} device={d} backend_storage={d} elapsed_us={d}",
+        .{
+            byte_size,
+            @tagName(buffer.element_type),
+            dims.len,
+            device.id,
+            @intFromBool(buffer.hasBackendStorage()),
+            elapsedUs(trace_start_ns),
+        },
+    );
     return null;
 }
 
@@ -934,25 +999,40 @@ fn graphExecuteError(err: runtime.GraphExecuteError) ?*c.PJRT_Error {
 }
 
 fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callconv(.c) ?*c.PJRT_Error {
+    const trace_start_ns = nowNs();
     const executable = executableFromC(args[0].executable);
     if (args[0].num_args == 0 and executable.plan.parameter_shardings.len != 0) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx execute expects arguments for executable parameters");
     if (args[0].num_devices > executable.graph.device_ids.len) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx execute requested more devices than the executable graph contains");
+    var total_outputs: usize = 0;
+    var backend_candidate = executable.graph.backend_executable != null;
     for (0..args[0].num_devices) |device_index| {
         const arguments = allocator.alloc(*runtime.Buffer, args[0].num_args) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable graph argument list");
         defer allocator.free(arguments);
         for (arguments, 0..) |*argument, argument_index| {
             argument.* = bufferFromC(args[0].argument_lists[device_index][argument_index]);
+            backend_candidate = backend_candidate and argument.*.hasBackendStorage();
         }
 
-        const outputs = executable.graph.executeDevice(allocator, executable.client, &executable.plan, device_index, arguments) catch |err| {
+        const outputs = executable.graph.executeDevice(allocator, executable.client, executable.plan, device_index, arguments) catch |err| {
             return graphExecuteError(err);
         };
         defer allocator.free(outputs);
+        total_outputs += outputs.len;
         for (outputs, 0..) |output, output_index| {
             args[0].output_lists[device_index][output_index] = @ptrCast(output);
         }
         if (args[0].device_complete_events) |events| events[device_index] = eventCreateReady();
     }
+    trace(
+        "event=execute devices={d} args={d} outputs={d} backend_candidate={d} elapsed_us={d}",
+        .{
+            args[0].num_devices,
+            args[0].num_args,
+            total_outputs,
+            @intFromBool(backend_candidate),
+            elapsedUs(trace_start_ns),
+        },
+    );
     return null;
 }
 
@@ -1161,7 +1241,7 @@ fn loadedExecutableExecuteLegacy(args: [*c]c.PJRT_LoadedExecutable_Execute_Args)
                         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute unary StableHLO op");
                     },
                 },
-                .convert, .bitcast_convert => runtime.Buffer.initConvert(
+                .convert => runtime.Buffer.initConvert(
                     allocator,
                     value_buffers[plan_instruction.inputs[0].index].?,
                     executable.plan.values[output_id.index].descriptor.element_type,
@@ -1180,6 +1260,10 @@ fn loadedExecutableExecuteLegacy(args: [*c]c.PJRT_LoadedExecutable_Execute_Args)
                         for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute convert StableHLO op");
                     },
+                },
+                .bitcast_convert => {
+                    for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                    return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "bitcast_convert StableHLO execution needs backend dtype reinterpretation support");
                 },
                 .iota => blk: {
                     const descriptor = executable.plan.values[output_id.index].descriptor;
@@ -1422,6 +1506,24 @@ fn loadedExecutableExecuteLegacy(args: [*c]c.PJRT_LoadedExecutable_Execute_Args)
                         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute gather StableHLO op");
                     },
                 },
+                .sort => runtime.Buffer.initSort(allocator, value_buffers[plan_instruction.inputs[0].index].?, plan_instruction.dimension orelse 0, plan_instruction.dims orelse &.{}, plan_instruction.compare_direction orelse .lt, device_index) catch |err| switch (err) {
+                    error.UnsupportedElementType => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "sort StableHLO execution currently supports numeric dense buffers with lt/le/gt/ge comparator direction");
+                    },
+                    error.ShapeMismatch => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "sort StableHLO dimension, comparator, or output shape is invalid");
+                    },
+                    error.UnsupportedRuntimeFeature => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "sort StableHLO execution requires a supported MLX device path");
+                    },
+                    else => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute sort StableHLO op");
+                    },
+                },
                 .compare => runtime.Buffer.initCompare(allocator, value_buffers[plan_instruction.inputs[0].index].?, value_buffers[plan_instruction.inputs[1].index].?, plan_instruction.compare_direction orelse .eq, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
                     error.UnsupportedElementType => {
                         for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
@@ -1617,6 +1719,7 @@ fn bufferDynamicDimensionIndices(args: [*c]c.PJRT_Buffer_DynamicDimensionIndices
 }
 
 fn bufferToHost(args: [*c]c.PJRT_Buffer_ToHostBuffer_Args) callconv(.c) ?*c.PJRT_Error {
+    const trace_start_ns = nowNs();
     const buffer = bufferFromC(args[0].src);
     if (args[0].dst == null) {
         args[0].dst_size = buffer.byte_size;
@@ -1627,6 +1730,17 @@ fn bufferToHost(args: [*c]c.PJRT_Buffer_ToHostBuffer_Args) callconv(.c) ?*c.PJRT
         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to copy buffer to host");
     };
     args[0].event = eventCreateReady();
+    trace(
+        "event=d2h bytes={d} dtype={s} rank={d} device={d} backend_storage={d} elapsed_us={d}",
+        .{
+            buffer.byte_size,
+            @tagName(buffer.element_type),
+            buffer.dims.len,
+            buffer.device_id,
+            @intFromBool(buffer.hasBackendStorage()),
+            elapsedUs(trace_start_ns),
+        },
+    );
     return null;
 }
 

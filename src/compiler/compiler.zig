@@ -336,6 +336,9 @@ fn parseAndRunMlirWithCapi(module_text: []const u8, writer: *std.Io.Writer) Anal
 }
 
 pub const ShardingPlan = core.ShardingPlan;
+pub const Value = core.Value;
+pub const ValueId = core.ValueId;
+pub const ValueRole = core.ValueRole;
 pub const PlanInstructionKind = core.PlanInstructionKind;
 pub const PlanInstruction = core.PlanInstruction;
 pub const ExecutablePlan = core.ExecutablePlan;
@@ -405,8 +408,10 @@ pub fn makeReplicatedPlan(
     errdefer allocator.free(parameter_shardings);
     const output_shardings = try allocator.alloc(ShardingPlan, num_outputs);
     errdefer allocator.free(output_shardings);
-    const ops = try allocator.dupe(PlanInstruction, &.{.{ .kind = .copy_arg0 }});
-    errdefer allocator.free(ops);
+    const values = try makeBootstrapValues(allocator, num_parameters, 1);
+    errdefer allocator.free(values);
+    const instructions = try makeCopyArg0Instructions(allocator, num_parameters);
+    errdefer freeInstructions(allocator, instructions);
 
     var initialized_parameters: usize = 0;
     errdefer for (parameter_shardings[0..initialized_parameters]) |plan| {
@@ -431,9 +436,10 @@ pub fn makeReplicatedPlan(
     return .{
         .allocator = allocator,
         .options = owned_options,
+        .values = values,
         .parameter_shardings = parameter_shardings,
         .output_shardings = output_shardings,
-        .instructions = ops,
+        .instructions = instructions,
     };
 }
 
@@ -490,8 +496,12 @@ pub fn makeExecutablePlan(
     if (options.use_shardy_partitioner) {
         try applyAnalysisShardingMetadataToPlan(allocator, &plan, analysis);
     }
-    allocator.free(plan.instructions);
-    plan.instructions = try lowerAnalysisOpsToPlan(allocator, analysis.ops);
+    freeInstructions(allocator, plan.instructions);
+    plan.instructions = &.{};
+    plan.instructions = try lowerAnalysisOpsToPlan(allocator, analysis.ops, analysis.num_parameters);
+    allocator.free(plan.values);
+    plan.values = &.{};
+    plan.values = try makeBootstrapValues(allocator, analysis.num_parameters, plan.instructions.len);
     return plan;
 }
 
@@ -513,25 +523,86 @@ fn instructionKindFromStablehlo(name: []const u8) PlanInstructionKind {
     return .unsupported;
 }
 
-fn lowerAnalysisOpsToPlan(allocator: std.mem.Allocator, ops: []const Operation) ![]PlanInstruction {
-    if (ops.len == 0) return allocator.dupe(PlanInstruction, &.{.{ .kind = .copy_arg0 }});
+fn makeValue(id: u32, role: ValueRole) Value {
+    return .{
+        .id = .{ .index = id },
+        .role = role,
+        .descriptor = .{
+            .element_type = .invalid,
+            .dims = &.{},
+            .device_id = -1,
+            .memory_id = -1,
+            .shard_index = 0,
+        },
+    };
+}
+
+fn makeBootstrapValues(allocator: std.mem.Allocator, num_parameters: usize, num_instruction_results: usize) ![]Value {
+    const value_count = num_parameters + num_instruction_results;
+    const values = try allocator.alloc(Value, value_count);
+    for (values[0..num_parameters], 0..) |*value, index| {
+        value.* = makeValue(@intCast(index), .parameter);
+    }
+    for (values[num_parameters..], 0..) |*value, index| {
+        value.* = makeValue(@intCast(num_parameters + index), .instruction_result);
+    }
+    return values;
+}
+
+fn instructionInputs(allocator: std.mem.Allocator, kind: PlanInstructionKind, previous_value: ValueId, second_parameter: ?ValueId) ![]const ValueId {
+    return switch (kind) {
+        .copy_arg0, .negate, .exp, .tanh, .sqrt, .rsqrt, .reshape, .transpose, .broadcast_in_dim, .slice => allocator.dupe(ValueId, &.{previous_value}),
+        .add, .subtract, .multiply, .divide, .concatenate => blk: {
+            const rhs = second_parameter orelse previous_value;
+            break :blk allocator.dupe(ValueId, &.{ previous_value, rhs });
+        },
+        .unsupported => &.{},
+    };
+}
+
+fn makeCopyArg0Instructions(allocator: std.mem.Allocator, num_parameters: usize) ![]PlanInstruction {
+    const output: ValueId = .{ .index = @intCast(num_parameters) };
+    const inputs = try allocator.dupe(ValueId, &.{.{ .index = 0 }});
+    errdefer allocator.free(inputs);
+    const outputs = try allocator.dupe(ValueId, &.{output});
+    errdefer allocator.free(outputs);
+    return allocator.dupe(PlanInstruction, &.{.{
+        .kind = .copy_arg0,
+        .inputs = inputs,
+        .outputs = outputs,
+    }});
+}
+
+fn freeInstructions(allocator: std.mem.Allocator, instructions: []PlanInstruction) void {
+    for (instructions) |instruction| {
+        if (instruction.inputs.len != 0) allocator.free(instruction.inputs);
+        if (instruction.outputs.len != 0) allocator.free(instruction.outputs);
+        if (instruction.dims) |dims| allocator.free(dims);
+        if (instruction.permutation) |permutation| allocator.free(permutation);
+        if (instruction.broadcast_dimensions) |broadcast_dimensions| allocator.free(broadcast_dimensions);
+        if (instruction.start_indices) |start_indices| allocator.free(start_indices);
+        if (instruction.limit_indices) |limit_indices| allocator.free(limit_indices);
+        if (instruction.strides) |strides| allocator.free(strides);
+    }
+    allocator.free(instructions);
+}
+
+fn lowerAnalysisOpsToPlan(allocator: std.mem.Allocator, ops: []const Operation, num_parameters: usize) ![]PlanInstruction {
+    if (ops.len == 0) return makeCopyArg0Instructions(allocator, num_parameters);
     const plan_instructions = try allocator.alloc(PlanInstruction, ops.len);
     errdefer {
-        for (plan_instructions) |plan_instruction| {
-            if (plan_instruction.dims) |dims| allocator.free(dims);
-            if (plan_instruction.permutation) |permutation| allocator.free(permutation);
-            if (plan_instruction.broadcast_dimensions) |broadcast_dimensions| allocator.free(broadcast_dimensions);
-            if (plan_instruction.start_indices) |start_indices| allocator.free(start_indices);
-            if (plan_instruction.limit_indices) |limit_indices| allocator.free(limit_indices);
-            if (plan_instruction.strides) |strides| allocator.free(strides);
-        }
-        allocator.free(plan_instructions);
+        freeInstructions(allocator, plan_instructions);
     }
     @memset(plan_instructions, .{ .kind = .unsupported });
-    for (ops, plan_instructions) |op, *plan_instruction| {
+    var previous_value: ValueId = .{ .index = 0 };
+    const second_parameter: ?ValueId = if (num_parameters > 1) .{ .index = 1 } else null;
+    for (ops, plan_instructions, 0..) |op, *plan_instruction, index| {
         const kind = instructionKindFromStablehlo(op.name);
+        const output: ValueId = .{ .index = @intCast(num_parameters + index) };
         plan_instruction.* = .{
             .kind = kind,
+            .inputs = try instructionInputs(allocator, kind, previous_value, second_parameter),
+            .outputs = try allocator.dupe(ValueId, &.{output}),
             .dims = if (kind == .reshape or kind == .transpose or kind == .broadcast_in_dim or kind == .slice or kind == .concatenate) try allocator.dupe(i64, op.dims) else null,
             .permutation = if (kind == .transpose) try allocator.dupe(i64, op.permutation) else null,
             .broadcast_dimensions = if (kind == .broadcast_in_dim) try allocator.dupe(i64, op.broadcast_dimensions) else null,
@@ -540,6 +611,7 @@ fn lowerAnalysisOpsToPlan(allocator: std.mem.Allocator, ops: []const Operation) 
             .strides = if (kind == .slice) try allocator.dupe(i64, op.strides) else null,
             .dimension = if (kind == .concatenate) op.dimension else null,
         };
+        previous_value = output;
     }
     return plan_instructions;
 }
@@ -1142,8 +1214,14 @@ test "replicated executable plan has per-value sharding metadata" {
     try std.testing.expectEqual(@as(usize, 2), plan.parameter_shardings.len);
     try std.testing.expectEqual(ShardingKind.replicated, plan.output_shardings[0].kind);
     try std.testing.expectEqualSlices(i32, &.{ 0, 1, 2, 3 }, plan.output_shardings[0].device_assignment);
+    try std.testing.expectEqual(@as(usize, 3), plan.values.len);
+    try std.testing.expectEqual(ValueRole.parameter, plan.values[0].role);
+    try std.testing.expectEqual(ValueRole.parameter, plan.values[1].role);
+    try std.testing.expectEqual(ValueRole.instruction_result, plan.values[2].role);
     try std.testing.expectEqual(@as(usize, 1), plan.instructions.len);
     try std.testing.expectEqual(PlanInstructionKind.copy_arg0, plan.instructions[0].kind);
+    try std.testing.expectEqual(@as(u32, 0), plan.instructions[0].inputs[0].index);
+    try std.testing.expectEqual(@as(u32, 2), plan.instructions[0].outputs[0].index);
 }
 
 test "executable plan preserves verified shardy parameter and output metadata" {
@@ -1198,6 +1276,16 @@ test "executable plan lowers initial arithmetic StableHLO ops" {
     try std.testing.expectEqual(@as(usize, 2), plan.instructions.len);
     try std.testing.expectEqual(PlanInstructionKind.subtract, plan.instructions[0].kind);
     try std.testing.expectEqual(PlanInstructionKind.negate, plan.instructions[1].kind);
+    try std.testing.expectEqual(@as(usize, 4), plan.values.len);
+    try std.testing.expectEqual(ValueRole.parameter, plan.values[0].role);
+    try std.testing.expectEqual(ValueRole.parameter, plan.values[1].role);
+    try std.testing.expectEqual(ValueRole.instruction_result, plan.values[2].role);
+    try std.testing.expectEqual(ValueRole.instruction_result, plan.values[3].role);
+    try std.testing.expectEqual(@as(u32, 0), plan.instructions[0].inputs[0].index);
+    try std.testing.expectEqual(@as(u32, 1), plan.instructions[0].inputs[1].index);
+    try std.testing.expectEqual(@as(u32, 2), plan.instructions[0].outputs[0].index);
+    try std.testing.expectEqual(@as(u32, 2), plan.instructions[1].inputs[0].index);
+    try std.testing.expectEqual(@as(u32, 3), plan.instructions[1].outputs[0].index);
 }
 
 test "executable plan lowers f32 unary math StableHLO ops" {

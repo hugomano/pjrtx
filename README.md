@@ -32,11 +32,29 @@ The Bazel toolchain is configured to follow ZML's sandboxed macOS path:
 
 ## Architecture
 
-The active architecture plan is tracked in
-[`docs/architecture_refactor_plan.md`](docs/architecture_refactor_plan.md). It
-imports the ZML/v2 bias toward explicit platform ownership, composable memory
-and IO, first-class sharding, pluggable optimized backends, and hermetic runtime
-sandboxes.
+PjRTx follows the ZML/v2 bias toward explicit ownership and composability. A
+PJRT client owns a selected backend, topology, devices, memories, transfer
+paths, compilation results, and executable lifecycle. Backend behavior is never
+hidden in ambient global state.
+
+The architecture imports these ZML/v2 principles:
+
+- Platform ownership is explicit: clients select and own the backend they use
+  for transfer, compile, and execute.
+- Build sandboxing is non-negotiable: runtime packages are stripped to the
+  minimum, vendored hermetically, and built through Bazel with the sandboxed
+  macOS SDK and hermetic LLVM.
+- Memory and IO are composable: pinned, pageable, device, accelerator-local, and
+  interconnect-visible memory classes remain visible in the model, even when a
+  backend like Metal maps most storage to unified memory.
+- Transfers are streams, not incidental copies: ingestion and diagnostics use
+  `std.Io.Reader` and `std.Io.Writer`; future weight loading should compose
+  with DMA/pinned staging and overlapped host-to-device writes.
+- Sharding is first-class: meshes, shardings, placements, and manual shard-local
+  computation are compiler/runtime data, not backend side channels.
+- Optimized libraries are pluggable backends: MLX is the first real backend,
+  but attention kernels, future Neuron-like hardware, CUDA/ROCm, and synthetic
+  tests should all slot behind PjRTx-owned interfaces.
 
 - `src/core`: backend-neutral value types for dtype, shape, layout, sharding,
   device ids, memory ids, topology, buffer descriptors, placements, compile
@@ -59,6 +77,29 @@ sandboxes.
 
 Bazel enforces these boundaries with package dependencies and the
 `//:architecture_boundary_test` smoke test.
+
+### IR Direction
+
+Operations are not modeled as buffers. A StableHLO op is an input program
+operation. A PjRTx instruction is a compiler/runtime scheduling unit. A runtime
+buffer is one possible materialized storage object for a value after placement
+and memory planning.
+
+The compiler contract keeps these concepts separate:
+
+- `Value`: typed logical tensor/token/control value with shape, layout, sharding,
+  memory-space intent, and placement constraints.
+- `Instruction`: computation, transfer, view, async dependency, collective, or
+  backend fragment that consumes and produces `ValueId`s.
+- `ExecutablePlan`: topology, compile options, sharding plans, values,
+  instructions, device assignment, memory plan, and backend legalization data.
+- `Buffer`: runtime storage for a placed value shard, with logical descriptor,
+  placement, opaque backend handle, optional host/debug cache, and readiness.
+
+The bootstrap linear executor still walks instructions over buffers for smoke
+tests, but the contract evolves toward value graphs plus backend legalization so
+other backends can lower to command buffers, graphs, fused kernels, streams,
+DMA copies, or library calls without pretending every op is a buffer allocation.
 
 ## Current Status
 

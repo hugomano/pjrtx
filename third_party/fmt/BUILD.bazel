@@ -1,0 +1,4 @@
+exports_files([
+    "fmt.bazel",
+    "repo.bzl",
+])

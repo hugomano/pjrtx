@@ -1,0 +1,24 @@
+load("@rules_zig//zig:defs.bzl", "zig_shared_library", "zig_test")
+
+zig_shared_library(
+    name = "pjrtx_metal_plugin",
+    main = "plugin.zig",
+    shared_lib_name = "libpjrtx_metal_plugin.dylib",
+    visibility = ["//visibility:public"],
+    zigopts = ["-fno-stack-check"],
+    deps = [
+        "//src/compiler",
+        "//src/runtime",
+        "@xla//xla/pjrt/c:pjrt_c_api_hdrs",
+    ],
+)
+
+zig_test(
+    name = "plugin_test",
+    main = "plugin.zig",
+    deps = [
+        "//src/compiler",
+        "//src/runtime",
+        "@xla//xla/pjrt/c:pjrt_c_api_hdrs",
+    ],
+)

@@ -1,0 +1,230 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+licenses(["notice"])
+
+genrule(
+    name = "metal_jit_includes_cc",
+    srcs = [
+        "mlx/backend/metal/jit/includes.h",
+        "mlx/backend/metal/kernels/utils.h",
+        ":metal_kernel_sources",
+    ],
+    outs = ["pjrtx_metal_jit_includes.cc"],
+    cmd = "$(location @//third_party/mlx:generate_metal_jit_includes.sh) $@ $(location mlx/backend/metal/kernels/utils.h)",
+    tools = ["@//third_party/mlx:generate_metal_jit_includes.sh"],
+)
+
+filegroup(
+    name = "core_public_headers",
+    srcs = glob(
+        [
+            "mlx/*.h",
+            "mlx/3rdparty/**/*.h",
+            "mlx/types/**/*.h",
+        ],
+        exclude = [
+            # mlx/mlx.h pulls in CUDA headers. PjRTx's bootstrap backend imports
+            # the precise MLX headers it uses instead of the all-backends umbrella.
+            "mlx/mlx.h",
+        ],
+    ),
+)
+
+cc_library(
+    name = "core_headers",
+    hdrs = [":core_public_headers"],
+    includes = ["."],
+    copts = ["-std=c++20"],
+    defines = ["MLX_STATIC"],
+)
+
+filegroup(
+    name = "gpu_public_headers",
+    srcs = glob(["mlx/backend/gpu/**/*.h"]),
+)
+
+cc_library(
+    name = "gpu_headers",
+    hdrs = [":gpu_public_headers"],
+    includes = ["."],
+    copts = ["-std=c++20"],
+    defines = ["MLX_STATIC"],
+    deps = [":core_headers"],
+)
+
+filegroup(
+    name = "metal_public_headers",
+    srcs = glob(["mlx/backend/metal/**/*.h"]),
+)
+
+filegroup(
+    name = "runtime_private_headers",
+    srcs = glob(
+        [
+            "mlx/**/*.h",
+        ],
+        exclude = ["mlx/mlx.h"],
+    ),
+)
+
+cc_library(
+    name = "metal_headers",
+    hdrs = [":metal_public_headers"],
+    includes = ["."],
+    copts = ["-std=c++20"],
+    defines = ["MLX_STATIC"],
+    deps = [
+        "@metal_cpp//:metal_cpp",
+        ":core_headers",
+        ":gpu_headers",
+    ],
+)
+
+cc_library(
+    name = "metal_runtime",
+    srcs = [
+        "mlx/array.cpp",
+        "mlx/compile.cpp",
+        "mlx/device.cpp",
+        "mlx/dtype.cpp",
+        "mlx/dtype_utils.cpp",
+        "mlx/einsum.cpp",
+        "mlx/export.cpp",
+        "mlx/fast.cpp",
+        "mlx/fft.cpp",
+        "mlx/graph_utils.cpp",
+        "mlx/linalg.cpp",
+        "mlx/ops.cpp",
+        "mlx/primitives.cpp",
+        "mlx/random.cpp",
+        "mlx/scheduler.cpp",
+        "mlx/stream.cpp",
+        "mlx/transforms.cpp",
+        "mlx/utils.cpp",
+        "mlx/version.cpp",
+        "mlx/backend/common/broadcasting.cpp",
+        "mlx/backend/common/common.cpp",
+        "mlx/backend/common/compiled.cpp",
+        "mlx/backend/common/load.cpp",
+        "mlx/backend/common/reduce.cpp",
+        "mlx/backend/common/slicing.cpp",
+        "mlx/backend/common/utils.cpp",
+        # No CPU backend: these stubs satisfy MLX primitive symbols without
+        # vendoring or linking the CPU implementation.
+        "mlx/backend/no_cpu/compiled.cpp",
+        "mlx/backend/no_cpu/device_info.cpp",
+        "mlx/backend/no_cpu/primitives.cpp",
+        "mlx/backend/cpu/encoder.cpp",
+        "mlx/backend/cpu/eval.cpp",
+        # No CUDA backend.
+        "mlx/backend/cuda/no_cuda.cpp",
+        # GPU shared implementation plus Metal runtime.
+        "mlx/backend/gpu/copy.cpp",
+        "mlx/backend/gpu/primitives.cpp",
+        "mlx/backend/gpu/slicing.cpp",
+        "mlx/backend/metal/allocator.cpp",
+        "mlx/backend/metal/binary.cpp",
+        "mlx/backend/metal/compiled.cpp",
+        "mlx/backend/metal/conv.cpp",
+        "mlx/backend/metal/copy.cpp",
+        "mlx/backend/metal/custom_kernel.cpp",
+        "mlx/backend/metal/device.cpp",
+        "mlx/backend/metal/device_info.cpp",
+        "mlx/backend/metal/distributed.cpp",
+        "mlx/backend/metal/eval.cpp",
+        "mlx/backend/metal/event.cpp",
+        "mlx/backend/metal/fence.cpp",
+        "mlx/backend/metal/fft.cpp",
+        "mlx/backend/metal/hadamard.cpp",
+        "mlx/backend/metal/indexing.cpp",
+        "mlx/backend/metal/jit_kernels.cpp",
+        ":metal_jit_includes_cc",
+        "mlx/backend/metal/logsumexp.cpp",
+        "mlx/backend/metal/matmul.cpp",
+        "mlx/backend/metal/metal.cpp",
+        "mlx/backend/metal/normalization.cpp",
+        "mlx/backend/metal/primitives.cpp",
+        "mlx/backend/metal/quantized.cpp",
+        "mlx/backend/metal/reduce.cpp",
+        "mlx/backend/metal/resident.cpp",
+        "mlx/backend/metal/rope.cpp",
+        "mlx/backend/metal/scaled_dot_product_attention.cpp",
+        "mlx/backend/metal/scan.cpp",
+        "mlx/backend/metal/slicing.cpp",
+        "mlx/backend/metal/softmax.cpp",
+        "mlx/backend/metal/sort.cpp",
+        "mlx/backend/metal/ternary.cpp",
+        "mlx/backend/metal/unary.cpp",
+        "mlx/backend/metal/utils.cpp",
+        # Minimal distributed and IO surfaces, with all optional transport/file
+        # formats compiled as no-op stubs.
+        "mlx/distributed/distributed.cpp",
+        "mlx/distributed/ops.cpp",
+        "mlx/distributed/primitives.cpp",
+        "mlx/distributed/jaccl/no_jaccl.cpp",
+        "mlx/distributed/mpi/no_mpi.cpp",
+        "mlx/distributed/nccl/no_nccl.cpp",
+        "mlx/distributed/ring/no_ring.cpp",
+        "mlx/io/load.cpp",
+        "mlx/io/no_gguf.cpp",
+        "mlx/io/no_safetensors.cpp",
+    ],
+    hdrs = [
+        ":core_public_headers",
+        ":gpu_public_headers",
+        ":metal_public_headers",
+        ":runtime_private_headers",
+    ],
+    includes = ["."],
+    copts = [
+        "-std=c++20",
+        "-Wno-deprecated-declarations",
+    ],
+    defines = [
+        "FMT_HEADER_ONLY=1",
+        "MLX_STATIC=1",
+        "MLX_VERSION=\\\"0.32.0\\\"",
+        "METAL_PATH=\\\"\\\"",
+    ],
+    deps = [
+        "@fmt//:fmt",
+        "@metal_cpp//:metal_cpp",
+    ],
+)
+
+filegroup(
+    name = "metal_runtime_sources",
+    srcs = glob(
+        ["mlx/backend/metal/**/*.cpp"],
+        exclude = [
+            "mlx/backend/metal/no_metal.cpp",
+        ],
+    ),
+)
+
+filegroup(
+    name = "metal_kernel_sources",
+    srcs = glob([
+        "mlx/backend/metal/kernels/**/*.h",
+        "mlx/backend/metal/kernels/**/*.metal",
+    ]),
+)
+
+filegroup(
+    name = "metal_jit_headers",
+    srcs = glob(["mlx/backend/metal/jit/**/*.h"]),
+)
+
+filegroup(
+    name = "metal_vendor_files",
+    srcs = [
+        ":core_public_headers",
+        ":gpu_public_headers",
+        ":metal_public_headers",
+        ":metal_runtime_sources",
+        ":metal_kernel_sources",
+        ":metal_jit_headers",
+    ],
+)

@@ -1,0 +1,49 @@
+# Keep PjRTx close to ZML's local development loop.
+startup         --digest_function=blake3
+
+common          --enable_workspace=false
+common          --lockfile_mode=update
+common          --enable_platform_specific_config
+common          --experimental_repo_remote_exec
+common          --experimental_remote_cache_eviction_retries=5
+
+common          --host_compilation_mode=opt
+common          --@rules_zig//zig/settings:host_mode=release_safe
+common          --@rules_zig//zig/settings:use_cc_common_link=true
+common          --@rules_zig//zig/settings:use_standalone_translate_c=True
+common          --@rules_zig//zig/settings:zigopt=-fllvm
+common          --@llvm//config:experimental_stub_libgcc_s=true
+
+common          --cxxopt='-std=c++17'
+common          --host_cxxopt='-std=c++17'
+common          --compiler=clang
+common          --enable_runfiles
+common          --incompatible_strict_action_env
+common          --@rules_python//python/config_settings:bootstrap_impl=script
+common          --experimental_check_output_files=false
+common          --legacy_external_runfiles=false
+common          --incompatible_autoload_externally=+cc_library,+cc_test,+py_library
+common          --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
+common          --repo_env=BAZEL_NO_APPLE_CPP_TOOLCHAIN=1
+common          --incompatible_enable_proto_toolchain_resolution
+common          --experimental_cc_shared_library
+common          --experimental_cc_static_library
+common          --experimental_starlark_cc_import
+common          --macos_minimum_os=13.0
+common          --@rules_cc//cc/toolchains/args/archiver_flags:use_libtool_on_macos=false
+
+# Fast local XLA iteration. Remove or override this flag to exercise the pinned
+# fallback from third_party/xla/repo.bzl.
+common          --override_repository=xla=/Users/hugo/Developer/xla
+
+build:macos     --sandbox_add_mount_pair=/var/tmp
+build:linux     --sandbox_add_mount_pair=/tmp
+build           --worker_sandboxing
+
+common:debug    --compilation_mode=opt
+common:debug    --@rules_zig//zig/settings:mode=debug
+common:release  --compilation_mode=opt
+common:release  --strip=always
+common:release  --@rules_zig//zig/settings:mode=release_safe
+
+test            --test_output=errors

@@ -1,0 +1,4 @@
+exports_files([
+    "metal_cpp.bazel",
+    "repo.bzl",
+])

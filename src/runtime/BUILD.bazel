@@ -1,0 +1,14 @@
+load("@rules_zig//zig:defs.bzl", "zig_library", "zig_test")
+
+zig_library(
+    name = "runtime",
+    import_name = "src/runtime",
+    main = "runtime.zig",
+    visibility = ["//visibility:public"],
+    deps = ["//src/backend:mlx_metal_api"],
+)
+
+zig_test(
+    name = "runtime_test",
+    deps = [":runtime"],
+)

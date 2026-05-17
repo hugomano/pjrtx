@@ -1,0 +1,5 @@
+exports_files([
+    "generate_metal_jit_includes.sh",
+    "mlx.bazel",
+    "repo.bzl",
+])

@@ -1,0 +1,33 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+cc_library(
+    name = "mlx_metal_api",
+    srcs = ["mlx_metal_api.cc"],
+    hdrs = ["mlx_metal_api.h"],
+    visibility = ["//visibility:public"],
+    copts = ["-std=c++20"],
+    deps = [
+        "@mlx//:metal_runtime",
+    ],
+)
+
+cc_test(
+    name = "mlx_metal_api_test",
+    srcs = ["mlx_metal_api_test.cc"],
+    deps = [":mlx_metal_api"],
+)
+
+cc_library(
+    name = "mlx_vendor_probe",
+    srcs = ["mlx_vendor_probe.cc"],
+    hdrs = ["mlx_vendor_probe.h"],
+    visibility = ["//visibility:public"],
+    copts = ["-std=c++20"],
+    deps = ["@mlx//:metal_runtime"],
+)
+
+cc_test(
+    name = "mlx_vendor_probe_test",
+    srcs = ["mlx_vendor_probe_test.cc"],
+    deps = [":mlx_vendor_probe"],
+)

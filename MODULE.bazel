@@ -1,0 +1,109 @@
+module(
+    name = "pjrtx",
+)
+
+bazel_dep(name = "abseil-cpp", version = "20250814.1", repo_name = "com_google_absl")
+bazel_dep(name = "aspect_rules_py", version = "1.8.4")
+bazel_dep(name = "bazel_lib", version = "3.2.2")
+bazel_dep(name = "bazel_skylib", version = "1.9.0")
+bazel_dep(name = "llvm", version = "0.7.3")
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "protobuf", version = "33.6", repo_name = "com_google_protobuf")
+bazel_dep(name = "rules_cc", version = "0.2.18")
+bazel_dep(name = "rules_license", version = "1.0.0")
+bazel_dep(name = "rules_proto", version = "7.1.0")
+bazel_dep(name = "rules_python", version = "1.9.0")
+bazel_dep(name = "rules_shell", version = "0.6.1")
+bazel_dep(name = "rules_zig", version = "0.12.2")
+
+single_version_override(
+    module_name = "protobuf",
+    version = "33.6",
+)
+
+git_override(
+    module_name = "rules_zig",
+    commit = "6e9d876037ecb01ce4354c9c9e0c93e026e84e37",
+    remote = "https://github.com/zml/rules_zig.git",
+)
+
+zig = use_extension("@rules_zig//zig:extensions.bzl", "zig")
+zig.index(file = "//bazel:zig_index.json")
+zig.toolchain(zig_version = "0.16.0")
+zig.mirrors(urls = [
+    "https://mirror.zml.ai/zig",
+    "https://pkg.machengine.org/zig",
+    "https://zigmirror.hryx.net/zig",
+    "https://zig.linus.dev/zig",
+    "https://zig.squirl.dev",
+    "https://zig.florent.dev",
+    "https://zig.mirror.mschae23.de/zig",
+    "https://zigmirror.meox.dev",
+    "https://ziglang.freetls.fastly.net",
+    "https://ziglang.org/builds/",
+])
+use_repo(zig, "zig_toolchains")
+
+register_toolchains("@rules_zig//zig/target:all")
+register_toolchains("@zig_toolchains//:all")
+register_toolchains("//:translate_c_toolchain")
+register_toolchains("@llvm//toolchain:all")
+
+non_module_deps = use_extension("//third_party:non_module_deps.bzl", "non_module_deps")
+use_repo(non_module_deps, "arocc", "fmt", "metal_cpp", "mlx", "translate-c", "xla")
+
+xla = use_extension("//third_party/xla:xla.bzl", "xla")
+use_repo(
+    xla,
+    "com_github_grpc_grpc",
+    "eigen_archive",
+    "farmhash_archive",
+    "farmhash_gpu_archive",
+    "highwayhash",
+    "hwloc",
+    "local_config_cuda",
+    "local_config_remote_execution",
+    "local_config_rocm",
+    "local_config_sycl",
+    "local_config_tensorrt",
+    "llvm-raw",
+    "ml_dtypes_py",
+    "python_version_repo",
+    "rules_ml_toolchain",
+    "shardy",
+    "snappy",
+    "stablehlo",
+    "sycl_configure",
+    "sycl_configure_ext",
+    "triton",
+    "tsl",
+)
+
+llvm = use_extension("//third_party/xla:llvm.bzl", "llvm")
+llvm.configure()
+use_repo(llvm, "llvm-project")
+
+osx = use_extension("@llvm//extensions:osx.bzl", "osx")
+osx.from_archive(
+    sha256 = "edc7ce9b8f09e0c7a39aaa714f941b4c2597f333ec1ffe59a14d67eb36cdb7e7",
+    strip_prefix = "Payload/Library/Developer/CommandLineTools/SDKs/MacOSX26.4.sdk",
+    type = "pkg",
+    urls = [
+        "https://swcdn.apple.com/content/downloads/60/13/122-35686-A_30JUXWIJFR/ck0gzuw5qccefzm3ptlwou3pu6a55d0o02/CLTools_macOSNMOS_SDK.pkg",
+        "https://web.archive.org/web/20260430051604/https://swcdn.apple.com/content/downloads/60/13/122-35686-A_30JUXWIJFR/ck0gzuw5qccefzm3ptlwou3pu6a55d0o02/CLTools_macOSNMOS_SDK.pkg",
+    ],
+)
+osx.frameworks(names = [
+    "CoreFoundation",
+    "CoreImage",
+    "CoreVideo",
+    "Foundation",
+    "IOSurface",
+    "Kernel",
+    "Metal",
+    "OSLog",
+    "QuartzCore",
+    "Security",
+    "SystemConfiguration",
+])
+use_repo(osx, "macos_sdk")

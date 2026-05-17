@@ -1,0 +1,25 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+licenses(["notice"])
+
+cc_library(
+    name = "metal_cpp",
+    hdrs = glob([
+        "Foundation/**/*.hpp",
+        "Metal/**/*.hpp",
+        "QuartzCore/**/*.hpp",
+    ]),
+    includes = ["."],
+    linkopts = [
+        "-framework",
+        "Foundation",
+        "-framework",
+        "IOSurface",
+        "-framework",
+        "Metal",
+        "-framework",
+        "QuartzCore",
+    ],
+)

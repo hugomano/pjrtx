@@ -414,10 +414,25 @@ fn pjrtClientCompile(args: [*c]c.PJRT_Client_Compile_Args) callconv(.c) ?*c.PJRT
         };
     }
 
-    const plan = if (analysis) |owned_analysis|
+    var plan = if (analysis) |owned_analysis|
         compiler.makeExecutablePlan(allocator, options, owned_analysis) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable plan")
     else
-        compiler.makeReplicatedPlan(allocator, options, 0, 1) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable plan");
+        compiler.makeReplicatedPlan(allocator, options, 1, 1) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable plan");
+    errdefer plan.deinit();
+
+    var plan_diagnostics = std.Io.Writer.Allocating.init(allocator);
+    defer plan_diagnostics.deinit();
+    compiler.verifyExecutablePlan(allocator, plan, &plan_diagnostics.writer) catch |err| {
+        const message = plan_diagnostics.writer.buffered();
+        const fallback = "invalid executable plan";
+        const text = if (message.len == 0) fallback else message;
+        const code: c.PJRT_Error_Code = @intCast(switch (err) {
+            error.InvalidExecutablePlan => c.PJRT_Error_Code_INVALID_ARGUMENT,
+            else => c.PJRT_Error_Code_INTERNAL,
+        });
+        return makeError(code, text);
+    };
+
     const executable = allocator.create(Executable) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable");
     executable.* = .{ .client = client, .plan = plan };
     args[0].executable = @ptrCast(executable);

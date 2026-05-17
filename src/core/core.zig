@@ -217,6 +217,9 @@ pub const ExecutablePlan = struct {
             if (instruction.limit_indices) |limit_indices| self.allocator.free(limit_indices);
             if (instruction.strides) |strides| self.allocator.free(strides);
         }
+        for (self.values) |value| {
+            if (value.descriptor.dims.len != 0) self.allocator.free(value.descriptor.dims);
+        }
         if (self.values.len != 0) self.allocator.free(self.values);
         self.allocator.free(self.parameter_shardings);
         self.allocator.free(self.output_shardings);

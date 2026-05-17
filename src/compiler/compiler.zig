@@ -77,6 +77,7 @@ pub const ModuleAnalysis = struct {
     source: []u8,
     dialects: []Dialect,
     ops: []Operation,
+    parameter_descriptors: []core.BufferDescriptor,
     num_parameters: usize,
     num_outputs: usize,
     parameter_shardings: []ShardingMetadata,
@@ -85,9 +86,11 @@ pub const ModuleAnalysis = struct {
     pub fn deinit(self: *ModuleAnalysis) void {
         for (self.output_shardings) |sharding| sharding.deinit(self.allocator);
         for (self.parameter_shardings) |sharding| sharding.deinit(self.allocator);
+        for (self.parameter_descriptors) |descriptor| self.allocator.free(descriptor.dims);
         for (self.ops) |op| op.deinit(self.allocator);
         self.allocator.free(self.output_shardings);
         self.allocator.free(self.parameter_shardings);
+        self.allocator.free(self.parameter_descriptors);
         self.allocator.free(self.ops);
         self.allocator.free(self.dialects);
         self.allocator.free(self.source);
@@ -342,6 +345,10 @@ pub const ValueRole = core.ValueRole;
 pub const PlanInstructionKind = core.PlanInstructionKind;
 pub const PlanInstruction = core.PlanInstruction;
 pub const ExecutablePlan = core.ExecutablePlan;
+pub const VerifyError = std.Io.Writer.Error || error{
+    InvalidExecutablePlan,
+    OutOfMemory,
+};
 
 pub fn parseTextCompileOptionsFromReader(allocator: std.mem.Allocator, reader: *std.Io.Reader) !CompileOptions {
     const text = try reader.allocRemaining(allocator, .limited(64 * 1024));
@@ -408,8 +415,15 @@ pub fn makeReplicatedPlan(
     errdefer allocator.free(parameter_shardings);
     const output_shardings = try allocator.alloc(ShardingPlan, num_outputs);
     errdefer allocator.free(output_shardings);
-    const values = try makeBootstrapValues(allocator, num_parameters, 1);
-    errdefer allocator.free(values);
+
+    const parameter_descriptors = try allocator.alloc(core.BufferDescriptor, num_parameters);
+    defer allocator.free(parameter_descriptors);
+    @memset(parameter_descriptors, makeDescriptor(&.{}, .invalid));
+    const values = try makeBootstrapValues(allocator, parameter_descriptors, &.{}, 1);
+    errdefer {
+        for (values) |value| allocator.free(value.descriptor.dims);
+        allocator.free(values);
+    }
     const instructions = try makeCopyArg0Instructions(allocator, num_parameters);
     errdefer freeInstructions(allocator, instructions);
 
@@ -501,7 +515,7 @@ pub fn makeExecutablePlan(
     plan.instructions = try lowerAnalysisOpsToPlan(allocator, analysis.ops, analysis.num_parameters);
     allocator.free(plan.values);
     plan.values = &.{};
-    plan.values = try makeBootstrapValues(allocator, analysis.num_parameters, plan.instructions.len);
+    plan.values = try makeBootstrapValues(allocator, analysis.parameter_descriptors, analysis.ops, plan.instructions.len);
     return plan;
 }
 
@@ -523,28 +537,79 @@ fn instructionKindFromStablehlo(name: []const u8) PlanInstructionKind {
     return .unsupported;
 }
 
-fn makeValue(id: u32, role: ValueRole) Value {
+fn bufferTypeFromDtype(dtype: []const u8) core.BufferType {
+    if (std.mem.eql(u8, dtype, "pred")) return .pred;
+    if (std.mem.eql(u8, dtype, "i8") or std.mem.eql(u8, dtype, "s8")) return .s8;
+    if (std.mem.eql(u8, dtype, "i16") or std.mem.eql(u8, dtype, "s16")) return .s16;
+    if (std.mem.eql(u8, dtype, "i32") or std.mem.eql(u8, dtype, "s32")) return .s32;
+    if (std.mem.eql(u8, dtype, "i64") or std.mem.eql(u8, dtype, "s64")) return .s64;
+    if (std.mem.eql(u8, dtype, "u8")) return .u8;
+    if (std.mem.eql(u8, dtype, "u16")) return .u16;
+    if (std.mem.eql(u8, dtype, "u32")) return .u32;
+    if (std.mem.eql(u8, dtype, "u64")) return .u64;
+    if (std.mem.eql(u8, dtype, "f16")) return .f16;
+    if (std.mem.eql(u8, dtype, "f32")) return .f32;
+    if (std.mem.eql(u8, dtype, "f64")) return .f64;
+    if (std.mem.eql(u8, dtype, "bf16")) return .bf16;
+    return .invalid;
+}
+
+fn makeDescriptor(dims: []const i64, element_type: core.BufferType) core.BufferDescriptor {
     return .{
-        .id = .{ .index = id },
-        .role = role,
-        .descriptor = .{
-            .element_type = .invalid,
-            .dims = &.{},
-            .device_id = -1,
-            .memory_id = -1,
-            .shard_index = 0,
-        },
+        .element_type = element_type,
+        .dims = dims,
+        .device_id = -1,
+        .memory_id = -1,
+        .shard_index = 0,
     };
 }
 
-fn makeBootstrapValues(allocator: std.mem.Allocator, num_parameters: usize, num_instruction_results: usize) ![]Value {
+fn descriptorFromOperation(allocator: std.mem.Allocator, op: Operation) !core.BufferDescriptor {
+    return makeDescriptor(try allocator.dupe(i64, op.dims), bufferTypeFromDtype(op.dtype));
+}
+
+fn descriptorFromType(allocator: std.mem.Allocator, ty: mlir.MlirType) !core.BufferDescriptor {
+    if (mlir.mlirTypeIsNull(ty)) return makeDescriptor(try allocator.dupe(i64, &.{}), .invalid);
+    const dtype = try typeDtype(allocator, ty);
+    defer allocator.free(dtype);
+    return makeDescriptor(try typeDims(allocator, ty), bufferTypeFromDtype(dtype));
+}
+
+fn makeValue(id: u32, role: ValueRole, descriptor: core.BufferDescriptor) Value {
+    return .{
+        .id = .{ .index = id },
+        .role = role,
+        .descriptor = descriptor,
+    };
+}
+
+fn makeUnknownDescriptor(allocator: std.mem.Allocator) !core.BufferDescriptor {
+    return makeDescriptor(try allocator.dupe(i64, &.{}), .invalid);
+}
+
+fn makeBootstrapValues(
+    allocator: std.mem.Allocator,
+    parameter_descriptors: []const core.BufferDescriptor,
+    ops: []const Operation,
+    num_instruction_results: usize,
+) ![]Value {
+    const num_parameters = parameter_descriptors.len;
     const value_count = num_parameters + num_instruction_results;
     const values = try allocator.alloc(Value, value_count);
+    var initialized: usize = 0;
+    errdefer {
+        for (values[0..initialized]) |value| allocator.free(value.descriptor.dims);
+        allocator.free(values);
+    }
     for (values[0..num_parameters], 0..) |*value, index| {
-        value.* = makeValue(@intCast(index), .parameter);
+        const descriptor = parameter_descriptors[index];
+        value.* = makeValue(@intCast(index), .parameter, makeDescriptor(try allocator.dupe(i64, descriptor.dims), descriptor.element_type));
+        initialized += 1;
     }
     for (values[num_parameters..], 0..) |*value, index| {
-        value.* = makeValue(@intCast(num_parameters + index), .instruction_result);
+        const descriptor = if (index < ops.len) try descriptorFromOperation(allocator, ops[index]) else try makeUnknownDescriptor(allocator);
+        value.* = makeValue(@intCast(num_parameters + index), .instruction_result, descriptor);
+        initialized += 1;
     }
     return values;
 }
@@ -587,6 +652,45 @@ fn freeInstructions(allocator: std.mem.Allocator, instructions: []PlanInstructio
     allocator.free(instructions);
 }
 
+fn makePlanInstruction(
+    allocator: std.mem.Allocator,
+    op: Operation,
+    kind: PlanInstructionKind,
+    previous_value: ValueId,
+    second_parameter: ?ValueId,
+    output: ValueId,
+) !PlanInstruction {
+    const inputs = try instructionInputs(allocator, kind, previous_value, second_parameter);
+    errdefer if (inputs.len != 0) allocator.free(inputs);
+    const outputs = try allocator.dupe(ValueId, &.{output});
+    errdefer allocator.free(outputs);
+    const dims = if (kind == .reshape or kind == .transpose or kind == .broadcast_in_dim or kind == .slice or kind == .concatenate) try allocator.dupe(i64, op.dims) else null;
+    errdefer if (dims) |owned| allocator.free(owned);
+    const permutation = if (kind == .transpose) try allocator.dupe(i64, op.permutation) else null;
+    errdefer if (permutation) |owned| allocator.free(owned);
+    const broadcast_dimensions = if (kind == .broadcast_in_dim) try allocator.dupe(i64, op.broadcast_dimensions) else null;
+    errdefer if (broadcast_dimensions) |owned| allocator.free(owned);
+    const start_indices = if (kind == .slice) try allocator.dupe(i64, op.start_indices) else null;
+    errdefer if (start_indices) |owned| allocator.free(owned);
+    const limit_indices = if (kind == .slice) try allocator.dupe(i64, op.limit_indices) else null;
+    errdefer if (limit_indices) |owned| allocator.free(owned);
+    const strides = if (kind == .slice) try allocator.dupe(i64, op.strides) else null;
+    errdefer if (strides) |owned| allocator.free(owned);
+
+    return .{
+        .kind = kind,
+        .inputs = inputs,
+        .outputs = outputs,
+        .dims = dims,
+        .permutation = permutation,
+        .broadcast_dimensions = broadcast_dimensions,
+        .start_indices = start_indices,
+        .limit_indices = limit_indices,
+        .strides = strides,
+        .dimension = if (kind == .concatenate) op.dimension else null,
+    };
+}
+
 fn lowerAnalysisOpsToPlan(allocator: std.mem.Allocator, ops: []const Operation, num_parameters: usize) ![]PlanInstruction {
     if (ops.len == 0) return makeCopyArg0Instructions(allocator, num_parameters);
     const plan_instructions = try allocator.alloc(PlanInstruction, ops.len);
@@ -599,21 +703,208 @@ fn lowerAnalysisOpsToPlan(allocator: std.mem.Allocator, ops: []const Operation, 
     for (ops, plan_instructions, 0..) |op, *plan_instruction, index| {
         const kind = instructionKindFromStablehlo(op.name);
         const output: ValueId = .{ .index = @intCast(num_parameters + index) };
-        plan_instruction.* = .{
-            .kind = kind,
-            .inputs = try instructionInputs(allocator, kind, previous_value, second_parameter),
-            .outputs = try allocator.dupe(ValueId, &.{output}),
-            .dims = if (kind == .reshape or kind == .transpose or kind == .broadcast_in_dim or kind == .slice or kind == .concatenate) try allocator.dupe(i64, op.dims) else null,
-            .permutation = if (kind == .transpose) try allocator.dupe(i64, op.permutation) else null,
-            .broadcast_dimensions = if (kind == .broadcast_in_dim) try allocator.dupe(i64, op.broadcast_dimensions) else null,
-            .start_indices = if (kind == .slice) try allocator.dupe(i64, op.start_indices) else null,
-            .limit_indices = if (kind == .slice) try allocator.dupe(i64, op.limit_indices) else null,
-            .strides = if (kind == .slice) try allocator.dupe(i64, op.strides) else null,
-            .dimension = if (kind == .concatenate) op.dimension else null,
-        };
+        plan_instruction.* = try makePlanInstruction(allocator, op, kind, previous_value, second_parameter, output);
         previous_value = output;
     }
     return plan_instructions;
+}
+
+fn expectedInputCount(kind: PlanInstructionKind) ?usize {
+    return switch (kind) {
+        .copy_arg0, .negate, .exp, .tanh, .sqrt, .rsqrt, .reshape, .transpose, .broadcast_in_dim, .slice => 1,
+        .add, .subtract, .multiply, .divide, .concatenate => 2,
+        .unsupported => null,
+    };
+}
+
+fn failPlanVerification(
+    writer: *std.Io.Writer,
+    pass_name: []const u8,
+    instruction_index: ?usize,
+    value_id: ?ValueId,
+    detail: []const u8,
+    feature: []const u8,
+) VerifyError {
+    try writer.print("invalid executable plan: pass={s}", .{pass_name});
+    if (instruction_index) |index| try writer.print(" instruction={d}", .{index});
+    if (value_id) |id| try writer.print(" value={d}", .{id.index});
+    try writer.print(" detail=\"{s}\" feature={s}", .{ detail, feature });
+    return error.InvalidExecutablePlan;
+}
+
+fn valueInPlan(plan: ExecutablePlan, id: ValueId) bool {
+    const index: usize = id.index;
+    return index < plan.values.len and plan.values[index].id.index == id.index;
+}
+
+fn descriptorKnown(descriptor: core.BufferDescriptor) bool {
+    return descriptor.element_type != .invalid;
+}
+
+fn sameShape(lhs: core.BufferDescriptor, rhs: core.BufferDescriptor) bool {
+    return std.mem.eql(i64, lhs.dims, rhs.dims);
+}
+
+fn sameTypeAndShape(lhs: core.BufferDescriptor, rhs: core.BufferDescriptor) bool {
+    if (!descriptorKnown(lhs) or !descriptorKnown(rhs)) return true;
+    return lhs.element_type == rhs.element_type and sameShape(lhs, rhs);
+}
+
+fn instructionOutputDims(instruction: PlanInstruction) ?[]const i64 {
+    return switch (instruction.kind) {
+        .reshape, .transpose, .broadcast_in_dim, .slice, .concatenate => instruction.dims,
+        else => null,
+    };
+}
+
+fn verifyInstructionDescriptors(
+    plan: ExecutablePlan,
+    instruction: PlanInstruction,
+    instruction_index: usize,
+    writer: *std.Io.Writer,
+) VerifyError!void {
+    const pass_name = "pjrtx-plan-verify";
+    const output = plan.values[instruction.outputs[0].index].descriptor;
+    for (instruction.inputs) |input_id| {
+        const input = plan.values[input_id.index].descriptor;
+        if (!descriptorKnown(input) or !descriptorKnown(output)) continue;
+        if (input.layout != .dense_row_major or output.layout != .dense_row_major) {
+            return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "bootstrap plan supports dense row-major layouts only", "layout");
+        }
+        for (input.dims) |dim| {
+            if (dim < 0) return failPlanVerification(writer, pass_name, instruction_index, input_id, "input shape contains dynamic dimensions", "shape");
+        }
+        for (output.dims) |dim| {
+            if (dim < 0) return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "output shape contains dynamic dimensions", "shape");
+        }
+    }
+
+    switch (instruction.kind) {
+        .copy_arg0, .negate, .exp, .tanh, .sqrt, .rsqrt => {
+            if (!sameTypeAndShape(plan.values[instruction.inputs[0].index].descriptor, output)) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "unary instruction must preserve input dtype and shape", "shape-type");
+            }
+        },
+        .add, .subtract, .multiply, .divide => {
+            const lhs = plan.values[instruction.inputs[0].index].descriptor;
+            const rhs = plan.values[instruction.inputs[1].index].descriptor;
+            if (!sameTypeAndShape(lhs, rhs)) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.inputs[1], "binary inputs must have matching dtype and shape", "shape-type");
+            }
+            if (!sameTypeAndShape(lhs, output)) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "binary output must match input dtype and shape", "shape-type");
+            }
+        },
+        .reshape => {
+            const input = plan.values[instruction.inputs[0].index].descriptor;
+            if (descriptorKnown(input) and descriptorKnown(output) and input.element_type != output.element_type) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "reshape must preserve dtype", "shape-type");
+            }
+            if (descriptorKnown(input) and descriptorKnown(output) and core.denseByteSize(input.element_type, input.dims) != core.denseByteSize(output.element_type, output.dims)) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "reshape must preserve dense byte size", "shape-type");
+            }
+        },
+        .transpose, .broadcast_in_dim, .slice => {
+            const input = plan.values[instruction.inputs[0].index].descriptor;
+            if (descriptorKnown(input) and descriptorKnown(output) and input.element_type != output.element_type) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "view instruction must preserve dtype", "shape-type");
+            }
+        },
+        .concatenate => {
+            const lhs = plan.values[instruction.inputs[0].index].descriptor;
+            const rhs = plan.values[instruction.inputs[1].index].descriptor;
+            if (descriptorKnown(lhs) and descriptorKnown(rhs) and lhs.element_type != rhs.element_type) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.inputs[1], "concatenate inputs must have matching dtype", "shape-type");
+            }
+            if (descriptorKnown(lhs) and descriptorKnown(output) and lhs.element_type != output.element_type) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "concatenate output must match input dtype", "shape-type");
+            }
+        },
+        .unsupported => {},
+    }
+
+    if (instructionOutputDims(instruction)) |dims| {
+        if (descriptorKnown(output) and !std.mem.eql(i64, output.dims, dims)) {
+            return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "instruction shape metadata must match output value descriptor", "shape");
+        }
+    }
+}
+
+pub fn verifyExecutablePlan(
+    allocator: std.mem.Allocator,
+    plan: ExecutablePlan,
+    writer: *std.Io.Writer,
+) VerifyError!void {
+    const pass_name = "pjrtx-plan-verify";
+    if (plan.options.num_replicas < 1 or plan.options.num_partitions < 1) {
+        return failPlanVerification(writer, pass_name, null, null, "replicas and partitions must be positive", "topology");
+    }
+    if (plan.options.device_assignment.len < plan.options.numDevices()) {
+        return failPlanVerification(writer, pass_name, null, null, "device assignment is smaller than replicas * partitions", "topology");
+    }
+    if (plan.values.len == 0) {
+        return failPlanVerification(writer, pass_name, null, null, "plan must define at least one value", "value-graph");
+    }
+
+    var defined = try allocator.alloc(bool, plan.values.len);
+    defer allocator.free(defined);
+    @memset(defined, false);
+
+    var parameter_count: usize = 0;
+    for (plan.values, 0..) |value, index| {
+        if (value.id.index != index) {
+            return failPlanVerification(writer, pass_name, null, value.id, "value id must match value table index", "value-graph");
+        }
+        switch (value.role) {
+            .parameter => {
+                parameter_count += 1;
+                defined[index] = true;
+            },
+            .constant => defined[index] = true,
+            .instruction_result, .output => {},
+        }
+    }
+
+    if (plan.parameter_shardings.len != parameter_count) {
+        return failPlanVerification(writer, pass_name, null, null, "parameter sharding count must match parameter value count", "sharding");
+    }
+    if (plan.instructions.len == 0) {
+        return failPlanVerification(writer, pass_name, null, null, "plan must contain at least one instruction", "instruction-graph");
+    }
+
+    for (plan.instructions, 0..) |instruction, instruction_index| {
+        const expected_inputs = expectedInputCount(instruction.kind) orelse {
+            return failPlanVerification(writer, pass_name, instruction_index, null, "unsupported instruction cannot enter executable plan", "instruction-kind");
+        };
+        if (instruction.inputs.len != expected_inputs) {
+            return failPlanVerification(writer, pass_name, instruction_index, null, "instruction input arity mismatch", "instruction-arity");
+        }
+        if (instruction.outputs.len != 1) {
+            return failPlanVerification(writer, pass_name, instruction_index, null, "bootstrap instructions must produce one value", "instruction-arity");
+        }
+        for (instruction.inputs) |input| {
+            if (!valueInPlan(plan, input)) {
+                return failPlanVerification(writer, pass_name, instruction_index, input, "instruction input references an unknown value", "value-graph");
+            }
+            if (!defined[input.index]) {
+                return failPlanVerification(writer, pass_name, instruction_index, input, "instruction input must be defined before use", "value-graph");
+            }
+        }
+        for (instruction.outputs) |output| {
+            if (!valueInPlan(plan, output)) {
+                return failPlanVerification(writer, pass_name, instruction_index, output, "instruction output references an unknown value", "value-graph");
+            }
+            if (defined[output.index]) {
+                return failPlanVerification(writer, pass_name, instruction_index, output, "instruction output value is already defined", "value-graph");
+            }
+            const role = plan.values[output.index].role;
+            if (role != .instruction_result and role != .output) {
+                return failPlanVerification(writer, pass_name, instruction_index, output, "instruction output must target an instruction-result or output value", "value-role");
+            }
+            defined[output.index] = true;
+        }
+        try verifyInstructionDescriptors(plan, instruction, instruction_index, writer);
+    }
 }
 
 fn addDialect(list: *std.ArrayList(Dialect), allocator: std.mem.Allocator, dialect: Dialect) !void {
@@ -852,6 +1143,7 @@ const CapiAnalysisBuilder = struct {
     diagnostic_writer: *std.Io.Writer,
     dialects: std.ArrayList(Dialect) = .empty,
     ops: std.ArrayList(Operation) = .empty,
+    parameter_descriptors: std.ArrayList(core.BufferDescriptor) = .empty,
     parameter_shardings: std.ArrayList(ShardingMetadata) = .empty,
     output_shardings: std.ArrayList(ShardingMetadata) = .empty,
     num_parameters: usize = 0,
@@ -866,9 +1158,11 @@ const CapiAnalysisBuilder = struct {
     fn deinitPartial(self: *CapiAnalysisBuilder) void {
         for (self.output_shardings.items) |sharding| sharding.deinit(self.allocator);
         for (self.parameter_shardings.items) |sharding| sharding.deinit(self.allocator);
+        for (self.parameter_descriptors.items) |descriptor| self.allocator.free(descriptor.dims);
         for (self.ops.items) |op| op.deinit(self.allocator);
         self.output_shardings.deinit(self.allocator);
         self.parameter_shardings.deinit(self.allocator);
+        self.parameter_descriptors.deinit(self.allocator);
         self.ops.deinit(self.allocator);
         self.dialects.deinit(self.allocator);
     }
@@ -882,6 +1176,17 @@ const CapiAnalysisBuilder = struct {
     fn replaceMetadata(self: *CapiAnalysisBuilder, list: *std.ArrayList(ShardingMetadata), index: usize, metadata: ShardingMetadata) void {
         list.items[index].deinit(self.allocator);
         list.items[index] = metadata;
+    }
+
+    fn ensureParameterDescriptors(self: *CapiAnalysisBuilder, count: usize) !void {
+        while (self.parameter_descriptors.items.len < count) {
+            try self.parameter_descriptors.append(self.allocator, try makeUnknownDescriptor(self.allocator));
+        }
+    }
+
+    fn replaceParameterDescriptor(self: *CapiAnalysisBuilder, index: usize, descriptor: core.BufferDescriptor) void {
+        self.allocator.free(self.parameter_descriptors.items[index].dims);
+        self.parameter_descriptors.items[index] = descriptor;
     }
 };
 
@@ -1029,8 +1334,31 @@ fn analyzeFunctionFromCapi(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation
 
     builder.num_parameters = @max(builder.num_parameters, num_inputs);
     builder.num_outputs = @max(builder.num_outputs, num_results);
+    try builder.ensureParameterDescriptors(builder.num_parameters);
     try builder.ensureShardings(&builder.parameter_shardings, builder.num_parameters);
     try builder.ensureShardings(&builder.output_shardings, builder.num_outputs);
+
+    const function_type_attr_for_params = getOperationAttribute(op, "function_type");
+    if (!mlir.mlirAttributeIsNull(function_type_attr_for_params) and mlir.mlirAttributeIsAType(function_type_attr_for_params)) {
+        const function_type = mlir.mlirTypeAttrGetValue(function_type_attr_for_params);
+        if (mlir.mlirTypeIsAFunction(function_type)) {
+            const typed_inputs = @min(num_inputs, @as(usize, @intCast(mlir.mlirFunctionTypeGetNumInputs(function_type))));
+            var input_index: usize = 0;
+            while (input_index < typed_inputs) : (input_index += 1) {
+                builder.replaceParameterDescriptor(input_index, try descriptorFromType(builder.allocator, mlir.mlirFunctionTypeGetInput(function_type, @intCast(input_index))));
+            }
+        }
+    }
+    if (mlir.mlirOperationGetNumRegions(op) > 0) {
+        const entry = mlir.mlirRegionGetFirstBlock(mlir.mlirOperationGetRegion(op, 0));
+        if (!mlir.mlirBlockIsNull(entry)) {
+            const block_args = @min(num_inputs, @as(usize, @intCast(mlir.mlirBlockGetNumArguments(entry))));
+            var arg_index_for_type: usize = 0;
+            while (arg_index_for_type < block_args) : (arg_index_for_type += 1) {
+                builder.replaceParameterDescriptor(arg_index_for_type, try descriptorFromType(builder.allocator, mlir.mlirValueGetType(mlir.mlirBlockGetArgument(entry, @intCast(arg_index_for_type)))));
+            }
+        }
+    }
 
     const arg_attrs = getOperationAttribute(op, "arg_attrs");
     var arg_index: usize = 0;
@@ -1162,6 +1490,7 @@ fn analyzeMlirSessionWithCapi(
         .source = source,
         .dialects = try builder.dialects.toOwnedSlice(allocator),
         .ops = try builder.ops.toOwnedSlice(allocator),
+        .parameter_descriptors = try builder.parameter_descriptors.toOwnedSlice(allocator),
         .num_parameters = builder.num_parameters,
         .num_outputs = builder.num_outputs,
         .parameter_shardings = try builder.parameter_shardings.toOwnedSlice(allocator),
@@ -1222,6 +1551,63 @@ test "replicated executable plan has per-value sharding metadata" {
     try std.testing.expectEqual(PlanInstructionKind.copy_arg0, plan.instructions[0].kind);
     try std.testing.expectEqual(@as(u32, 0), plan.instructions[0].inputs[0].index);
     try std.testing.expectEqual(@as(u32, 2), plan.instructions[0].outputs[0].index);
+
+    var diagnostics = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer diagnostics.deinit();
+    try verifyExecutablePlan(std.testing.allocator, plan, &diagnostics.writer);
+}
+
+test "executable plan values carry parameter and result descriptors" {
+    const module_text =
+        \\module {
+        \\  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+        \\    %0 = stablehlo.tanh %arg0 : tensor<4xf32>
+        \\    return %0 : tensor<4xf32>
+        \\  }
+        \\}
+    ;
+    var reader: std.Io.Reader = .fixed(module_text);
+    var diagnostics = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    var analysis = try analyzeProgramFromReader(std.testing.allocator, "mlir", &reader, &diagnostics.writer);
+    defer analysis.deinit();
+
+    var plan = try makeExecutablePlan(std.testing.allocator, .{}, analysis);
+    defer plan.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), plan.values.len);
+    try std.testing.expectEqual(core.BufferType.f32, plan.values[0].descriptor.element_type);
+    try std.testing.expectEqual(core.BufferType.f32, plan.values[1].descriptor.element_type);
+    try std.testing.expectEqualSlices(i64, &.{4}, plan.values[0].descriptor.dims);
+    try std.testing.expectEqualSlices(i64, &.{4}, plan.values[1].descriptor.dims);
+}
+
+test "executable plan verifier rejects unknown value references with diagnostics" {
+    var plan = try makeReplicatedPlan(std.testing.allocator, .{}, 1, 1);
+    defer plan.deinit();
+    std.testing.allocator.free(plan.instructions[0].inputs);
+    plan.instructions[0].inputs = try std.testing.allocator.dupe(ValueId, &.{.{ .index = 99 }});
+
+    var diagnostics = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer diagnostics.deinit();
+    try std.testing.expectError(error.InvalidExecutablePlan, verifyExecutablePlan(std.testing.allocator, plan, &diagnostics.writer));
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.writer.buffered(), "pass=pjrtx-plan-verify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.writer.buffered(), "instruction input references an unknown value") != null);
+}
+
+test "executable plan verifier rejects shape type mismatch with diagnostics" {
+    var plan = try makeReplicatedPlan(std.testing.allocator, .{}, 1, 1);
+    defer plan.deinit();
+    plan.values[0].descriptor.element_type = .f32;
+    plan.values[0].descriptor.dims = try std.testing.allocator.dupe(i64, &.{4});
+    plan.values[1].descriptor.element_type = .f32;
+    plan.values[1].descriptor.dims = try std.testing.allocator.dupe(i64, &.{2});
+
+    var diagnostics = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer diagnostics.deinit();
+    try std.testing.expectError(error.InvalidExecutablePlan, verifyExecutablePlan(std.testing.allocator, plan, &diagnostics.writer));
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.writer.buffered(), "feature=shape-type") != null);
 }
 
 test "executable plan preserves verified shardy parameter and output metadata" {
@@ -1286,6 +1672,10 @@ test "executable plan lowers initial arithmetic StableHLO ops" {
     try std.testing.expectEqual(@as(u32, 2), plan.instructions[0].outputs[0].index);
     try std.testing.expectEqual(@as(u32, 2), plan.instructions[1].inputs[0].index);
     try std.testing.expectEqual(@as(u32, 3), plan.instructions[1].outputs[0].index);
+
+    var verify_diagnostics = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer verify_diagnostics.deinit();
+    try verifyExecutablePlan(std.testing.allocator, plan, &verify_diagnostics.writer);
 }
 
 test "executable plan lowers f32 unary math StableHLO ops" {

@@ -75,12 +75,14 @@ fn cloneBuffer(_: backend.Backend, src: backend.BufferHandle) backend.Error!?bac
 }
 
 fn binary(_: backend.Backend, lhs: backend.BufferHandle, rhs: backend.BufferHandle, op: core.ElementwiseBinaryOp) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_binary(@ptrCast(@alignCast(lhs)), @ptrCast(@alignCast(rhs)), mlxBinaryOpCode(op)) orelse return error.CommandSubmissionFailed;
+    const op_code = mlxBinaryOpCode(op) orelse return error.CommandSubmissionFailed;
+    const handle = c.pjrtx_mlx_metal_buffer_binary(@ptrCast(@alignCast(lhs)), @ptrCast(@alignCast(rhs)), op_code) orelse return error.CommandSubmissionFailed;
     return @ptrCast(handle);
 }
 
 fn unary(_: backend.Backend, src: backend.BufferHandle, op: core.ElementwiseUnaryOp) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_unary(@ptrCast(@alignCast(src)), mlxUnaryOpCode(op)) orelse return error.CommandSubmissionFailed;
+    const op_code = mlxUnaryOpCode(op) orelse return error.CommandSubmissionFailed;
+    const handle = c.pjrtx_mlx_metal_buffer_unary(@ptrCast(@alignCast(src)), op_code) orelse return error.CommandSubmissionFailed;
     return @ptrCast(handle);
 }
 
@@ -169,22 +171,24 @@ fn mlxDtype(element_type: core.BufferType) ?c_int {
     };
 }
 
-fn mlxBinaryOpCode(op: core.ElementwiseBinaryOp) c_int {
+fn mlxBinaryOpCode(op: core.ElementwiseBinaryOp) ?c_int {
     return switch (op) {
         .add => c.PJRTX_MLX_METAL_U8_BINARY_ADD,
         .subtract => c.PJRTX_MLX_METAL_U8_BINARY_SUBTRACT,
         .multiply => c.PJRTX_MLX_METAL_U8_BINARY_MULTIPLY,
         .divide => c.PJRTX_MLX_METAL_U8_BINARY_DIVIDE,
+        else => null,
     };
 }
 
-fn mlxUnaryOpCode(op: core.ElementwiseUnaryOp) c_int {
+fn mlxUnaryOpCode(op: core.ElementwiseUnaryOp) ?c_int {
     return switch (op) {
         .negate => c.PJRTX_MLX_METAL_U8_UNARY_NEGATE,
         .exp => c.PJRTX_MLX_METAL_UNARY_EXP,
         .tanh => c.PJRTX_MLX_METAL_UNARY_TANH,
         .sqrt => c.PJRTX_MLX_METAL_UNARY_SQRT,
         .rsqrt => c.PJRTX_MLX_METAL_UNARY_RSQRT,
+        else => null,
     };
 }
 

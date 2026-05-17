@@ -55,7 +55,19 @@ pub const Operation = struct {
     start_indices: []const i64 = &.{},
     limit_indices: []const i64 = &.{},
     strides: []const i64 = &.{},
+    slice_sizes: []const i64 = &.{},
+    edge_padding_low: []const i64 = &.{},
+    edge_padding_high: []const i64 = &.{},
+    interior_padding: []const i64 = &.{},
+    offset_dims: []const i64 = &.{},
+    collapsed_slice_dims: []const i64 = &.{},
+    operand_batching_dims: []const i64 = &.{},
+    start_indices_batching_dims: []const i64 = &.{},
+    start_index_map: []const i64 = &.{},
+    index_vector_dim: ?i64 = null,
     dimension: ?i64 = null,
+    iota_dimension: ?i64 = null,
+    dimensions: []const i64 = &.{},
     reduce_dimensions: []const i64 = &.{},
     lhs_batch_dimensions: []const i64 = &.{},
     rhs_batch_dimensions: []const i64 = &.{},
@@ -76,6 +88,16 @@ pub const Operation = struct {
         allocator.free(self.start_indices);
         allocator.free(self.limit_indices);
         allocator.free(self.strides);
+        allocator.free(self.slice_sizes);
+        allocator.free(self.edge_padding_low);
+        allocator.free(self.edge_padding_high);
+        allocator.free(self.interior_padding);
+        allocator.free(self.offset_dims);
+        allocator.free(self.collapsed_slice_dims);
+        allocator.free(self.operand_batching_dims);
+        allocator.free(self.start_indices_batching_dims);
+        allocator.free(self.start_index_map);
+        allocator.free(self.dimensions);
         allocator.free(self.reduce_dimensions);
         allocator.free(self.lhs_batch_dimensions);
         allocator.free(self.rhs_batch_dimensions);
@@ -594,21 +616,58 @@ fn instructionKindFromStablehlo(name: []const u8) PlanInstructionKind {
     if (std.mem.eql(u8, name, "subtract")) return .subtract;
     if (std.mem.eql(u8, name, "multiply")) return .multiply;
     if (std.mem.eql(u8, name, "divide")) return .divide;
+    if (std.mem.eql(u8, name, "maximum")) return .maximum;
+    if (std.mem.eql(u8, name, "minimum")) return .minimum;
+    if (std.mem.eql(u8, name, "power")) return .power;
+    if (std.mem.eql(u8, name, "atan2")) return .atan2;
+    if (std.mem.eql(u8, name, "remainder")) return .remainder;
+    if (std.mem.eql(u8, name, "and")) return .and_;
+    if (std.mem.eql(u8, name, "or")) return .or_;
+    if (std.mem.eql(u8, name, "xor")) return .xor;
+    if (std.mem.eql(u8, name, "shift_left")) return .shift_left;
+    if (std.mem.eql(u8, name, "shift_right_arithmetic")) return .shift_right_arithmetic;
+    if (std.mem.eql(u8, name, "shift_right_logical")) return .shift_right_logical;
     if (std.mem.eql(u8, name, "negate")) return .negate;
     if (std.mem.eql(u8, name, "exponential")) return .exp;
+    if (std.mem.eql(u8, name, "exponential_minus_one")) return .expm1;
     if (std.mem.eql(u8, name, "tanh")) return .tanh;
     if (std.mem.eql(u8, name, "sqrt")) return .sqrt;
     if (std.mem.eql(u8, name, "rsqrt")) return .rsqrt;
+    if (std.mem.eql(u8, name, "abs")) return .abs;
+    if (std.mem.eql(u8, name, "cbrt")) return .cbrt;
+    if (std.mem.eql(u8, name, "ceil")) return .ceil;
+    if (std.mem.eql(u8, name, "floor")) return .floor;
+    if (std.mem.eql(u8, name, "log")) return .log;
+    if (std.mem.eql(u8, name, "log_plus_one")) return .log1p;
+    if (std.mem.eql(u8, name, "logistic")) return .logistic;
+    if (std.mem.eql(u8, name, "sine")) return .sine;
+    if (std.mem.eql(u8, name, "cosine")) return .cosine;
+    if (std.mem.eql(u8, name, "not")) return .not_;
+    if (std.mem.eql(u8, name, "sign")) return .sign;
+    if (std.mem.eql(u8, name, "is_finite")) return .is_finite;
+    if (std.mem.eql(u8, name, "round_nearest_afz")) return .round_nearest_afz;
+    if (std.mem.eql(u8, name, "round_nearest_even")) return .round_nearest_even;
+    if (std.mem.eql(u8, name, "popcnt")) return .popcnt;
+    if (std.mem.eql(u8, name, "count_leading_zeros")) return .count_leading_zeros;
+    if (std.mem.eql(u8, name, "convert")) return .convert;
+    if (std.mem.eql(u8, name, "bitcast_convert")) return .bitcast_convert;
     if (std.mem.eql(u8, name, "reshape")) return .reshape;
     if (std.mem.eql(u8, name, "transpose")) return .transpose;
     if (std.mem.eql(u8, name, "broadcast_in_dim")) return .broadcast_in_dim;
     if (std.mem.eql(u8, name, "slice")) return .slice;
+    if (std.mem.eql(u8, name, "dynamic_slice")) return .dynamic_slice;
+    if (std.mem.eql(u8, name, "dynamic_update_slice")) return .dynamic_update_slice;
+    if (std.mem.eql(u8, name, "pad")) return .pad;
+    if (std.mem.eql(u8, name, "reverse")) return .reverse;
     if (std.mem.eql(u8, name, "concatenate")) return .concatenate;
+    if (std.mem.eql(u8, name, "iota")) return .iota;
+    if (std.mem.eql(u8, name, "gather")) return .gather;
     if (std.mem.eql(u8, name, "dot_general")) return .dot_general;
     if (std.mem.eql(u8, name, "reduce_sum")) return .reduce_sum;
     if (std.mem.eql(u8, name, "reduce_max")) return .reduce_max;
     if (std.mem.eql(u8, name, "compare")) return .compare;
     if (std.mem.eql(u8, name, "select")) return .select;
+    if (std.mem.eql(u8, name, "clamp")) return .clamp;
     return .unsupported;
 }
 
@@ -648,6 +707,72 @@ fn descriptorFromType(allocator: std.mem.Allocator, ty: mlir.MlirType) !core.Buf
     const dtype = try typeDtype(allocator, ty);
     defer allocator.free(dtype);
     return makeDescriptor(try typeDims(allocator, ty), bufferTypeFromDtype(dtype));
+}
+
+fn isUnaryKind(kind: PlanInstructionKind) bool {
+    return switch (kind) {
+        .copy_arg0,
+        .negate,
+        .exp,
+        .expm1,
+        .tanh,
+        .sqrt,
+        .rsqrt,
+        .abs,
+        .cbrt,
+        .ceil,
+        .floor,
+        .log,
+        .log1p,
+        .logistic,
+        .sine,
+        .cosine,
+        .not_,
+        .sign,
+        .is_finite,
+        .round_nearest_afz,
+        .round_nearest_even,
+        .popcnt,
+        .count_leading_zeros,
+        .convert,
+        .bitcast_convert,
+        .reshape,
+        .transpose,
+        .broadcast_in_dim,
+        .slice,
+        .reverse,
+        .reduce_sum,
+        .reduce_max,
+        => true,
+        else => false,
+    };
+}
+
+fn isBinaryKind(kind: PlanInstructionKind) bool {
+    return switch (kind) {
+        .add,
+        .subtract,
+        .multiply,
+        .divide,
+        .maximum,
+        .minimum,
+        .power,
+        .atan2,
+        .remainder,
+        .and_,
+        .or_,
+        .xor,
+        .shift_left,
+        .shift_right_arithmetic,
+        .shift_right_logical,
+        .concatenate,
+        .dot_general,
+        .compare,
+        .gather,
+        .pad,
+        => true,
+        else => false,
+    };
 }
 
 fn makeValue(id: u32, role: ValueRole, descriptor: core.BufferDescriptor) Value {
@@ -713,11 +838,14 @@ fn instructionInputs(allocator: std.mem.Allocator, kind: PlanInstructionKind, op
     }
     if (op.inputs.len != 0 or kind == .constant) return allocator.dupe(ValueId, op.inputs);
     return switch (kind) {
-        .copy_arg0, .negate, .exp, .tanh, .sqrt, .rsqrt, .reshape, .transpose, .broadcast_in_dim, .slice, .reduce_sum, .reduce_max => allocator.dupe(ValueId, &.{.{ .index = 0 }}),
-        .add, .subtract, .multiply, .divide, .concatenate, .dot_general, .compare => allocator.dupe(ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
-        .select => allocator.dupe(ValueId, &.{ .{ .index = 0 }, .{ .index = 1 }, .{ .index = 2 } }),
-        .constant => &.{},
-        .unsupported => &.{},
+        .constant, .iota => &.{},
+        .select, .clamp => allocator.dupe(ValueId, &.{ .{ .index = 0 }, .{ .index = 1 }, .{ .index = 2 } }),
+        else => if (isUnaryKind(kind))
+            allocator.dupe(ValueId, &.{.{ .index = 0 }})
+        else if (isBinaryKind(kind))
+            allocator.dupe(ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } })
+        else
+            &.{},
     };
 }
 
@@ -744,6 +872,16 @@ fn freeInstructions(allocator: std.mem.Allocator, instructions: []PlanInstructio
         if (instruction.start_indices) |start_indices| allocator.free(start_indices);
         if (instruction.limit_indices) |limit_indices| allocator.free(limit_indices);
         if (instruction.strides) |strides| allocator.free(strides);
+        if (instruction.slice_sizes) |slice_sizes| allocator.free(slice_sizes);
+        if (instruction.edge_padding_low) |padding| allocator.free(padding);
+        if (instruction.edge_padding_high) |padding| allocator.free(padding);
+        if (instruction.interior_padding) |padding| allocator.free(padding);
+        if (instruction.offset_dims) |dims| allocator.free(dims);
+        if (instruction.collapsed_slice_dims) |dims| allocator.free(dims);
+        if (instruction.operand_batching_dims) |dims| allocator.free(dims);
+        if (instruction.start_indices_batching_dims) |dims| allocator.free(dims);
+        if (instruction.start_index_map) |dims| allocator.free(dims);
+        if (instruction.dimensions) |dimensions| allocator.free(dimensions);
         if (instruction.reduce_dimensions) |reduce_dimensions| allocator.free(reduce_dimensions);
         if (instruction.lhs_batch_dimensions) |dims| allocator.free(dims);
         if (instruction.rhs_batch_dimensions) |dims| allocator.free(dims);
@@ -763,7 +901,7 @@ fn makePlanInstruction(
     errdefer if (inputs.len != 0) allocator.free(inputs);
     const outputs = try allocator.dupe(ValueId, op.outputs);
     errdefer allocator.free(outputs);
-    const dims = if (kind == .reshape or kind == .transpose or kind == .broadcast_in_dim or kind == .slice or kind == .concatenate or kind == .dot_general or kind == .reduce_sum or kind == .reduce_max or kind == .compare or kind == .select) try allocator.dupe(i64, op.dims) else null;
+    const dims = if (kind != .constant and kind != .unsupported) try allocator.dupe(i64, op.dims) else null;
     errdefer if (dims) |owned| allocator.free(owned);
     const permutation = if (kind == .transpose) try allocator.dupe(i64, op.permutation) else null;
     errdefer if (permutation) |owned| allocator.free(owned);
@@ -775,6 +913,26 @@ fn makePlanInstruction(
     errdefer if (limit_indices) |owned| allocator.free(owned);
     const strides = if (kind == .slice) try allocator.dupe(i64, op.strides) else null;
     errdefer if (strides) |owned| allocator.free(owned);
+    const slice_sizes = if (kind == .dynamic_slice or kind == .gather) try allocator.dupe(i64, op.slice_sizes) else null;
+    errdefer if (slice_sizes) |owned| allocator.free(owned);
+    const edge_padding_low = if (kind == .pad) try allocator.dupe(i64, op.edge_padding_low) else null;
+    errdefer if (edge_padding_low) |owned| allocator.free(owned);
+    const edge_padding_high = if (kind == .pad) try allocator.dupe(i64, op.edge_padding_high) else null;
+    errdefer if (edge_padding_high) |owned| allocator.free(owned);
+    const interior_padding = if (kind == .pad) try allocator.dupe(i64, op.interior_padding) else null;
+    errdefer if (interior_padding) |owned| allocator.free(owned);
+    const offset_dims = if (kind == .gather) try allocator.dupe(i64, op.offset_dims) else null;
+    errdefer if (offset_dims) |owned| allocator.free(owned);
+    const collapsed_slice_dims = if (kind == .gather) try allocator.dupe(i64, op.collapsed_slice_dims) else null;
+    errdefer if (collapsed_slice_dims) |owned| allocator.free(owned);
+    const operand_batching_dims = if (kind == .gather) try allocator.dupe(i64, op.operand_batching_dims) else null;
+    errdefer if (operand_batching_dims) |owned| allocator.free(owned);
+    const start_indices_batching_dims = if (kind == .gather) try allocator.dupe(i64, op.start_indices_batching_dims) else null;
+    errdefer if (start_indices_batching_dims) |owned| allocator.free(owned);
+    const start_index_map = if (kind == .gather) try allocator.dupe(i64, op.start_index_map) else null;
+    errdefer if (start_index_map) |owned| allocator.free(owned);
+    const dimensions = if (kind == .reverse) try allocator.dupe(i64, op.dimensions) else null;
+    errdefer if (dimensions) |owned| allocator.free(owned);
     const reduce_dimensions = if (kind == .reduce_sum or kind == .reduce_max) try allocator.dupe(i64, op.reduce_dimensions) else null;
     errdefer if (reduce_dimensions) |owned| allocator.free(owned);
     const lhs_batch_dimensions = if (kind == .dot_general) try allocator.dupe(i64, op.lhs_batch_dimensions) else null;
@@ -798,7 +956,19 @@ fn makePlanInstruction(
         .start_indices = start_indices,
         .limit_indices = limit_indices,
         .strides = strides,
+        .slice_sizes = slice_sizes,
+        .edge_padding_low = edge_padding_low,
+        .edge_padding_high = edge_padding_high,
+        .interior_padding = interior_padding,
+        .offset_dims = offset_dims,
+        .collapsed_slice_dims = collapsed_slice_dims,
+        .operand_batching_dims = operand_batching_dims,
+        .start_indices_batching_dims = start_indices_batching_dims,
+        .start_index_map = start_index_map,
+        .index_vector_dim = if (kind == .gather) op.index_vector_dim else null,
         .dimension = if (kind == .concatenate) op.dimension else null,
+        .iota_dimension = if (kind == .iota) op.iota_dimension else null,
+        .dimensions = dimensions,
         .reduce_dimensions = reduce_dimensions,
         .lhs_batch_dimensions = lhs_batch_dimensions,
         .rhs_batch_dimensions = rhs_batch_dimensions,
@@ -826,11 +996,11 @@ fn lowerAnalysisOpsToPlan(allocator: std.mem.Allocator, ops: []const Operation, 
 
 fn expectedInputCount(kind: PlanInstructionKind) ?usize {
     return switch (kind) {
-        .constant => 0,
-        .copy_arg0, .negate, .exp, .tanh, .sqrt, .rsqrt, .reshape, .transpose, .broadcast_in_dim, .slice, .reduce_sum, .reduce_max => 1,
-        .add, .subtract, .multiply, .divide, .concatenate, .dot_general, .compare => 2,
-        .select => 3,
+        .constant, .iota => 0,
+        .dynamic_slice, .dynamic_update_slice, .concatenate => null,
+        .select, .clamp => 3,
         .unsupported => null,
+        else => if (isUnaryKind(kind)) 1 else if (isBinaryKind(kind)) 2 else null,
     };
 }
 
@@ -869,8 +1039,8 @@ fn sameTypeAndShape(lhs: core.BufferDescriptor, rhs: core.BufferDescriptor) bool
 
 fn instructionOutputDims(instruction: PlanInstruction) ?[]const i64 {
     return switch (instruction.kind) {
-        .reshape, .transpose, .broadcast_in_dim, .slice, .concatenate, .dot_general, .reduce_sum, .reduce_max, .compare, .select => instruction.dims,
-        else => null,
+        .constant, .copy_arg0, .unsupported => null,
+        else => instruction.dims,
     };
 }
 
@@ -902,12 +1072,33 @@ fn verifyInstructionDescriptors(
                 return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "constant instruction must carry literal bytes", "constant");
             }
         },
-        .copy_arg0, .negate, .exp, .tanh, .sqrt, .rsqrt => {
+        .copy_arg0, .negate, .exp, .expm1, .tanh, .sqrt, .rsqrt, .abs, .cbrt, .ceil, .floor, .log, .log1p, .logistic, .sine, .cosine, .not_, .sign, .round_nearest_afz, .round_nearest_even, .popcnt, .count_leading_zeros => {
             if (!sameTypeAndShape(plan.values[instruction.inputs[0].index].descriptor, output)) {
                 return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "unary instruction must preserve input dtype and shape", "shape-type");
             }
         },
-        .add, .subtract, .multiply, .divide => {
+        .is_finite => {
+            const input = plan.values[instruction.inputs[0].index].descriptor;
+            if (descriptorKnown(input) and descriptorKnown(output) and !sameShape(input, output)) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "is_finite output must preserve input shape", "shape-type");
+            }
+            if (descriptorKnown(output) and output.element_type != .pred) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "is_finite output must be pred", "shape-type");
+            }
+        },
+        .convert => {
+            const input = plan.values[instruction.inputs[0].index].descriptor;
+            if (descriptorKnown(input) and descriptorKnown(output) and !sameShape(input, output)) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "convert output must preserve input shape", "shape-type");
+            }
+        },
+        .bitcast_convert => {
+            const input = plan.values[instruction.inputs[0].index].descriptor;
+            if (descriptorKnown(input) and descriptorKnown(output) and core.denseByteSize(input.element_type, input.dims) != core.denseByteSize(output.element_type, output.dims)) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "bitcast_convert must preserve dense byte size", "shape-type");
+            }
+        },
+        .add, .subtract, .multiply, .divide, .maximum, .minimum, .power, .atan2, .remainder, .and_, .or_, .xor, .shift_left, .shift_right_arithmetic, .shift_right_logical => {
             const lhs = plan.values[instruction.inputs[0].index].descriptor;
             const rhs = plan.values[instruction.inputs[1].index].descriptor;
             if (!sameTypeAndShape(lhs, rhs)) {
@@ -926,7 +1117,7 @@ fn verifyInstructionDescriptors(
                 return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "reshape must preserve dense byte size", "shape-type");
             }
         },
-        .transpose, .broadcast_in_dim, .slice => {
+        .transpose, .broadcast_in_dim, .slice, .dynamic_slice, .dynamic_update_slice, .pad, .reverse, .gather => {
             const input = plan.values[instruction.inputs[0].index].descriptor;
             if (descriptorKnown(input) and descriptorKnown(output) and input.element_type != output.element_type) {
                 return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "view instruction must preserve dtype", "shape-type");
@@ -976,6 +1167,21 @@ fn verifyInstructionDescriptors(
                 return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "select data inputs and output must match", "shape-type");
             }
         },
+        .clamp => {
+            const min = plan.values[instruction.inputs[0].index].descriptor;
+            const value = plan.values[instruction.inputs[1].index].descriptor;
+            const max = plan.values[instruction.inputs[2].index].descriptor;
+            if (descriptorKnown(min) and descriptorKnown(value) and min.element_type != value.element_type) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.inputs[0], "clamp min and operand dtypes must match", "shape-type");
+            }
+            if (descriptorKnown(max) and descriptorKnown(value) and max.element_type != value.element_type) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.inputs[2], "clamp max and operand dtypes must match", "shape-type");
+            }
+            if (!sameTypeAndShape(value, output)) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "clamp output must match operand", "shape-type");
+            }
+        },
+        .iota => {},
         .unsupported => {},
     }
 
@@ -1029,12 +1235,12 @@ pub fn verifyExecutablePlan(
     }
 
     for (plan.instructions, 0..) |instruction, instruction_index| {
-        const expected_inputs = expectedInputCount(instruction.kind) orelse {
+        if (instruction.kind == .unsupported) {
             return failPlanVerification(writer, pass_name, instruction_index, null, "unsupported instruction cannot enter executable plan", "instruction-kind");
-        };
-        if (instruction.inputs.len != expected_inputs) {
-            return failPlanVerification(writer, pass_name, instruction_index, null, "instruction input arity mismatch", "instruction-arity");
         }
+        if (expectedInputCount(instruction.kind)) |expected_inputs| if (instruction.inputs.len != expected_inputs) {
+            return failPlanVerification(writer, pass_name, instruction_index, null, "instruction input arity mismatch", "instruction-arity");
+        };
         if (instruction.outputs.len != 1) {
             return failPlanVerification(writer, pass_name, instruction_index, null, "bootstrap instructions must produce one value", "instruction-arity");
         }
@@ -1086,18 +1292,55 @@ fn stablehloOpSupported(name: []const u8) bool {
         "subtract",
         "multiply",
         "divide",
+        "maximum",
+        "minimum",
+        "power",
+        "atan2",
+        "remainder",
+        "and",
+        "or",
+        "xor",
+        "shift_left",
+        "shift_right_arithmetic",
+        "shift_right_logical",
         "negate",
+        "abs",
+        "cbrt",
+        "ceil",
         "exponential",
+        "exponential_minus_one",
+        "floor",
+        "log",
+        "log_plus_one",
+        "logistic",
+        "sine",
+        "cosine",
+        "not",
+        "sign",
+        "is_finite",
+        "round_nearest_afz",
+        "round_nearest_even",
+        "popcnt",
+        "count_leading_zeros",
         "tanh",
         "sqrt",
         "rsqrt",
+        "convert",
+        "bitcast_convert",
         "compare",
         "select",
+        "clamp",
         "reshape",
         "broadcast_in_dim",
         "transpose",
         "slice",
+        "dynamic_slice",
+        "dynamic_update_slice",
+        "pad",
+        "reverse",
         "concatenate",
+        "iota",
+        "gather",
         "reduce",
         "dot_general",
     };
@@ -1472,6 +1715,40 @@ fn stablehloDotDims(allocator: std.mem.Allocator, attr: mlir.MlirAttribute, comp
     return values;
 }
 
+fn stablehloGatherDims(allocator: std.mem.Allocator, attr: mlir.MlirAttribute, comptime which: []const u8) ![]const i64 {
+    if (mlir.mlirAttributeIsNull(attr) or !mlir.stablehloAttributeIsAGatherDimensionNumbers(attr)) return allocator.dupe(i64, &.{});
+    const count = if (std.mem.eql(u8, which, "offset"))
+        mlir.stablehloGatherDimensionNumbersGetOffsetDimsSize(attr)
+    else if (std.mem.eql(u8, which, "collapsed"))
+        mlir.stablehloGatherDimensionNumbersGetCollapsedSliceDimsSize(attr)
+    else if (std.mem.eql(u8, which, "operand_batching"))
+        mlir.stablehloGatherDimensionNumbersGetOperandBatchingDimsSize(attr)
+    else if (std.mem.eql(u8, which, "start_indices_batching"))
+        mlir.stablehloGatherDimensionNumbersGetStartIndicesBatchingDimsSize(attr)
+    else
+        mlir.stablehloGatherDimensionNumbersGetStartIndexMapSize(attr);
+    const values = try allocator.alloc(i64, @intCast(count));
+    var index: isize = 0;
+    while (index < count) : (index += 1) {
+        values[@intCast(index)] = if (std.mem.eql(u8, which, "offset"))
+            mlir.stablehloGatherDimensionNumbersGetOffsetDimsElem(attr, index)
+        else if (std.mem.eql(u8, which, "collapsed"))
+            mlir.stablehloGatherDimensionNumbersGetCollapsedSliceDimsElem(attr, index)
+        else if (std.mem.eql(u8, which, "operand_batching"))
+            mlir.stablehloGatherDimensionNumbersGetOperandBatchingDimsElem(attr, index)
+        else if (std.mem.eql(u8, which, "start_indices_batching"))
+            mlir.stablehloGatherDimensionNumbersGetStartIndicesBatchingDimsElem(attr, index)
+        else
+            mlir.stablehloGatherDimensionNumbersGetStartIndexMapElem(attr, index);
+    }
+    return values;
+}
+
+fn stablehloGatherIndexVectorDim(attr: mlir.MlirAttribute) ?i64 {
+    if (mlir.mlirAttributeIsNull(attr) or !mlir.stablehloAttributeIsAGatherDimensionNumbers(attr)) return null;
+    return mlir.stablehloGatherDimensionNumbersGetIndexVectorDim(attr);
+}
+
 fn compareDirectionFromAttr(attr: mlir.MlirAttribute) ?core.CompareOp {
     if (mlir.mlirAttributeIsNull(attr) or !mlir.stablehloAttributeIsAComparisonDirectionAttr(attr)) return null;
     const text = mlirStringSlice(mlir.stablehloComparisonDirectionAttrGetValue(attr));
@@ -1545,10 +1822,61 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
         try builder.allocator.dupe(i64, &.{});
     var owns_strides = true;
     errdefer if (owns_strides) builder.allocator.free(strides);
+    const slice_sizes = if (std.mem.eql(u8, short_name, "dynamic_slice") or std.mem.eql(u8, short_name, "gather"))
+        try intListAttribute(builder.allocator, getOperationAttribute(op, "slice_sizes"))
+    else
+        try builder.allocator.dupe(i64, &.{});
+    var owns_slice_sizes = true;
+    errdefer if (owns_slice_sizes) builder.allocator.free(slice_sizes);
+    const edge_padding_low = if (std.mem.eql(u8, short_name, "pad"))
+        try intListAttribute(builder.allocator, getOperationAttribute(op, "edge_padding_low"))
+    else
+        try builder.allocator.dupe(i64, &.{});
+    var owns_edge_padding_low = true;
+    errdefer if (owns_edge_padding_low) builder.allocator.free(edge_padding_low);
+    const edge_padding_high = if (std.mem.eql(u8, short_name, "pad"))
+        try intListAttribute(builder.allocator, getOperationAttribute(op, "edge_padding_high"))
+    else
+        try builder.allocator.dupe(i64, &.{});
+    var owns_edge_padding_high = true;
+    errdefer if (owns_edge_padding_high) builder.allocator.free(edge_padding_high);
+    const interior_padding = if (std.mem.eql(u8, short_name, "pad"))
+        try intListAttribute(builder.allocator, getOperationAttribute(op, "interior_padding"))
+    else
+        try builder.allocator.dupe(i64, &.{});
+    var owns_interior_padding = true;
+    errdefer if (owns_interior_padding) builder.allocator.free(interior_padding);
+    const gather_dimensions = getOperationAttribute(op, "dimension_numbers");
+    const offset_dims = if (std.mem.eql(u8, short_name, "gather")) try stablehloGatherDims(builder.allocator, gather_dimensions, "offset") else try builder.allocator.dupe(i64, &.{});
+    var owns_offset_dims = true;
+    errdefer if (owns_offset_dims) builder.allocator.free(offset_dims);
+    const collapsed_slice_dims = if (std.mem.eql(u8, short_name, "gather")) try stablehloGatherDims(builder.allocator, gather_dimensions, "collapsed") else try builder.allocator.dupe(i64, &.{});
+    var owns_collapsed_slice_dims = true;
+    errdefer if (owns_collapsed_slice_dims) builder.allocator.free(collapsed_slice_dims);
+    const operand_batching_dims = if (std.mem.eql(u8, short_name, "gather")) try stablehloGatherDims(builder.allocator, gather_dimensions, "operand_batching") else try builder.allocator.dupe(i64, &.{});
+    var owns_operand_batching_dims = true;
+    errdefer if (owns_operand_batching_dims) builder.allocator.free(operand_batching_dims);
+    const start_indices_batching_dims = if (std.mem.eql(u8, short_name, "gather")) try stablehloGatherDims(builder.allocator, gather_dimensions, "start_indices_batching") else try builder.allocator.dupe(i64, &.{});
+    var owns_start_indices_batching_dims = true;
+    errdefer if (owns_start_indices_batching_dims) builder.allocator.free(start_indices_batching_dims);
+    const start_index_map = if (std.mem.eql(u8, short_name, "gather")) try stablehloGatherDims(builder.allocator, gather_dimensions, "start_index_map") else try builder.allocator.dupe(i64, &.{});
+    var owns_start_index_map = true;
+    errdefer if (owns_start_index_map) builder.allocator.free(start_index_map);
+    const index_vector_dim = if (std.mem.eql(u8, short_name, "gather")) stablehloGatherIndexVectorDim(gather_dimensions) else null;
     const dimension = if (std.mem.eql(u8, short_name, "concatenate"))
         intAttribute(getOperationAttribute(op, "dimension"))
     else
         null;
+    const iota_dimension = if (std.mem.eql(u8, short_name, "iota"))
+        intAttribute(getOperationAttribute(op, "iota_dimension"))
+    else
+        null;
+    const dimensions = if (std.mem.eql(u8, short_name, "reverse"))
+        try intListAttribute(builder.allocator, getOperationAttribute(op, "dimensions"))
+    else
+        try builder.allocator.dupe(i64, &.{});
+    var owns_dimensions = true;
+    errdefer if (owns_dimensions) builder.allocator.free(dimensions);
     const reduce_dimensions = if (std.mem.startsWith(u8, short_name, "reduce_"))
         try intListAttribute(builder.allocator, getOperationAttribute(op, "dimensions"))
     else
@@ -1605,7 +1933,19 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
         .start_indices = start_indices,
         .limit_indices = limit_indices,
         .strides = strides,
+        .slice_sizes = slice_sizes,
+        .edge_padding_low = edge_padding_low,
+        .edge_padding_high = edge_padding_high,
+        .interior_padding = interior_padding,
+        .offset_dims = offset_dims,
+        .collapsed_slice_dims = collapsed_slice_dims,
+        .operand_batching_dims = operand_batching_dims,
+        .start_indices_batching_dims = start_indices_batching_dims,
+        .start_index_map = start_index_map,
+        .index_vector_dim = index_vector_dim,
         .dimension = dimension,
+        .iota_dimension = iota_dimension,
+        .dimensions = dimensions,
         .reduce_dimensions = reduce_dimensions,
         .lhs_batch_dimensions = lhs_batch_dimensions,
         .rhs_batch_dimensions = rhs_batch_dimensions,
@@ -1627,6 +1967,16 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
         owns_start_indices = false;
         owns_limit_indices = false;
         owns_strides = false;
+        owns_slice_sizes = false;
+        owns_edge_padding_low = false;
+        owns_edge_padding_high = false;
+        owns_interior_padding = false;
+        owns_offset_dims = false;
+        owns_collapsed_slice_dims = false;
+        owns_operand_batching_dims = false;
+        owns_start_indices_batching_dims = false;
+        owns_start_index_map = false;
+        owns_dimensions = false;
         owns_reduce_dimensions = false;
         owns_lhs_batch_dimensions = false;
         owns_rhs_batch_dimensions = false;
@@ -1647,6 +1997,16 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
     owns_start_indices = false;
     owns_limit_indices = false;
     owns_strides = false;
+    owns_slice_sizes = false;
+    owns_edge_padding_low = false;
+    owns_edge_padding_high = false;
+    owns_interior_padding = false;
+    owns_offset_dims = false;
+    owns_collapsed_slice_dims = false;
+    owns_operand_batching_dims = false;
+    owns_start_indices_batching_dims = false;
+    owns_start_index_map = false;
+    owns_dimensions = false;
     owns_reduce_dimensions = false;
     owns_lhs_batch_dimensions = false;
     owns_rhs_batch_dimensions = false;
@@ -2328,7 +2688,7 @@ test "analyze stablehlo text reports unsupported op with location dtype rank and
     const module_text =
         \\sdy.mesh @mesh = <["x"=2]>
         \\func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
-        \\  %0 = stablehlo.log %arg0 {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{"x"}]>]>} : tensor<4xf32>
+        \\  %0 = "stablehlo.reduce_precision"(%arg0) <{exponent_bits = 8 : i32, mantissa_bits = 23 : i32}> {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{"x"}]>]>} : (tensor<4xf32>) -> tensor<4xf32>
         \\  return %0 : tensor<4xf32>
         \\}
     ;
@@ -2341,7 +2701,7 @@ test "analyze stablehlo text reports unsupported op with location dtype rank and
         analyzeProgramFromReader(std.testing.allocator, "mlir", &reader, &diagnostics.writer),
     );
     const text = diagnostics.writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, text, "op=log") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "op=reduce_precision") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "dtype=f32") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "rank=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "sharding=sdy.sharding_per_value") != null);

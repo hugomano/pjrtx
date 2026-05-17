@@ -52,14 +52,42 @@ pub const ElementwiseBinaryOp = enum {
     subtract,
     multiply,
     divide,
+    maximum,
+    minimum,
+    power,
+    atan2,
+    remainder,
+    and_,
+    or_,
+    xor,
+    shift_left,
+    shift_right_arithmetic,
+    shift_right_logical,
 };
 
 pub const ElementwiseUnaryOp = enum {
     negate,
     exp,
+    expm1,
     tanh,
     sqrt,
     rsqrt,
+    abs,
+    cbrt,
+    ceil,
+    floor,
+    log,
+    log1p,
+    logistic,
+    sine,
+    cosine,
+    not_,
+    sign,
+    is_finite,
+    round_nearest_afz,
+    round_nearest_even,
+    popcnt,
+    count_leading_zeros,
 };
 
 pub const CompareOp = enum {
@@ -173,21 +201,58 @@ pub const PlanInstructionKind = enum {
     subtract,
     multiply,
     divide,
+    maximum,
+    minimum,
+    power,
+    atan2,
+    remainder,
+    and_,
+    or_,
+    xor,
+    shift_left,
+    shift_right_arithmetic,
+    shift_right_logical,
     negate,
     exp,
+    expm1,
     tanh,
     sqrt,
     rsqrt,
+    abs,
+    cbrt,
+    ceil,
+    floor,
+    log,
+    log1p,
+    logistic,
+    sine,
+    cosine,
+    not_,
+    sign,
+    is_finite,
+    round_nearest_afz,
+    round_nearest_even,
+    popcnt,
+    count_leading_zeros,
+    convert,
+    bitcast_convert,
     reshape,
     transpose,
     broadcast_in_dim,
     slice,
+    dynamic_slice,
+    dynamic_update_slice,
+    pad,
+    reverse,
     concatenate,
+    iota,
+    gather,
     dot_general,
     reduce_sum,
     reduce_max,
     compare,
     select,
+    clamp,
     unsupported,
 };
 
@@ -201,7 +266,19 @@ pub const PlanInstruction = struct {
     start_indices: ?[]const i64 = null,
     limit_indices: ?[]const i64 = null,
     strides: ?[]const i64 = null,
+    slice_sizes: ?[]const i64 = null,
+    edge_padding_low: ?[]const i64 = null,
+    edge_padding_high: ?[]const i64 = null,
+    interior_padding: ?[]const i64 = null,
+    offset_dims: ?[]const i64 = null,
+    collapsed_slice_dims: ?[]const i64 = null,
+    operand_batching_dims: ?[]const i64 = null,
+    start_indices_batching_dims: ?[]const i64 = null,
+    start_index_map: ?[]const i64 = null,
+    index_vector_dim: ?i64 = null,
     dimension: ?i64 = null,
+    iota_dimension: ?i64 = null,
+    dimensions: ?[]const i64 = null,
     reduce_dimensions: ?[]const i64 = null,
     lhs_batch_dimensions: ?[]const i64 = null,
     rhs_batch_dimensions: ?[]const i64 = null,
@@ -239,6 +316,16 @@ pub const ExecutablePlan = struct {
             if (instruction.start_indices) |start_indices| self.allocator.free(start_indices);
             if (instruction.limit_indices) |limit_indices| self.allocator.free(limit_indices);
             if (instruction.strides) |strides| self.allocator.free(strides);
+            if (instruction.slice_sizes) |slice_sizes| self.allocator.free(slice_sizes);
+            if (instruction.edge_padding_low) |padding| self.allocator.free(padding);
+            if (instruction.edge_padding_high) |padding| self.allocator.free(padding);
+            if (instruction.interior_padding) |padding| self.allocator.free(padding);
+            if (instruction.offset_dims) |dims| self.allocator.free(dims);
+            if (instruction.collapsed_slice_dims) |dims| self.allocator.free(dims);
+            if (instruction.operand_batching_dims) |dims| self.allocator.free(dims);
+            if (instruction.start_indices_batching_dims) |dims| self.allocator.free(dims);
+            if (instruction.start_index_map) |dims| self.allocator.free(dims);
+            if (instruction.dimensions) |dimensions| self.allocator.free(dimensions);
             if (instruction.reduce_dimensions) |reduce_dimensions| self.allocator.free(reduce_dimensions);
             if (instruction.lhs_batch_dimensions) |dims| self.allocator.free(dims);
             if (instruction.rhs_batch_dimensions) |dims| self.allocator.free(dims);

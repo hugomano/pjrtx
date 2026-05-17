@@ -277,7 +277,7 @@ pub const Buffer = struct {
         shard_index: usize,
     ) !*Buffer {
         if (lhs.element_type != rhs.element_type) return error.UnsupportedElementType;
-        if (lhs.element_type != .u8 and lhs.element_type != .f32) return error.UnsupportedElementType;
+        if (lhs.element_type.byteSize() == 0) return error.UnsupportedElementType;
         if (!std.mem.eql(i64, lhs.dims, rhs.dims) or lhs.bytes.len != rhs.bytes.len) return error.ShapeMismatch;
 
         const buffer = try allocator.create(Buffer);
@@ -289,6 +289,16 @@ pub const Buffer = struct {
         const bytes = try allocator.alloc(u8, lhs.bytes.len);
         errdefer allocator.free(bytes);
         switch (lhs.element_type) {
+            .pred => {
+                for (lhs.bytes, rhs.bytes, 0..) |a, b, i| {
+                    bytes[i] = switch (op) {
+                        .and_ => if (a != 0 and b != 0) 1 else 0,
+                        .or_ => if (a != 0 or b != 0) 1 else 0,
+                        .xor => if ((a != 0) != (b != 0)) 1 else 0,
+                        else => return error.UnsupportedElementType,
+                    };
+                }
+            },
             .u8 => {
                 for (lhs.bytes, rhs.bytes, 0..) |a, b, i| {
                     bytes[i] = switch (op) {
@@ -296,7 +306,64 @@ pub const Buffer = struct {
                         .subtract => a -% b,
                         .multiply => a *% b,
                         .divide => if (b == 0) 0 else a / b,
+                        .maximum => @max(a, b),
+                        .minimum => @min(a, b),
+                        .remainder => if (b == 0) 0 else a % b,
+                        .and_ => a & b,
+                        .or_ => a | b,
+                        .xor => a ^ b,
+                        .shift_left => a << @intCast(@min(b, 7)),
+                        .shift_right_logical, .shift_right_arithmetic => a >> @intCast(@min(b, 7)),
+                        else => return error.UnsupportedElementType,
                     };
+                }
+            },
+            .s32 => {
+                const element_count = lhs.bytes.len / 4;
+                for (0..element_count) |i| {
+                    const a = readI32LE(lhs.bytes, i);
+                    const b = readI32LE(rhs.bytes, i);
+                    const value: i32 = switch (op) {
+                        .add => a +% b,
+                        .subtract => a -% b,
+                        .multiply => a *% b,
+                        .divide => if (b == 0) 0 else @divTrunc(a, b),
+                        .maximum => @max(a, b),
+                        .minimum => @min(a, b),
+                        .remainder => if (b == 0) 0 else @rem(a, b),
+                        .and_ => a & b,
+                        .or_ => a | b,
+                        .xor => a ^ b,
+                        .shift_left => a << @intCast(@min(@as(u5, @intCast(@max(b, 0))), 31)),
+                        .shift_right_arithmetic => a >> @intCast(@min(@as(u5, @intCast(@max(b, 0))), 31)),
+                        .shift_right_logical => @bitCast(@as(u32, @bitCast(a)) >> @intCast(@min(@as(u5, @intCast(@max(b, 0))), 31))),
+                        else => return error.UnsupportedElementType,
+                    };
+                    writeI32LE(bytes, i, value);
+                }
+            },
+            .u32 => {
+                const element_count = lhs.bytes.len / 4;
+                for (0..element_count) |i| {
+                    const a = readU32LE(lhs.bytes, i);
+                    const b = readU32LE(rhs.bytes, i);
+                    const shift: u5 = @intCast(@min(b, 31));
+                    const value: u32 = switch (op) {
+                        .add => a +% b,
+                        .subtract => a -% b,
+                        .multiply => a *% b,
+                        .divide => if (b == 0) 0 else a / b,
+                        .maximum => @max(a, b),
+                        .minimum => @min(a, b),
+                        .remainder => if (b == 0) 0 else a % b,
+                        .and_ => a & b,
+                        .or_ => a | b,
+                        .xor => a ^ b,
+                        .shift_left => a << shift,
+                        .shift_right_logical, .shift_right_arithmetic => a >> shift,
+                        else => return error.UnsupportedElementType,
+                    };
+                    writeU32LE(bytes, i, value);
                 }
             },
             .f32 => {
@@ -311,11 +378,17 @@ pub const Buffer = struct {
                         .subtract => a - b,
                         .multiply => a * b,
                         .divide => a / b,
+                        .maximum => @max(a, b),
+                        .minimum => @min(a, b),
+                        .power => std.math.pow(f32, a, b),
+                        .atan2 => std.math.atan2(a, b),
+                        .remainder => @mod(a, b),
+                        else => return error.UnsupportedElementType,
                     };
                     std.mem.writeInt(u32, bytes[offset..][0..4], @bitCast(value), .little);
                 }
             },
-            else => unreachable,
+            else => return error.UnsupportedElementType,
         }
 
         var backend_buffer: ?backend_api.BufferHandle = null;
@@ -367,42 +440,115 @@ pub const Buffer = struct {
         src: *Buffer,
         shard_index: usize,
     ) !*Buffer {
-        if (src.element_type != .u8 and src.element_type != .f32) return error.UnsupportedElementType;
-        if (src.element_type == .u8 and op != .negate) return error.UnsupportedElementType;
+        return initElementwiseUnaryTyped(allocator, op, src, src.element_type, src.dims, shard_index);
+    }
+
+    pub fn initElementwiseUnaryTyped(
+        allocator: std.mem.Allocator,
+        op: ElementwiseUnaryOp,
+        src: *Buffer,
+        output_type: BufferType,
+        output_dims: []const i64,
+        shard_index: usize,
+    ) !*Buffer {
+        if (!std.mem.eql(i64, src.dims, output_dims)) return error.ShapeMismatch;
+        if (src.element_type.byteSize() == 0 or output_type.byteSize() == 0) return error.UnsupportedElementType;
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
 
-        const dims = try allocator.dupe(i64, src.dims);
+        const dims = try allocator.dupe(i64, output_dims);
         errdefer allocator.free(dims);
 
-        const bytes = try allocator.alloc(u8, src.bytes.len);
+        const bytes = try allocator.alloc(u8, denseByteSize(output_type, output_dims));
         errdefer allocator.free(bytes);
         switch (src.element_type) {
+            .pred => {
+                if (output_type != .pred or op != .not_) return error.UnsupportedElementType;
+                for (src.bytes, 0..) |value, i| bytes[i] = if (value == 0) 1 else 0;
+            },
             .u8 => {
+                if (output_type != .u8 and output_type != .s8 and output_type != .pred) return error.UnsupportedElementType;
                 for (src.bytes, 0..) |value, i| {
-                    bytes[i] = switch (op) {
-                        .negate => 0 -% value,
-                        else => unreachable,
+                    _ = switch (op) {
+                        .negate => bytes[i] = 0 -% value,
+                        .not_ => bytes[i] = ~value,
+                        .popcnt => bytes[i] = @popCount(value),
+                        .count_leading_zeros => bytes[i] = @clz(value),
+                        .sign => bytes[i] = if (value == 0) 0 else 1,
+                        .is_finite => bytes[i] = 1,
+                        else => return error.UnsupportedElementType,
+                    };
+                }
+            },
+            .s32 => {
+                if (output_type != .s32 and output_type != .pred) return error.UnsupportedElementType;
+                const element_count = src.bytes.len / 4;
+                for (0..element_count) |i| {
+                    const value = readI32LE(src.bytes, i);
+                    _ = switch (op) {
+                        .negate => writeI32LE(bytes, i, -%value),
+                        .not_ => writeI32LE(bytes, i, ~value),
+                        .popcnt => writeI32LE(bytes, i, @intCast(@popCount(value))),
+                        .count_leading_zeros => writeI32LE(bytes, i, @intCast(@clz(value))),
+                        .sign => writeI32LE(bytes, i, if (value < 0) -1 else if (value > 0) 1 else 0),
+                        .is_finite => bytes[i] = 1,
+                        else => return error.UnsupportedElementType,
+                    };
+                }
+            },
+            .u32 => {
+                if (output_type != .u32 and output_type != .pred) return error.UnsupportedElementType;
+                const element_count = src.bytes.len / 4;
+                for (0..element_count) |i| {
+                    const value = readU32LE(src.bytes, i);
+                    _ = switch (op) {
+                        .not_ => writeU32LE(bytes, i, ~value),
+                        .popcnt => writeU32LE(bytes, i, @intCast(@popCount(value))),
+                        .count_leading_zeros => writeU32LE(bytes, i, @intCast(@clz(value))),
+                        .sign => writeU32LE(bytes, i, if (value == 0) 0 else 1),
+                        .is_finite => bytes[i] = 1,
+                        else => return error.UnsupportedElementType,
                     };
                 }
             },
             .f32 => {
+                if (output_type != .f32 and output_type != .pred) return error.UnsupportedElementType;
                 var offset: usize = 0;
+                var index: usize = 0;
                 while (offset < src.bytes.len) : (offset += 4) {
                     const bits = std.mem.readInt(u32, src.bytes[offset..][0..4], .little);
                     const value: f32 = @bitCast(bits);
-                    const out: f32 = switch (op) {
-                        .negate => -value,
-                        .exp => std.math.exp(value),
-                        .tanh => std.math.tanh(value),
-                        .sqrt => std.math.sqrt(value),
-                        .rsqrt => 1.0 / std.math.sqrt(value),
-                    };
-                    std.mem.writeInt(u32, bytes[offset..][0..4], @bitCast(out), .little);
+                    if (op == .is_finite) {
+                        bytes[index] = if (std.math.isFinite(value)) 1 else 0;
+                        index += 1;
+                    } else {
+                        const out: f32 = switch (op) {
+                            .negate => -value,
+                            .exp => std.math.exp(value),
+                            .expm1 => std.math.exp(value) - 1.0,
+                            .tanh => std.math.tanh(value),
+                            .sqrt => std.math.sqrt(value),
+                            .rsqrt => 1.0 / std.math.sqrt(value),
+                            .abs => @abs(value),
+                            .cbrt => std.math.cbrt(value),
+                            .ceil => @ceil(value),
+                            .floor => @floor(value),
+                            .log => @log(value),
+                            .log1p => @log(value + 1.0),
+                            .logistic => 1.0 / (1.0 + std.math.exp(-value)),
+                            .sine => @sin(value),
+                            .cosine => @cos(value),
+                            .sign => if (value < 0.0) -1.0 else if (value > 0.0) 1.0 else 0.0,
+                            .round_nearest_afz => @round(value),
+                            .round_nearest_even => @round(value),
+                            else => return error.UnsupportedElementType,
+                        };
+                        std.mem.writeInt(u32, bytes[offset..][0..4], @bitCast(out), .little);
+                    }
                 }
             },
-            else => unreachable,
+            else => return error.UnsupportedElementType,
         }
 
         var backend_buffer: ?backend_api.BufferHandle = null;
@@ -415,7 +561,7 @@ pub const Buffer = struct {
             .allocator = allocator,
             .backend = src.backend,
             .backend_kind = src.backend_kind,
-            .element_type = src.element_type,
+            .element_type = output_type,
             .dims = dims,
             .device_id = src.device_id,
             .memory_id = src.memory_id,
@@ -851,7 +997,6 @@ pub const Buffer = struct {
         shard_index: usize,
     ) !*Buffer {
         if (lhs.element_type != rhs.element_type) return error.UnsupportedElementType;
-        if (lhs.element_type != .f32) return error.UnsupportedElementType;
         if (!std.mem.eql(i64, lhs.dims, rhs.dims) or !std.mem.eql(i64, lhs.dims, output_dims)) return error.ShapeMismatch;
 
         const buffer = try allocator.create(Buffer);
@@ -860,13 +1005,13 @@ pub const Buffer = struct {
         const dims = try allocator.dupe(i64, output_dims);
         errdefer allocator.free(dims);
 
-        const element_count = lhs.bytes.len / 4;
+        const element_size = lhs.element_type.byteSize();
+        if (element_size == 0) return error.UnsupportedElementType;
+        const element_count = lhs.bytes.len / element_size;
         const bytes = try allocator.alloc(u8, element_count);
         errdefer allocator.free(bytes);
         for (0..element_count) |i| {
-            const a = readF32LE(lhs.bytes, i);
-            const b = readF32LE(rhs.bytes, i);
-            bytes[i] = if (compareF32(a, b, direction)) 1 else 0;
+            bytes[i] = if (compareElement(lhs.element_type, lhs.bytes, rhs.bytes, i, direction)) 1 else 0;
         }
 
         var backend_buffer: ?backend_api.BufferHandle = null;
@@ -936,6 +1081,447 @@ pub const Buffer = struct {
             .memory_id = on_true.memory_id,
             .device = on_true.device,
             .memory = on_true.memory,
+            .shard_index = shard_index,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer;
+    }
+
+    pub fn initConvert(
+        allocator: std.mem.Allocator,
+        src: *Buffer,
+        output_type: BufferType,
+        output_dims: []const i64,
+        shard_index: usize,
+    ) !*Buffer {
+        if (!std.mem.eql(i64, src.dims, output_dims)) return error.ShapeMismatch;
+        if (src.element_type.byteSize() == 0 or output_type.byteSize() == 0) return error.UnsupportedElementType;
+
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+
+        const dims = try allocator.dupe(i64, output_dims);
+        errdefer allocator.free(dims);
+
+        const output_size = denseByteSize(output_type, output_dims);
+        const bytes = try allocator.alloc(u8, output_size);
+        errdefer allocator.free(bytes);
+
+        const element_count = if (output_type.byteSize() == 0) 0 else output_size / output_type.byteSize();
+        for (0..element_count) |i| {
+            const value = readScalarAsF64(src.element_type, src.bytes, i);
+            writeScalarFromF64(output_type, bytes, i, value);
+        }
+
+        const backend_buffer = src.backend.bufferFromHost(src.device.local_hardware_id, output_type, output_dims, bytes) catch null;
+        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
+
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = src.backend,
+            .backend_kind = src.backend_kind,
+            .element_type = output_type,
+            .dims = dims,
+            .device_id = src.device_id,
+            .memory_id = src.memory_id,
+            .device = src.device,
+            .memory = src.memory,
+            .shard_index = shard_index,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer;
+    }
+
+    pub fn initIota(
+        allocator: std.mem.Allocator,
+        backend_impl: backend_api.Backend,
+        element_type: BufferType,
+        output_dims: []const i64,
+        device: *Device,
+        memory: *Memory,
+        iota_dimension: i64,
+        shard_index: usize,
+    ) !*Buffer {
+        if (iota_dimension < 0 or iota_dimension >= @as(i64, @intCast(output_dims.len))) return error.ShapeMismatch;
+        if (element_type.byteSize() == 0) return error.UnsupportedElementType;
+
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+
+        const dims = try allocator.dupe(i64, output_dims);
+        errdefer allocator.free(dims);
+
+        const bytes = try allocator.alloc(u8, denseByteSize(element_type, output_dims));
+        errdefer allocator.free(bytes);
+        const strides = try rowMajorStrides(allocator, output_dims);
+        defer allocator.free(strides);
+        const coords = try allocator.alloc(usize, output_dims.len);
+        defer allocator.free(coords);
+        const element_count = if (element_type.byteSize() == 0) 0 else bytes.len / element_type.byteSize();
+        const axis: usize = @intCast(iota_dimension);
+        for (0..element_count) |i| {
+            unravelIndex(i, output_dims, strides, coords);
+            writeScalarFromF64(element_type, bytes, i, @floatFromInt(coords[axis]));
+        }
+
+        const backend_buffer = backend_impl.bufferFromHost(device.local_hardware_id, element_type, output_dims, bytes) catch null;
+        errdefer if (backend_buffer) |owned| backend_impl.destroyBuffer(owned);
+
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = backend_impl,
+            .backend_kind = backend_impl.kind(),
+            .element_type = element_type,
+            .dims = dims,
+            .device_id = device.id,
+            .memory_id = memory.id,
+            .device = device,
+            .memory = memory,
+            .shard_index = shard_index,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer;
+    }
+
+    pub fn initReverse(
+        allocator: std.mem.Allocator,
+        src: *Buffer,
+        dimensions: []const i64,
+        output_dims: []const i64,
+        shard_index: usize,
+    ) !*Buffer {
+        if (!std.mem.eql(i64, src.dims, output_dims)) return error.ShapeMismatch;
+        const element_size = src.element_type.byteSize();
+        if (element_size == 0) return error.UnsupportedElementType;
+
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+        const dims = try allocator.dupe(i64, output_dims);
+        errdefer allocator.free(dims);
+        const bytes = try allocator.alloc(u8, src.bytes.len);
+        errdefer allocator.free(bytes);
+        const strides = try rowMajorStrides(allocator, src.dims);
+        defer allocator.free(strides);
+        const coords = try allocator.alloc(usize, src.dims.len);
+        defer allocator.free(coords);
+        const element_count = src.bytes.len / element_size;
+        for (0..element_count) |dst_index| {
+            unravelIndex(dst_index, output_dims, strides, coords);
+            var src_index: usize = 0;
+            for (coords, 0..) |coord, axis| {
+                const reverse_axis = axisInList(axis, dimensions);
+                const src_coord = if (reverse_axis) @as(usize, @intCast(src.dims[axis])) - 1 - coord else coord;
+                src_index += src_coord * strides[axis];
+            }
+            @memcpy(bytes[dst_index * element_size ..][0..element_size], src.bytes[src_index * element_size ..][0..element_size]);
+        }
+        const backend_buffer = src.backend.bufferFromHost(src.device.local_hardware_id, src.element_type, output_dims, bytes) catch null;
+        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = src.backend,
+            .backend_kind = src.backend_kind,
+            .element_type = src.element_type,
+            .dims = dims,
+            .device_id = src.device_id,
+            .memory_id = src.memory_id,
+            .device = src.device,
+            .memory = src.memory,
+            .shard_index = shard_index,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer;
+    }
+
+    pub fn initClamp(
+        allocator: std.mem.Allocator,
+        min_buffer: *Buffer,
+        value_buffer: *Buffer,
+        max_buffer: *Buffer,
+        output_dims: []const i64,
+        shard_index: usize,
+    ) !*Buffer {
+        if (value_buffer.element_type != min_buffer.element_type or value_buffer.element_type != max_buffer.element_type) return error.UnsupportedElementType;
+        if (!std.mem.eql(i64, value_buffer.dims, output_dims)) return error.ShapeMismatch;
+        const element_size = value_buffer.element_type.byteSize();
+        if (element_size == 0) return error.UnsupportedElementType;
+        const min_scalar = min_buffer.dims.len == 0;
+        const max_scalar = max_buffer.dims.len == 0;
+        if (!min_scalar and !std.mem.eql(i64, min_buffer.dims, output_dims)) return error.ShapeMismatch;
+        if (!max_scalar and !std.mem.eql(i64, max_buffer.dims, output_dims)) return error.ShapeMismatch;
+
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+        const dims = try allocator.dupe(i64, output_dims);
+        errdefer allocator.free(dims);
+        const bytes = try allocator.alloc(u8, value_buffer.bytes.len);
+        errdefer allocator.free(bytes);
+        const element_count = value_buffer.bytes.len / element_size;
+        for (0..element_count) |i| {
+            const min_value = readScalarAsF64(value_buffer.element_type, min_buffer.bytes, if (min_scalar) 0 else i);
+            const value = readScalarAsF64(value_buffer.element_type, value_buffer.bytes, i);
+            const max_value = readScalarAsF64(value_buffer.element_type, max_buffer.bytes, if (max_scalar) 0 else i);
+            writeScalarFromF64(value_buffer.element_type, bytes, i, @min(@max(value, min_value), max_value));
+        }
+        const backend_buffer = value_buffer.backend.bufferFromHost(value_buffer.device.local_hardware_id, value_buffer.element_type, output_dims, bytes) catch null;
+        errdefer if (backend_buffer) |owned| value_buffer.backend.destroyBuffer(owned);
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = value_buffer.backend,
+            .backend_kind = value_buffer.backend_kind,
+            .element_type = value_buffer.element_type,
+            .dims = dims,
+            .device_id = value_buffer.device_id,
+            .memory_id = value_buffer.memory_id,
+            .device = value_buffer.device,
+            .memory = value_buffer.memory,
+            .shard_index = shard_index,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer;
+    }
+
+    pub fn initDynamicSlice(
+        allocator: std.mem.Allocator,
+        src: *Buffer,
+        start_buffers: []const *Buffer,
+        slice_sizes: []const i64,
+        output_dims: []const i64,
+        shard_index: usize,
+    ) !*Buffer {
+        if (start_buffers.len != src.dims.len or slice_sizes.len != src.dims.len) return error.ShapeMismatch;
+        var starts = try allocator.alloc(i64, start_buffers.len);
+        defer allocator.free(starts);
+        var limits = try allocator.alloc(i64, start_buffers.len);
+        defer allocator.free(limits);
+        var strides = try allocator.alloc(i64, start_buffers.len);
+        defer allocator.free(strides);
+        for (start_buffers, 0..) |start_buffer, i| {
+            if (start_buffer.dims.len != 0) return error.ShapeMismatch;
+            starts[i] = scalarIndex(start_buffer);
+            if (starts[i] < 0) starts[i] = 0;
+            if (starts[i] + slice_sizes[i] > src.dims[i]) starts[i] = src.dims[i] - slice_sizes[i];
+            limits[i] = starts[i] + slice_sizes[i];
+            strides[i] = 1;
+        }
+        return initSlice(allocator, src, starts, limits, strides, output_dims, shard_index);
+    }
+
+    pub fn initDynamicUpdateSlice(
+        allocator: std.mem.Allocator,
+        src: *Buffer,
+        update: *Buffer,
+        start_buffers: []const *Buffer,
+        output_dims: []const i64,
+        shard_index: usize,
+    ) !*Buffer {
+        if (src.element_type != update.element_type) return error.UnsupportedElementType;
+        if (!std.mem.eql(i64, src.dims, output_dims) or src.dims.len != update.dims.len or start_buffers.len != src.dims.len) return error.ShapeMismatch;
+        const element_size = src.element_type.byteSize();
+        if (element_size == 0) return error.UnsupportedElementType;
+
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+        const dims = try allocator.dupe(i64, output_dims);
+        errdefer allocator.free(dims);
+        const bytes = try allocator.dupe(u8, src.bytes);
+        errdefer allocator.free(bytes);
+
+        var starts = try allocator.alloc(i64, start_buffers.len);
+        defer allocator.free(starts);
+        for (start_buffers, 0..) |start_buffer, i| {
+            if (start_buffer.dims.len != 0) return error.ShapeMismatch;
+            starts[i] = scalarIndex(start_buffer);
+            if (starts[i] < 0) starts[i] = 0;
+            if (starts[i] + update.dims[i] > src.dims[i]) starts[i] = src.dims[i] - update.dims[i];
+        }
+
+        const src_strides = try rowMajorStrides(allocator, src.dims);
+        defer allocator.free(src_strides);
+        const update_strides = try rowMajorStrides(allocator, update.dims);
+        defer allocator.free(update_strides);
+        const coords = try allocator.alloc(usize, update.dims.len);
+        defer allocator.free(coords);
+        const update_count = update.bytes.len / element_size;
+        for (0..update_count) |update_index| {
+            unravelIndex(update_index, update.dims, update_strides, coords);
+            var dst_index: usize = 0;
+            for (coords, 0..) |coord, axis| {
+                dst_index += (@as(usize, @intCast(starts[axis])) + coord) * src_strides[axis];
+            }
+            @memcpy(bytes[dst_index * element_size ..][0..element_size], update.bytes[update_index * element_size ..][0..element_size]);
+        }
+        const backend_buffer = src.backend.bufferFromHost(src.device.local_hardware_id, src.element_type, output_dims, bytes) catch null;
+        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = src.backend,
+            .backend_kind = src.backend_kind,
+            .element_type = src.element_type,
+            .dims = dims,
+            .device_id = src.device_id,
+            .memory_id = src.memory_id,
+            .device = src.device,
+            .memory = src.memory,
+            .shard_index = shard_index,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer;
+    }
+
+    pub fn initPad(
+        allocator: std.mem.Allocator,
+        src: *Buffer,
+        padding_value: *Buffer,
+        edge_padding_low: []const i64,
+        edge_padding_high: []const i64,
+        interior_padding: []const i64,
+        output_dims: []const i64,
+        shard_index: usize,
+    ) !*Buffer {
+        if (src.element_type != padding_value.element_type or padding_value.dims.len != 0) return error.UnsupportedElementType;
+        const rank = src.dims.len;
+        if (edge_padding_low.len != rank or edge_padding_high.len != rank or interior_padding.len != rank or output_dims.len != rank) return error.ShapeMismatch;
+        const element_size = src.element_type.byteSize();
+        if (element_size == 0) return error.UnsupportedElementType;
+
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+        const dims = try allocator.dupe(i64, output_dims);
+        errdefer allocator.free(dims);
+        const bytes = try allocator.alloc(u8, denseByteSize(src.element_type, output_dims));
+        errdefer allocator.free(bytes);
+        const out_count = bytes.len / element_size;
+        for (0..out_count) |i| @memcpy(bytes[i * element_size ..][0..element_size], padding_value.bytes[0..element_size]);
+
+        const src_strides = try rowMajorStrides(allocator, src.dims);
+        defer allocator.free(src_strides);
+        const dst_strides = try rowMajorStrides(allocator, output_dims);
+        defer allocator.free(dst_strides);
+        const coords = try allocator.alloc(usize, src.dims.len);
+        defer allocator.free(coords);
+        const src_count = src.bytes.len / element_size;
+        for (0..src_count) |src_index| {
+            unravelIndex(src_index, src.dims, src_strides, coords);
+            var dst_index: usize = 0;
+            for (coords, 0..) |coord, axis| {
+                const interior = @as(usize, @intCast(interior_padding[axis]));
+                const low = @as(usize, @intCast(edge_padding_low[axis]));
+                dst_index += (low + coord * (interior + 1)) * dst_strides[axis];
+            }
+            @memcpy(bytes[dst_index * element_size ..][0..element_size], src.bytes[src_index * element_size ..][0..element_size]);
+        }
+        const backend_buffer = src.backend.bufferFromHost(src.device.local_hardware_id, src.element_type, output_dims, bytes) catch null;
+        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = src.backend,
+            .backend_kind = src.backend_kind,
+            .element_type = src.element_type,
+            .dims = dims,
+            .device_id = src.device_id,
+            .memory_id = src.memory_id,
+            .device = src.device,
+            .memory = src.memory,
+            .shard_index = shard_index,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer;
+    }
+
+    pub fn initGather(
+        allocator: std.mem.Allocator,
+        operand: *Buffer,
+        indices: *Buffer,
+        offset_dims: []const i64,
+        collapsed_slice_dims: []const i64,
+        operand_batching_dims: []const i64,
+        start_indices_batching_dims: []const i64,
+        start_index_map: []const i64,
+        index_vector_dim: i64,
+        slice_sizes: []const i64,
+        output_dims: []const i64,
+        shard_index: usize,
+    ) !*Buffer {
+        _ = offset_dims;
+        _ = operand_batching_dims;
+        _ = start_indices_batching_dims;
+        if (operand.element_type.byteSize() == 0) return error.UnsupportedElementType;
+        if (start_index_map.len == 0 or slice_sizes.len != operand.dims.len) return error.ShapeMismatch;
+        if (index_vector_dim < 0) return error.ShapeMismatch;
+
+        const element_size = operand.element_type.byteSize();
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+        const dims = try allocator.dupe(i64, output_dims);
+        errdefer allocator.free(dims);
+        const bytes = try allocator.alloc(u8, denseByteSize(operand.element_type, output_dims));
+        errdefer allocator.free(bytes);
+
+        const operand_strides = try rowMajorStrides(allocator, operand.dims);
+        defer allocator.free(operand_strides);
+        const output_strides = try rowMajorStrides(allocator, output_dims);
+        defer allocator.free(output_strides);
+        const out_coords = try allocator.alloc(usize, output_dims.len);
+        defer allocator.free(out_coords);
+        const out_count = bytes.len / element_size;
+
+        if (collapsed_slice_dims.len == 1 and start_index_map.len == 1 and slice_sizes[@intCast(start_index_map[0])] == 1) {
+            const gather_axis: usize = @intCast(start_index_map[0]);
+            const index_rank = indices.dims.len;
+            const index_vector_axis: usize = @intCast(index_vector_dim);
+            const index_prefix_rank = if (index_rank > 0 and index_vector_axis < index_rank and indices.dims[index_vector_axis] == @as(i64, @intCast(start_index_map.len))) index_rank - 1 else index_rank;
+            if (output_dims.len < index_prefix_rank + operand.dims.len - 1) return error.ShapeMismatch;
+            const index_strides = try rowMajorStrides(allocator, indices.dims);
+            defer allocator.free(index_strides);
+            for (0..out_count) |out_index| {
+                unravelIndex(out_index, output_dims, output_strides, out_coords);
+                var index_flat: usize = 0;
+                var prefix_axis: usize = 0;
+                for (0..index_rank) |axis| {
+                    const coord = if (axis == index_vector_axis and index_rank != index_prefix_rank) 0 else blk: {
+                        const c = out_coords[prefix_axis];
+                        prefix_axis += 1;
+                        break :blk c;
+                    };
+                    index_flat += coord * index_strides[axis];
+                }
+                const gathered = scalarIndexAt(indices, index_flat);
+                var operand_index: usize = 0;
+                var offset_axis: usize = 0;
+                for (0..operand.dims.len) |axis| {
+                    const coord = if (axis == gather_axis) @as(usize, @intCast(@max(@as(i64, 0), @min(gathered, operand.dims[axis] - 1)))) else blk: {
+                        const c = out_coords[index_prefix_rank + offset_axis];
+                        offset_axis += 1;
+                        break :blk c;
+                    };
+                    operand_index += coord * operand_strides[axis];
+                }
+                @memcpy(bytes[out_index * element_size ..][0..element_size], operand.bytes[operand_index * element_size ..][0..element_size]);
+            }
+        } else {
+            return error.UnsupportedElementType;
+        }
+
+        const backend_buffer = operand.backend.bufferFromHost(operand.device.local_hardware_id, operand.element_type, output_dims, bytes) catch null;
+        errdefer if (backend_buffer) |owned| operand.backend.destroyBuffer(owned);
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = operand.backend,
+            .backend_kind = operand.backend_kind,
+            .element_type = operand.element_type,
+            .dims = dims,
+            .device_id = operand.device_id,
+            .memory_id = operand.memory_id,
+            .device = operand.device,
+            .memory = operand.memory,
             .shard_index = shard_index,
             .bytes = bytes,
             .backend_buffer = backend_buffer,
@@ -1115,6 +1701,22 @@ fn writeF32LE(bytes: []u8, index: usize, value: f32) void {
     std.mem.writeInt(u32, bytes[index * 4 ..][0..4], @bitCast(value), .little);
 }
 
+fn readI32LE(bytes: []const u8, index: usize) i32 {
+    return @bitCast(std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little));
+}
+
+fn writeI32LE(bytes: []u8, index: usize, value: i32) void {
+    std.mem.writeInt(u32, bytes[index * 4 ..][0..4], @bitCast(value), .little);
+}
+
+fn readU32LE(bytes: []const u8, index: usize) u32 {
+    return std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little);
+}
+
+fn writeU32LE(bytes: []u8, index: usize, value: u32) void {
+    std.mem.writeInt(u32, bytes[index * 4 ..][0..4], value, .little);
+}
+
 fn compareF32(lhs: f32, rhs: f32, direction: CompareOp) bool {
     return switch (direction) {
         .eq => lhs == rhs,
@@ -1123,6 +1725,59 @@ fn compareF32(lhs: f32, rhs: f32, direction: CompareOp) bool {
         .gt => lhs > rhs,
         .le => lhs <= rhs,
         .lt => lhs < rhs,
+    };
+}
+
+fn compareScalar(lhs: f64, rhs: f64, direction: CompareOp) bool {
+    return switch (direction) {
+        .eq => lhs == rhs,
+        .ne => lhs != rhs,
+        .ge => lhs >= rhs,
+        .gt => lhs > rhs,
+        .le => lhs <= rhs,
+        .lt => lhs < rhs,
+    };
+}
+
+fn compareElement(element_type: BufferType, lhs: []const u8, rhs: []const u8, index: usize, direction: CompareOp) bool {
+    return compareScalar(readScalarAsF64(element_type, lhs, index), readScalarAsF64(element_type, rhs, index), direction);
+}
+
+fn readScalarAsF64(element_type: BufferType, bytes: []const u8, index: usize) f64 {
+    return switch (element_type) {
+        .pred, .u8 => @floatFromInt(bytes[index]),
+        .s8 => @floatFromInt(@as(i8, @bitCast(bytes[index]))),
+        .s32 => @floatFromInt(readI32LE(bytes, index)),
+        .u32 => @floatFromInt(readU32LE(bytes, index)),
+        .f32 => readF32LE(bytes, index),
+        else => 0.0,
+    };
+}
+
+fn writeScalarFromF64(element_type: BufferType, bytes: []u8, index: usize, value: f64) void {
+    switch (element_type) {
+        .pred => bytes[index] = if (value != 0.0) 1 else 0,
+        .u8 => bytes[index] = @intFromFloat(@min(@max(value, 0.0), 255.0)),
+        .s8 => bytes[index] = @bitCast(@as(i8, @intFromFloat(@min(@max(value, -128.0), 127.0)))),
+        .s32 => writeI32LE(bytes, index, @intFromFloat(@min(@max(value, -2147483648.0), 2147483647.0))),
+        .u32 => writeU32LE(bytes, index, @intFromFloat(@min(@max(value, 0.0), 4294967295.0))),
+        .f32 => writeF32LE(bytes, index, @floatCast(value)),
+        else => {},
+    }
+}
+
+fn scalarIndex(buffer: *const Buffer) i64 {
+    return scalarIndexAt(buffer, 0);
+}
+
+fn scalarIndexAt(buffer: *const Buffer, index: usize) i64 {
+    return switch (buffer.element_type) {
+        .pred, .u8 => buffer.bytes[index],
+        .s8 => @as(i8, @bitCast(buffer.bytes[index])),
+        .s32 => readI32LE(buffer.bytes, index),
+        .u32 => @intCast(readU32LE(buffer.bytes, index)),
+        .f32 => @intFromFloat(readF32LE(buffer.bytes, index)),
+        else => 0,
     };
 }
 

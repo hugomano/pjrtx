@@ -864,6 +864,17 @@ fn runtimeBinaryOp(kind: compiler.PlanInstructionKind) ?runtime.ElementwiseBinar
         .subtract => .subtract,
         .multiply => .multiply,
         .divide => .divide,
+        .maximum => .maximum,
+        .minimum => .minimum,
+        .power => .power,
+        .atan2 => .atan2,
+        .remainder => .remainder,
+        .and_ => .and_,
+        .or_ => .or_,
+        .xor => .xor,
+        .shift_left => .shift_left,
+        .shift_right_arithmetic => .shift_right_arithmetic,
+        .shift_right_logical => .shift_right_logical,
         else => null,
     };
 }
@@ -872,9 +883,26 @@ fn runtimeUnaryOp(kind: compiler.PlanInstructionKind) ?runtime.ElementwiseUnaryO
     return switch (kind) {
         .negate => .negate,
         .exp => .exp,
+        .expm1 => .expm1,
         .tanh => .tanh,
         .sqrt => .sqrt,
         .rsqrt => .rsqrt,
+        .abs => .abs,
+        .cbrt => .cbrt,
+        .ceil => .ceil,
+        .floor => .floor,
+        .log => .log,
+        .log1p => .log1p,
+        .logistic => .logistic,
+        .sine => .sine,
+        .cosine => .cosine,
+        .not_ => .not_,
+        .sign => .sign,
+        .is_finite => .is_finite,
+        .round_nearest_afz => .round_nearest_afz,
+        .round_nearest_even => .round_nearest_even,
+        .popcnt => .popcnt,
+        .count_leading_zeros => .count_leading_zeros,
         else => null,
     };
 }
@@ -946,7 +974,7 @@ fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callc
                     for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                     return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate execute output");
                 },
-                .add, .subtract, .multiply, .divide => blk: {
+                .add, .subtract, .multiply, .divide, .maximum, .minimum, .power, .atan2, .remainder, .and_, .or_, .xor, .shift_left, .shift_right_arithmetic, .shift_right_logical => blk: {
                     const lhs = value_buffers[plan_instruction.inputs[0].index].?;
                     const rhs = value_buffers[plan_instruction.inputs[1].index].?;
                     break :blk runtime.Buffer.initElementwiseBinary(allocator, runtimeBinaryOp(plan_instruction.kind).?, lhs, rhs, device_index) catch |err| switch (err) {
@@ -964,7 +992,14 @@ fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callc
                         },
                     };
                 },
-                .negate, .exp, .tanh, .sqrt, .rsqrt => runtime.Buffer.initElementwiseUnary(allocator, runtimeUnaryOp(plan_instruction.kind).?, value_buffers[plan_instruction.inputs[0].index].?, device_index) catch |err| switch (err) {
+                .negate, .exp, .expm1, .tanh, .sqrt, .rsqrt, .abs, .cbrt, .ceil, .floor, .log, .log1p, .logistic, .sine, .cosine, .not_, .sign, .is_finite, .round_nearest_afz, .round_nearest_even, .popcnt, .count_leading_zeros => runtime.Buffer.initElementwiseUnaryTyped(
+                    allocator,
+                    runtimeUnaryOp(plan_instruction.kind).?,
+                    value_buffers[plan_instruction.inputs[0].index].?,
+                    executable.plan.values[output_id.index].descriptor.element_type,
+                    plan_instruction.dims orelse executable.plan.values[output_id.index].descriptor.dims,
+                    device_index,
+                ) catch |err| switch (err) {
                     error.UnsupportedElementType => {
                         for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                         return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "unary StableHLO execution currently supports u8 negate and f32 math buffers only");
@@ -973,6 +1008,53 @@ fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callc
                         for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute unary StableHLO op");
                     },
+                },
+                .convert, .bitcast_convert => runtime.Buffer.initConvert(
+                    allocator,
+                    value_buffers[plan_instruction.inputs[0].index].?,
+                    executable.plan.values[output_id.index].descriptor.element_type,
+                    plan_instruction.dims orelse executable.plan.values[output_id.index].descriptor.dims,
+                    device_index,
+                ) catch |err| switch (err) {
+                    error.UnsupportedElementType => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "convert StableHLO execution currently supports pred/u8/s8/s32/u32/f32 scalar conversions");
+                    },
+                    error.ShapeMismatch => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "convert StableHLO output shape must match input shape");
+                    },
+                    else => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute convert StableHLO op");
+                    },
+                },
+                .iota => blk: {
+                    const descriptor = executable.plan.values[output_id.index].descriptor;
+                    const device = &executable.client.devices[device_index];
+                    break :blk runtime.Buffer.initIota(
+                        allocator,
+                        executable.client.backend,
+                        descriptor.element_type,
+                        plan_instruction.dims orelse descriptor.dims,
+                        device,
+                        device.default_memory,
+                        plan_instruction.iota_dimension orelse 0,
+                        device_index,
+                    ) catch |err| switch (err) {
+                        error.UnsupportedElementType => {
+                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                            return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "iota StableHLO execution currently supports scalar numeric element types");
+                        },
+                        error.ShapeMismatch => {
+                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                            return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "iota StableHLO dimension is invalid");
+                        },
+                        else => {
+                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                            return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute iota StableHLO op");
+                        },
+                    };
                 },
                 .reshape => runtime.Buffer.initReshape(allocator, value_buffers[plan_instruction.inputs[0].index].?, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
                     error.UnsupportedElementType => {
@@ -1038,6 +1120,79 @@ fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callc
                         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute slice StableHLO op");
                     },
                 },
+                .dynamic_slice => blk: {
+                    const src = value_buffers[plan_instruction.inputs[0].index].?;
+                    const starts = allocator.alloc(*runtime.Buffer, plan_instruction.inputs.len - 1) catch {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate dynamic_slice start table");
+                    };
+                    defer allocator.free(starts);
+                    for (plan_instruction.inputs[1..], 0..) |input_id, i| starts[i] = value_buffers[input_id.index].?;
+                    break :blk runtime.Buffer.initDynamicSlice(allocator, src, starts, plan_instruction.slice_sizes orelse &.{}, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
+                        error.UnsupportedElementType => {
+                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                            return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "dynamic_slice StableHLO execution currently supports dense host fallback buffers only");
+                        },
+                        error.ShapeMismatch => {
+                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                            return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "dynamic_slice StableHLO starts or slice sizes are invalid");
+                        },
+                        else => {
+                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                            return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute dynamic_slice StableHLO op");
+                        },
+                    };
+                },
+                .dynamic_update_slice => blk: {
+                    const starts = allocator.alloc(*runtime.Buffer, plan_instruction.inputs.len - 2) catch {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate dynamic_update_slice start table");
+                    };
+                    defer allocator.free(starts);
+                    for (plan_instruction.inputs[2..], 0..) |input_id, i| starts[i] = value_buffers[input_id.index].?;
+                    break :blk runtime.Buffer.initDynamicUpdateSlice(allocator, value_buffers[plan_instruction.inputs[0].index].?, value_buffers[plan_instruction.inputs[1].index].?, starts, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
+                        error.UnsupportedElementType => {
+                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                            return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "dynamic_update_slice StableHLO execution currently supports matching dense element types");
+                        },
+                        error.ShapeMismatch => {
+                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                            return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "dynamic_update_slice StableHLO update or starts are invalid");
+                        },
+                        else => {
+                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                            return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute dynamic_update_slice StableHLO op");
+                        },
+                    };
+                },
+                .pad => runtime.Buffer.initPad(allocator, value_buffers[plan_instruction.inputs[0].index].?, value_buffers[plan_instruction.inputs[1].index].?, plan_instruction.edge_padding_low orelse &.{}, plan_instruction.edge_padding_high orelse &.{}, plan_instruction.interior_padding orelse &.{}, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
+                    error.UnsupportedElementType => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "pad StableHLO execution currently supports scalar padding values with dense buffers");
+                    },
+                    error.ShapeMismatch => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "pad StableHLO padding attributes are invalid");
+                    },
+                    else => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute pad StableHLO op");
+                    },
+                },
+                .reverse => runtime.Buffer.initReverse(allocator, value_buffers[plan_instruction.inputs[0].index].?, plan_instruction.dimensions orelse &.{}, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
+                    error.UnsupportedElementType => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "reverse StableHLO execution currently supports dense buffers only");
+                    },
+                    error.ShapeMismatch => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "reverse StableHLO dimensions are invalid");
+                    },
+                    else => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute reverse StableHLO op");
+                    },
+                },
                 .concatenate => blk: {
                     const lhs = value_buffers[plan_instruction.inputs[0].index].?;
                     const rhs = value_buffers[plan_instruction.inputs[1].index].?;
@@ -1101,6 +1256,20 @@ fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callc
                         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute reduce StableHLO op");
                     },
                 },
+                .gather => runtime.Buffer.initGather(allocator, value_buffers[plan_instruction.inputs[0].index].?, value_buffers[plan_instruction.inputs[1].index].?, plan_instruction.offset_dims orelse &.{}, plan_instruction.collapsed_slice_dims orelse &.{}, plan_instruction.operand_batching_dims orelse &.{}, plan_instruction.start_indices_batching_dims orelse &.{}, plan_instruction.start_index_map orelse &.{}, plan_instruction.index_vector_dim orelse 0, plan_instruction.slice_sizes orelse &.{}, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
+                    error.UnsupportedElementType => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "gather StableHLO execution currently supports embedding-style collapsed single-axis gathers");
+                    },
+                    error.ShapeMismatch => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "gather StableHLO dimension numbers or slice sizes are invalid");
+                    },
+                    else => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute gather StableHLO op");
+                    },
+                },
                 .compare => runtime.Buffer.initCompare(allocator, value_buffers[plan_instruction.inputs[0].index].?, value_buffers[plan_instruction.inputs[1].index].?, plan_instruction.compare_direction orelse .eq, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
                     error.UnsupportedElementType => {
                         for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
@@ -1127,6 +1296,20 @@ fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callc
                     else => {
                         for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
                         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute select StableHLO op");
+                    },
+                },
+                .clamp => runtime.Buffer.initClamp(allocator, value_buffers[plan_instruction.inputs[0].index].?, value_buffers[plan_instruction.inputs[1].index].?, value_buffers[plan_instruction.inputs[2].index].?, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
+                    error.UnsupportedElementType => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "clamp StableHLO execution currently supports matching dense numeric buffers");
+                    },
+                    error.ShapeMismatch => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "clamp StableHLO input or output shape is invalid");
+                    },
+                    else => {
+                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
+                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute clamp StableHLO op");
                     },
                 },
                 .unsupported => {
@@ -2745,7 +2928,7 @@ test "compile unsupported op returns detailed PJRT diagnostic" {
     const module_text =
         \\sdy.mesh @mesh = <["x"=2]>
         \\func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
-        \\  %0 = stablehlo.log %arg0 {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{"x"}]>]>} : tensor<4xf32>
+        \\  %0 = "stablehlo.reduce_precision"(%arg0) <{exponent_bits = 8 : i32, mantissa_bits = 23 : i32}> {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{"x"}]>]>} : (tensor<4xf32>) -> tensor<4xf32>
         \\  return %0 : tensor<4xf32>
         \\}
     ;
@@ -2771,7 +2954,7 @@ test "compile unsupported op returns detailed PJRT diagnostic" {
     try std.testing.expectEqual(@as(c.PJRT_Error_Code, @intCast(c.PJRT_Error_Code_UNIMPLEMENTED)), code_args.code);
 
     const message = errorMessage(api, err);
-    try std.testing.expect(std.mem.indexOf(u8, message, "op=log") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "op=reduce_precision") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "dtype=f32") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "rank=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "sharding=sdy.sharding_per_value") != null);

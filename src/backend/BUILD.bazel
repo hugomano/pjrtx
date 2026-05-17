@@ -1,33 +1,32 @@
-load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+load("@rules_zig//zig:defs.bzl", "zig_library", "zig_test")
 
-cc_library(
-    name = "mlx_metal_api",
-    srcs = ["mlx_metal_api.cc"],
-    hdrs = ["mlx_metal_api.h"],
+zig_library(
+    name = "backend",
+    import_name = "src/backend",
+    main = "backend.zig",
     visibility = ["//visibility:public"],
-    copts = ["-std=c++20"],
+    deps = ["//src/core"],
+)
+
+zig_test(
+    name = "backend_test",
+    deps = [":backend"],
+)
+
+zig_library(
+    name = "registry",
+    import_name = "src/backend/registry",
+    main = "registry.zig",
+    visibility = ["//visibility:public"],
     deps = [
-        "@mlx//:metal_runtime",
+        ":backend",
+        "//src/backend/mlx_metal:mlx_metal",
+        "//src/backend/synthetic:synthetic",
+        "//src/core",
     ],
 )
 
-cc_test(
-    name = "mlx_metal_api_test",
-    srcs = ["mlx_metal_api_test.cc"],
-    deps = [":mlx_metal_api"],
-)
-
-cc_library(
-    name = "mlx_vendor_probe",
-    srcs = ["mlx_vendor_probe.cc"],
-    hdrs = ["mlx_vendor_probe.h"],
-    visibility = ["//visibility:public"],
-    copts = ["-std=c++20"],
-    deps = ["@mlx//:metal_runtime"],
-)
-
-cc_test(
-    name = "mlx_vendor_probe_test",
-    srcs = ["mlx_vendor_probe_test.cc"],
-    deps = [":mlx_vendor_probe"],
+zig_test(
+    name = "registry_test",
+    deps = [":registry"],
 )

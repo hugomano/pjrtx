@@ -1,4 +1,4 @@
-#include "src/backend/mlx_vendor_probe.h"
+#include "src/backend/mlx_metal/vendor_probe.h"
 
 #include "mlx/backend/metal/metal.h"
 #include "mlx/device.h"

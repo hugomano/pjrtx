@@ -30,13 +30,45 @@ The Bazel toolchain is configured to follow ZML's sandboxed macOS path:
   discovery. The root module explicitly adds the Metal stack framework slices
   through `osx.frameworks`.
 
+## Architecture
+
+The active architecture plan is tracked in
+[`docs/architecture_refactor_plan.md`](docs/architecture_refactor_plan.md). It
+imports the ZML/v2 bias toward explicit platform ownership, composable memory
+and IO, first-class sharding, pluggable optimized backends, and hermetic runtime
+sandboxes.
+
+- `src/core`: backend-neutral value types for dtype, shape, layout, sharding,
+  device ids, memory ids, topology, buffer descriptors, placements, compile
+  options, value/instruction executable plans, and bootstrap plan instructions.
+  These are the contracts shared across compiler, runtime, plugin, and backends.
+- `src/compiler`: StableHLO/MLIR ingestion, verification, compile option
+  parsing, Shardy metadata extraction, and construction of PjRTx executable
+  plans. The compiler depends on `src/core` and MLIR C API targets only; it does
+  not depend on runtime or backend packages.
+- `src/runtime`: client/device/memory/topology/buffer/executable lifecycle and
+  scheduling. Runtime consumes PjRTx executable plans and dispatches through a
+  backend vtable with opaque backend buffer handles. It does not import MLX,
+  Metal, or C symbols.
+- `src/backend`: the PjRTx backend interface plus implementations. Synthetic is
+  first-class for tests and multi-device simulation. MLX/Metal specifics live
+  under `src/backend/mlx_metal` behind the private C++ C ABI shim.
+- `src/plugin`: PJRT C API adapter only. It parses PJRT inputs, selects a
+  backend through the backend registry, calls compiler/runtime APIs, and
+  translates results back into PJRT structs. It does not import MLX symbols.
+
+Bazel enforces these boundaries with package dependencies and the
+`//:architecture_boundary_test` smoke test.
+
 ## Current Status
 
 - `src/runtime`: explicit client/device/memory/topology/buffer ownership model,
   including synthetic 2/4+ device test coverage, stable PJRT handle arrays, and
-  a backend-kind entry point for the Metal/MLX backend. `metal_mlx` buffers keep
-  a host shadow for bootstrap execution and own an optional opaque Metal buffer
-  for real transfer-path coverage.
+  backend-neutral buffer placement/storage split. Buffers keep a host shadow for
+  bootstrap correctness and may own an opaque backend buffer for transfer-path
+  coverage. Operations are not modeled as buffers in the compiler contract:
+  PjRTx plans contain logical values and instructions, while runtime buffers are
+  only materialized storage for placed value shards.
 - `third_party/mlx`: pinned MLX vendor module at
   `ml-explore/mlx@7b7c12407f85b494e3e6d1cd3888650d224f362c`, exposing only
   core headers plus a Metal-first runtime target. The runtime target vendors
@@ -49,16 +81,18 @@ The Bazel toolchain is configured to follow ZML's sandboxed macOS path:
 - `third_party/metal_cpp`: pinned Apple `metal-cpp_26.zip`, used by the MLX
   Metal header target and linked against the sandboxed macOS SDK framework
   slices. No host Xcode SDK paths are used.
-- `src/backend`: a small PjRTx C ABI shim over the vendored MLX Metal headers
-  and MLX device APIs. It copies MLX Metal device names and recommended
-  working-set sizes into plain C structs so Zig never owns C++/Objective-C
-  objects. The same shim exposes opaque buffers that always keep bootstrap host
-  bytes and opportunistically keep an MLX array when the vendored runtime can
-  construct one, avoiding MLX's non-hermetic default `mlx.metallib` load during
-  plain PJRT host-buffer ownership. The typed constructor preserves dtype and
-  shape metadata for the MLX array path. Elementwise `u8` and `f32` arithmetic
-  plus f32 unary math, transpose, broadcast-in-dim, slice, and concatenate now
-  run through
+- `src/backend`: a Zig backend vtable/interface plus backend-specific package
+  directories. `src/backend/synthetic` owns synthetic multi-device simulation.
+  `src/backend/mlx_metal` owns the small private C ABI shim over vendored MLX
+  Metal headers and MLX device APIs. It copies MLX Metal device names and
+  recommended working-set sizes into plain C structs so Zig never owns
+  C++/Objective-C objects. The same shim exposes opaque buffers that always keep
+  bootstrap host bytes and opportunistically keep an MLX array when the vendored
+  runtime can construct one, avoiding MLX's non-hermetic default `mlx.metallib`
+  load during plain PJRT host-buffer ownership. The typed constructor preserves
+  dtype and shape metadata for the MLX array path. Elementwise `u8` and `f32`
+  arithmetic plus f32 unary math, transpose, broadcast-in-dim, slice, and
+  concatenate now run through
   `mlx::core::{add,subtract,multiply,divide,floor_divide,negative,exp,tanh,sqrt,rsqrt,transpose,reshape,broadcast_to,slice,concatenate}`
   on the GPU device using MLX's runtime Metal JIT when an MLX array and Metal
   device are available. The PjRTx C shim no longer builds direct Metal arithmetic
@@ -70,7 +104,7 @@ The Bazel toolchain is configured to follow ZML's sandboxed macOS path:
   directly, records supported StableHLO ops, constructs parameter/output
   sharding plans from Shardy C attributes, lowers the first bootstrap execution
   ops into a PjRTx executable plan (`copy_arg0` for empty programs, arithmetic
-  plan ops for StableHLO add/subtract/multiply/divide/negate, f32
+  plan instructions for StableHLO add/subtract/multiply/divide/negate, f32
   exp/tanh/sqrt/rsqrt, shape metadata for StableHLO reshape, transpose
   permutations, broadcast dimensions, slice start/limit/stride metadata from
   MLIR DenseI64ArrayAttr, and concatenate dimensions from MLIR integer
@@ -82,8 +116,8 @@ The Bazel toolchain is configured to follow ZML's sandboxed macOS path:
 - `src/plugin`: Zig shared library exporting `GetPjrtApi` and a PJRT API table
   with plugin attributes, errors, events, client/device/memory enumeration,
   host buffer copies, compile skeleton, loaded executable metadata, and
-  per-device execute plumbing. Bootstrap execute now dispatches from the
-  compiled executable plan: empty bootstrap programs copy arg0, linear
+  per-device execute plumbing. Bootstrap execute now dispatches through runtime
+  from compiled executable plans: empty bootstrap programs copy arg0, linear
   StableHLO arithmetic chains execute the bootstrap `u8` and `f32` elementwise
   paths for matching buffers, StableHLO reshape preserves bytes while updating
   buffer dimensions and typed MLX metadata, StableHLO transpose performs dense
@@ -106,6 +140,9 @@ bazel-bin/src/plugin/libpjrtx_metal_plugin.dylib
 
 ## Next Implementation Steps
 
-- Extend executable-plan driven StableHLO op dispatch to shape-preserving view
-  ops while preserving the typed MLX buffer metadata.
+- Grow the staged PjRTx IR passes: shape/type/layout verification, topology
+  validation, memory-space planning, tiling/shard planning, async dependency
+  modeling, fusion marking, and backend legalization.
 - Implement the initial StableHLO op set and JAX CPU-vs-PjRTx correctness tests.
+- Add focused backend conformance tests so synthetic and MLX backends prove the
+  same buffer/execution semantics through the vtable.

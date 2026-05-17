@@ -1,6 +1,15 @@
 load("@rules_cc//cc:defs.bzl", "cc_library")
 load("@rules_zig//zig:defs.bzl", "zig_library", "zig_test")
 
+filegroup(
+    name = "sources",
+    srcs = [
+        "BUILD.bazel",
+        "compiler.zig",
+    ],
+    visibility = ["//visibility:public"],
+)
+
 cc_library(
     name = "mlir_c_api",
     srcs = ["mlir_register.cc"],
@@ -25,7 +34,7 @@ zig_library(
     visibility = ["//visibility:public"],
     deps = [
         ":mlir_c_api",
-        "//src/runtime",
+        "//src/core",
     ],
 )
 

@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const backend_api = @import("src/backend");
+const backend_registry = @import("src/backend/registry");
 const compiler = @import("src/compiler");
 const runtime = @import("src/runtime");
 const c = @import("c");
@@ -296,8 +298,8 @@ fn pjrtClientCreate(args: [*c]c.PJRT_Client_Create_Args) callconv(.c) ?*c.PJRT_E
         return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "invalid PjRTx client create option");
     };
     const client = switch (config.backend_kind) {
-        .synthetic => runtime.Client.initForBackend(allocator, .synthetic, config.synthetic_device_count),
-        .metal_mlx => runtime.Client.initMetalMlxBootstrap(allocator),
+        .synthetic => runtime.Client.init(allocator, backend_registry.create(.synthetic), config.synthetic_device_count),
+        .metal_mlx => runtime.Client.init(allocator, backend_registry.create(.metal_mlx), 1),
     } catch {
         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to create PjRTx client");
     };
@@ -439,7 +441,7 @@ fn pjrtClientBufferFromHostBuffer(args: [*c]c.PJRT_Client_BufferFromHostBuffer_A
     const dims = args[0].dims[0..args[0].num_dims];
     const byte_size = denseByteSize(args[0].type, dims);
     const data = @as([*]const u8, @ptrCast(args[0].data))[0..byte_size];
-    const buffer = runtime.Buffer.initHostCopyForBackend(allocator, client.backend_kind, runtimeTypeFromPjrt(args[0].type), dims, device, memory, @intCast(device.id), data) catch {
+    const buffer = runtime.Buffer.initHostCopyForBackend(allocator, client.backend, runtimeTypeFromPjrt(args[0].type), dims, device, memory, @intCast(device.id), data) catch {
         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to create host buffer copy");
     };
     args[0].buffer = @ptrCast(buffer);
@@ -639,7 +641,7 @@ fn loadedExecutableIsDeleted(args: [*c]c.PJRT_LoadedExecutable_IsDeleted_Args) c
     return null;
 }
 
-fn runtimeBinaryOp(kind: compiler.PlanOpKind) ?runtime.ElementwiseBinaryOp {
+fn runtimeBinaryOp(kind: compiler.PlanInstructionKind) ?runtime.ElementwiseBinaryOp {
     return switch (kind) {
         .add => .add,
         .subtract => .subtract,
@@ -649,7 +651,7 @@ fn runtimeBinaryOp(kind: compiler.PlanOpKind) ?runtime.ElementwiseBinaryOp {
     };
 }
 
-fn runtimeUnaryOp(kind: compiler.PlanOpKind) ?runtime.ElementwiseUnaryOp {
+fn runtimeUnaryOp(kind: compiler.PlanInstructionKind) ?runtime.ElementwiseUnaryOp {
     return switch (kind) {
         .negate => .negate,
         .exp => .exp,
@@ -667,13 +669,13 @@ fn destroyOwnedBuffer(buffer: *runtime.Buffer, owned: bool) void {
 fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callconv(.c) ?*c.PJRT_Error {
     const executable = executableFromC(args[0].executable);
     if (args[0].num_args == 0) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx bootstrap execute expects at least one argument");
-    if (executable.plan.ops.len == 0) return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "executable plan has no runtime operations");
+    if (executable.plan.instructions.len == 0) return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "executable plan has no runtime operations");
     for (0..args[0].num_devices) |device_index| {
         const first_arg = args[0].argument_lists[device_index][0];
         var current = bufferFromC(first_arg);
         var current_owned = false;
-        for (executable.plan.ops) |plan_op| {
-            const next = switch (plan_op.kind) {
+        for (executable.plan.instructions) |plan_instruction| {
+            const next = switch (plan_instruction.kind) {
                 .copy_arg0 => runtime.Buffer.initDeviceCopy(allocator, current, device_index) catch {
                     destroyOwnedBuffer(current, current_owned);
                     return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate execute output");
@@ -684,7 +686,7 @@ fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callc
                         return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "binary StableHLO executable expects two arguments");
                     }
                     const rhs = bufferFromC(args[0].argument_lists[device_index][1]);
-                    break :blk runtime.Buffer.initElementwiseBinary(allocator, runtimeBinaryOp(plan_op.kind).?, current, rhs, device_index) catch |err| switch (err) {
+                    break :blk runtime.Buffer.initElementwiseBinary(allocator, runtimeBinaryOp(plan_instruction.kind).?, current, rhs, device_index) catch |err| switch (err) {
                         error.UnsupportedElementType => {
                             destroyOwnedBuffer(current, current_owned);
                             return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "binary StableHLO execution currently supports u8 and f32 buffers only");
@@ -699,7 +701,7 @@ fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callc
                         },
                     };
                 },
-                .negate, .exp, .tanh, .sqrt, .rsqrt => runtime.Buffer.initElementwiseUnary(allocator, runtimeUnaryOp(plan_op.kind).?, current, device_index) catch |err| switch (err) {
+                .negate, .exp, .tanh, .sqrt, .rsqrt => runtime.Buffer.initElementwiseUnary(allocator, runtimeUnaryOp(plan_instruction.kind).?, current, device_index) catch |err| switch (err) {
                     error.UnsupportedElementType => {
                         destroyOwnedBuffer(current, current_owned);
                         return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "unary StableHLO execution currently supports u8 negate and f32 math buffers only");
@@ -709,7 +711,7 @@ fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callc
                         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute unary StableHLO op");
                     },
                 },
-                .reshape => runtime.Buffer.initReshape(allocator, current, plan_op.dims orelse &.{}, device_index) catch |err| switch (err) {
+                .reshape => runtime.Buffer.initReshape(allocator, current, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
                     error.UnsupportedElementType => {
                         destroyOwnedBuffer(current, current_owned);
                         return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "reshape StableHLO execution currently supports u8 and f32 MLX buffers only");
@@ -723,7 +725,7 @@ fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callc
                         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute reshape StableHLO op");
                     },
                 },
-                .transpose => runtime.Buffer.initTranspose(allocator, current, plan_op.permutation orelse &.{}, plan_op.dims orelse &.{}, device_index) catch |err| switch (err) {
+                .transpose => runtime.Buffer.initTranspose(allocator, current, plan_instruction.permutation orelse &.{}, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
                     error.UnsupportedElementType => {
                         destroyOwnedBuffer(current, current_owned);
                         return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "transpose StableHLO execution currently supports dense u8 and f32 buffers only");
@@ -737,7 +739,7 @@ fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callc
                         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute transpose StableHLO op");
                     },
                 },
-                .broadcast_in_dim => runtime.Buffer.initBroadcastInDim(allocator, current, plan_op.broadcast_dimensions orelse &.{}, plan_op.dims orelse &.{}, device_index) catch |err| switch (err) {
+                .broadcast_in_dim => runtime.Buffer.initBroadcastInDim(allocator, current, plan_instruction.broadcast_dimensions orelse &.{}, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
                     error.UnsupportedElementType => {
                         destroyOwnedBuffer(current, current_owned);
                         return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "broadcast_in_dim StableHLO execution currently supports dense u8 and f32 buffers only");
@@ -754,10 +756,10 @@ fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callc
                 .slice => runtime.Buffer.initSlice(
                     allocator,
                     current,
-                    plan_op.start_indices orelse &.{},
-                    plan_op.limit_indices orelse &.{},
-                    plan_op.strides orelse &.{},
-                    plan_op.dims orelse &.{},
+                    plan_instruction.start_indices orelse &.{},
+                    plan_instruction.limit_indices orelse &.{},
+                    plan_instruction.strides orelse &.{},
+                    plan_instruction.dims orelse &.{},
                     device_index,
                 ) catch |err| switch (err) {
                     error.UnsupportedElementType => {
@@ -783,8 +785,8 @@ fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callc
                         allocator,
                         current,
                         rhs,
-                        plan_op.dimension orelse 0,
-                        plan_op.dims orelse &.{},
+                        plan_instruction.dimension orelse 0,
+                        plan_instruction.dims orelse &.{},
                         device_index,
                     ) catch |err| switch (err) {
                         error.UnsupportedElementType => {

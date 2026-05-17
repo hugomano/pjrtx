@@ -1,0 +1,13 @@
+load("@rules_zig//zig:defs.bzl", "zig_library", "zig_test")
+
+zig_library(
+    name = "core",
+    import_name = "src/core",
+    main = "core.zig",
+    visibility = ["//visibility:public"],
+)
+
+zig_test(
+    name = "core_test",
+    deps = [":core"],
+)

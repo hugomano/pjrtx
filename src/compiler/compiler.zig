@@ -1,6 +1,6 @@
 const std = @import("std");
 const mlir = @import("c");
-const runtime = @import("src/runtime");
+const core = @import("src/core");
 
 var shardy_pass_registration_mutex: std.atomic.Mutex = .unlocked;
 var shardy_passes_registered = false;
@@ -12,16 +12,7 @@ pub const Partitioner = enum {
     gspmd,
 };
 
-pub const CompileOptions = struct {
-    num_replicas: i32 = 1,
-    num_partitions: i32 = 1,
-    use_shardy_partitioner: bool = true,
-    device_assignment: []const i32 = &.{},
-
-    pub fn numDevices(self: CompileOptions) usize {
-        return @intCast(self.num_replicas * self.num_partitions);
-    }
-};
+pub const CompileOptions = core.CompileOptions;
 
 pub const ProgramFormat = enum {
     stablehlo_text,
@@ -78,20 +69,8 @@ pub const Operation = struct {
     }
 };
 
-pub const ShardingKind = enum {
-    replicated,
-    partitioned,
-    manual,
-};
-
-pub const ShardingMetadata = struct {
-    kind: ShardingKind,
-    mesh_name: []const u8,
-
-    fn deinit(self: ShardingMetadata, allocator: std.mem.Allocator) void {
-        allocator.free(self.mesh_name);
-    }
-};
+pub const ShardingKind = core.ShardingKind;
+pub const ShardingMetadata = core.ShardingMetadata;
 
 pub const ModuleAnalysis = struct {
     allocator: std.mem.Allocator,
@@ -356,72 +335,10 @@ fn parseAndRunMlirWithCapi(module_text: []const u8, writer: *std.Io.Writer) Anal
     return session;
 }
 
-pub const ShardingPlan = struct {
-    kind: ShardingKind,
-    mesh_name: []const u8,
-    device_assignment: []const i32,
-};
-
-pub const PlanOpKind = enum {
-    copy_arg0,
-    add,
-    subtract,
-    multiply,
-    divide,
-    negate,
-    exp,
-    tanh,
-    sqrt,
-    rsqrt,
-    reshape,
-    transpose,
-    broadcast_in_dim,
-    slice,
-    concatenate,
-    unsupported,
-};
-
-pub const PlanOp = struct {
-    kind: PlanOpKind,
-    dims: ?[]const i64 = null,
-    permutation: ?[]const i64 = null,
-    broadcast_dimensions: ?[]const i64 = null,
-    start_indices: ?[]const i64 = null,
-    limit_indices: ?[]const i64 = null,
-    strides: ?[]const i64 = null,
-    dimension: ?i64 = null,
-};
-
-pub const ExecutablePlan = struct {
-    allocator: std.mem.Allocator,
-    options: CompileOptions,
-    parameter_shardings: []ShardingPlan,
-    output_shardings: []ShardingPlan,
-    ops: []PlanOp,
-
-    pub fn deinit(self: *ExecutablePlan) void {
-        self.allocator.free(self.options.device_assignment);
-        for (self.parameter_shardings) |plan| {
-            self.allocator.free(plan.mesh_name);
-            self.allocator.free(plan.device_assignment);
-        }
-        for (self.output_shardings) |plan| {
-            self.allocator.free(plan.mesh_name);
-            self.allocator.free(plan.device_assignment);
-        }
-        for (self.ops) |op| {
-            if (op.dims) |dims| self.allocator.free(dims);
-            if (op.permutation) |permutation| self.allocator.free(permutation);
-            if (op.broadcast_dimensions) |broadcast_dimensions| self.allocator.free(broadcast_dimensions);
-            if (op.start_indices) |start_indices| self.allocator.free(start_indices);
-            if (op.limit_indices) |limit_indices| self.allocator.free(limit_indices);
-            if (op.strides) |strides| self.allocator.free(strides);
-        }
-        self.allocator.free(self.parameter_shardings);
-        self.allocator.free(self.output_shardings);
-        self.allocator.free(self.ops);
-    }
-};
+pub const ShardingPlan = core.ShardingPlan;
+pub const PlanInstructionKind = core.PlanInstructionKind;
+pub const PlanInstruction = core.PlanInstruction;
+pub const ExecutablePlan = core.ExecutablePlan;
 
 pub fn parseTextCompileOptionsFromReader(allocator: std.mem.Allocator, reader: *std.Io.Reader) !CompileOptions {
     const text = try reader.allocRemaining(allocator, .limited(64 * 1024));
@@ -488,7 +405,7 @@ pub fn makeReplicatedPlan(
     errdefer allocator.free(parameter_shardings);
     const output_shardings = try allocator.alloc(ShardingPlan, num_outputs);
     errdefer allocator.free(output_shardings);
-    const ops = try allocator.dupe(PlanOp, &.{.{ .kind = .copy_arg0 }});
+    const ops = try allocator.dupe(PlanInstruction, &.{.{ .kind = .copy_arg0 }});
     errdefer allocator.free(ops);
 
     var initialized_parameters: usize = 0;
@@ -516,7 +433,7 @@ pub fn makeReplicatedPlan(
         .options = owned_options,
         .parameter_shardings = parameter_shardings,
         .output_shardings = output_shardings,
-        .ops = ops,
+        .instructions = ops,
     };
 }
 
@@ -573,12 +490,12 @@ pub fn makeExecutablePlan(
     if (options.use_shardy_partitioner) {
         try applyAnalysisShardingMetadataToPlan(allocator, &plan, analysis);
     }
-    allocator.free(plan.ops);
-    plan.ops = try lowerAnalysisOpsToPlan(allocator, analysis.ops);
+    allocator.free(plan.instructions);
+    plan.instructions = try lowerAnalysisOpsToPlan(allocator, analysis.ops);
     return plan;
 }
 
-fn planOpKindFromStablehlo(name: []const u8) PlanOpKind {
+fn instructionKindFromStablehlo(name: []const u8) PlanInstructionKind {
     if (std.mem.eql(u8, name, "add")) return .add;
     if (std.mem.eql(u8, name, "subtract")) return .subtract;
     if (std.mem.eql(u8, name, "multiply")) return .multiply;
@@ -596,24 +513,24 @@ fn planOpKindFromStablehlo(name: []const u8) PlanOpKind {
     return .unsupported;
 }
 
-fn lowerAnalysisOpsToPlan(allocator: std.mem.Allocator, ops: []const Operation) ![]PlanOp {
-    if (ops.len == 0) return allocator.dupe(PlanOp, &.{.{ .kind = .copy_arg0 }});
-    const plan_ops = try allocator.alloc(PlanOp, ops.len);
+fn lowerAnalysisOpsToPlan(allocator: std.mem.Allocator, ops: []const Operation) ![]PlanInstruction {
+    if (ops.len == 0) return allocator.dupe(PlanInstruction, &.{.{ .kind = .copy_arg0 }});
+    const plan_instructions = try allocator.alloc(PlanInstruction, ops.len);
     errdefer {
-        for (plan_ops) |plan_op| {
-            if (plan_op.dims) |dims| allocator.free(dims);
-            if (plan_op.permutation) |permutation| allocator.free(permutation);
-            if (plan_op.broadcast_dimensions) |broadcast_dimensions| allocator.free(broadcast_dimensions);
-            if (plan_op.start_indices) |start_indices| allocator.free(start_indices);
-            if (plan_op.limit_indices) |limit_indices| allocator.free(limit_indices);
-            if (plan_op.strides) |strides| allocator.free(strides);
+        for (plan_instructions) |plan_instruction| {
+            if (plan_instruction.dims) |dims| allocator.free(dims);
+            if (plan_instruction.permutation) |permutation| allocator.free(permutation);
+            if (plan_instruction.broadcast_dimensions) |broadcast_dimensions| allocator.free(broadcast_dimensions);
+            if (plan_instruction.start_indices) |start_indices| allocator.free(start_indices);
+            if (plan_instruction.limit_indices) |limit_indices| allocator.free(limit_indices);
+            if (plan_instruction.strides) |strides| allocator.free(strides);
         }
-        allocator.free(plan_ops);
+        allocator.free(plan_instructions);
     }
-    @memset(plan_ops, .{ .kind = .unsupported });
-    for (ops, plan_ops) |op, *plan_op| {
-        const kind = planOpKindFromStablehlo(op.name);
-        plan_op.* = .{
+    @memset(plan_instructions, .{ .kind = .unsupported });
+    for (ops, plan_instructions) |op, *plan_instruction| {
+        const kind = instructionKindFromStablehlo(op.name);
+        plan_instruction.* = .{
             .kind = kind,
             .dims = if (kind == .reshape or kind == .transpose or kind == .broadcast_in_dim or kind == .slice or kind == .concatenate) try allocator.dupe(i64, op.dims) else null,
             .permutation = if (kind == .transpose) try allocator.dupe(i64, op.permutation) else null,
@@ -624,7 +541,7 @@ fn lowerAnalysisOpsToPlan(allocator: std.mem.Allocator, ops: []const Operation) 
             .dimension = if (kind == .concatenate) op.dimension else null,
         };
     }
-    return plan_ops;
+    return plan_instructions;
 }
 
 fn addDialect(list: *std.ArrayList(Dialect), allocator: std.mem.Allocator, dialect: Dialect) !void {
@@ -1225,8 +1142,8 @@ test "replicated executable plan has per-value sharding metadata" {
     try std.testing.expectEqual(@as(usize, 2), plan.parameter_shardings.len);
     try std.testing.expectEqual(ShardingKind.replicated, plan.output_shardings[0].kind);
     try std.testing.expectEqualSlices(i32, &.{ 0, 1, 2, 3 }, plan.output_shardings[0].device_assignment);
-    try std.testing.expectEqual(@as(usize, 1), plan.ops.len);
-    try std.testing.expectEqual(PlanOpKind.copy_arg0, plan.ops[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), plan.instructions.len);
+    try std.testing.expectEqual(PlanInstructionKind.copy_arg0, plan.instructions[0].kind);
 }
 
 test "executable plan preserves verified shardy parameter and output metadata" {
@@ -1254,8 +1171,8 @@ test "executable plan preserves verified shardy parameter and output metadata" {
     try std.testing.expectEqualStrings("mesh", plan.parameter_shardings[0].mesh_name);
     try std.testing.expectEqualStrings("mesh", plan.output_shardings[0].mesh_name);
     try std.testing.expectEqualSlices(i32, &.{ 0, 1 }, plan.output_shardings[0].device_assignment);
-    try std.testing.expectEqual(@as(usize, 1), plan.ops.len);
-    try std.testing.expectEqual(PlanOpKind.add, plan.ops[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), plan.instructions.len);
+    try std.testing.expectEqual(PlanInstructionKind.add, plan.instructions[0].kind);
 }
 
 test "executable plan lowers initial arithmetic StableHLO ops" {
@@ -1278,9 +1195,9 @@ test "executable plan lowers initial arithmetic StableHLO ops" {
     var plan = try makeExecutablePlan(std.testing.allocator, .{}, analysis);
     defer plan.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), plan.ops.len);
-    try std.testing.expectEqual(PlanOpKind.subtract, plan.ops[0].kind);
-    try std.testing.expectEqual(PlanOpKind.negate, plan.ops[1].kind);
+    try std.testing.expectEqual(@as(usize, 2), plan.instructions.len);
+    try std.testing.expectEqual(PlanInstructionKind.subtract, plan.instructions[0].kind);
+    try std.testing.expectEqual(PlanInstructionKind.negate, plan.instructions[1].kind);
 }
 
 test "executable plan lowers f32 unary math StableHLO ops" {
@@ -1305,11 +1222,11 @@ test "executable plan lowers f32 unary math StableHLO ops" {
     var plan = try makeExecutablePlan(std.testing.allocator, .{}, analysis);
     defer plan.deinit();
 
-    try std.testing.expectEqual(@as(usize, 4), plan.ops.len);
-    try std.testing.expectEqual(PlanOpKind.exp, plan.ops[0].kind);
-    try std.testing.expectEqual(PlanOpKind.tanh, plan.ops[1].kind);
-    try std.testing.expectEqual(PlanOpKind.sqrt, plan.ops[2].kind);
-    try std.testing.expectEqual(PlanOpKind.rsqrt, plan.ops[3].kind);
+    try std.testing.expectEqual(@as(usize, 4), plan.instructions.len);
+    try std.testing.expectEqual(PlanInstructionKind.exp, plan.instructions[0].kind);
+    try std.testing.expectEqual(PlanInstructionKind.tanh, plan.instructions[1].kind);
+    try std.testing.expectEqual(PlanInstructionKind.sqrt, plan.instructions[2].kind);
+    try std.testing.expectEqual(PlanInstructionKind.rsqrt, plan.instructions[3].kind);
 }
 
 test "executable plan lowers reshape with result dimensions" {
@@ -1331,9 +1248,9 @@ test "executable plan lowers reshape with result dimensions" {
     var plan = try makeExecutablePlan(std.testing.allocator, .{}, analysis);
     defer plan.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), plan.ops.len);
-    try std.testing.expectEqual(PlanOpKind.reshape, plan.ops[0].kind);
-    try std.testing.expectEqualSlices(i64, &.{4}, plan.ops[0].dims.?);
+    try std.testing.expectEqual(@as(usize, 1), plan.instructions.len);
+    try std.testing.expectEqual(PlanInstructionKind.reshape, plan.instructions[0].kind);
+    try std.testing.expectEqualSlices(i64, &.{4}, plan.instructions[0].dims.?);
 }
 
 test "executable plan lowers transpose with permutation and result dimensions" {
@@ -1355,10 +1272,10 @@ test "executable plan lowers transpose with permutation and result dimensions" {
     var plan = try makeExecutablePlan(std.testing.allocator, .{}, analysis);
     defer plan.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), plan.ops.len);
-    try std.testing.expectEqual(PlanOpKind.transpose, plan.ops[0].kind);
-    try std.testing.expectEqualSlices(i64, &.{ 3, 2 }, plan.ops[0].dims.?);
-    try std.testing.expectEqualSlices(i64, &.{ 1, 0 }, plan.ops[0].permutation.?);
+    try std.testing.expectEqual(@as(usize, 1), plan.instructions.len);
+    try std.testing.expectEqual(PlanInstructionKind.transpose, plan.instructions[0].kind);
+    try std.testing.expectEqualSlices(i64, &.{ 3, 2 }, plan.instructions[0].dims.?);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 0 }, plan.instructions[0].permutation.?);
 }
 
 test "executable plan lowers broadcast_in_dim with dimensions and result shape" {
@@ -1380,10 +1297,10 @@ test "executable plan lowers broadcast_in_dim with dimensions and result shape" 
     var plan = try makeExecutablePlan(std.testing.allocator, .{}, analysis);
     defer plan.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), plan.ops.len);
-    try std.testing.expectEqual(PlanOpKind.broadcast_in_dim, plan.ops[0].kind);
-    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, plan.ops[0].dims.?);
-    try std.testing.expectEqualSlices(i64, &.{1}, plan.ops[0].broadcast_dimensions.?);
+    try std.testing.expectEqual(@as(usize, 1), plan.instructions.len);
+    try std.testing.expectEqual(PlanInstructionKind.broadcast_in_dim, plan.instructions[0].kind);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, plan.instructions[0].dims.?);
+    try std.testing.expectEqualSlices(i64, &.{1}, plan.instructions[0].broadcast_dimensions.?);
 }
 
 test "executable plan lowers slice with bounds strides and result shape" {
@@ -1405,12 +1322,12 @@ test "executable plan lowers slice with bounds strides and result shape" {
     var plan = try makeExecutablePlan(std.testing.allocator, .{}, analysis);
     defer plan.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), plan.ops.len);
-    try std.testing.expectEqual(PlanOpKind.slice, plan.ops[0].kind);
-    try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, plan.ops[0].dims.?);
-    try std.testing.expectEqualSlices(i64, &.{ 1, 0 }, plan.ops[0].start_indices.?);
-    try std.testing.expectEqualSlices(i64, &.{ 3, 4 }, plan.ops[0].limit_indices.?);
-    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, plan.ops[0].strides.?);
+    try std.testing.expectEqual(@as(usize, 1), plan.instructions.len);
+    try std.testing.expectEqual(PlanInstructionKind.slice, plan.instructions[0].kind);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, plan.instructions[0].dims.?);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 0 }, plan.instructions[0].start_indices.?);
+    try std.testing.expectEqualSlices(i64, &.{ 3, 4 }, plan.instructions[0].limit_indices.?);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, plan.instructions[0].strides.?);
 }
 
 test "executable plan lowers concatenate with dimension and result shape" {
@@ -1432,10 +1349,10 @@ test "executable plan lowers concatenate with dimension and result shape" {
     var plan = try makeExecutablePlan(std.testing.allocator, .{}, analysis);
     defer plan.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), plan.ops.len);
-    try std.testing.expectEqual(PlanOpKind.concatenate, plan.ops[0].kind);
-    try std.testing.expectEqualSlices(i64, &.{ 2, 5 }, plan.ops[0].dims.?);
-    try std.testing.expectEqual(@as(?i64, 1), plan.ops[0].dimension);
+    try std.testing.expectEqual(@as(usize, 1), plan.instructions.len);
+    try std.testing.expectEqual(PlanInstructionKind.concatenate, plan.instructions[0].kind);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 5 }, plan.instructions[0].dims.?);
+    try std.testing.expectEqual(@as(?i64, 1), plan.instructions[0].dimension);
 }
 
 test "analyze stablehlo text registers dialects and supported ops" {

@@ -1,4 +1,4 @@
-#include "src/backend/mlx_metal_api.h"
+#include "src/backend/mlx_metal/api.h"
 
 #include <cstdio>
 #include <cstring>

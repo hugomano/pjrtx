@@ -1,5 +1,14 @@
 load("@rules_zig//zig:defs.bzl", "zig_shared_library", "zig_test")
 
+filegroup(
+    name = "sources",
+    srcs = [
+        "BUILD.bazel",
+        "plugin.zig",
+    ],
+    visibility = ["//visibility:public"],
+)
+
 zig_shared_library(
     name = "pjrtx_metal_plugin",
     main = "plugin.zig",
@@ -7,6 +16,8 @@ zig_shared_library(
     visibility = ["//visibility:public"],
     zigopts = ["-fno-stack-check"],
     deps = [
+        "//src/backend",
+        "//src/backend:registry",
         "//src/compiler",
         "//src/runtime",
         "@xla//xla/pjrt/c:pjrt_c_api_hdrs",
@@ -17,6 +28,8 @@ zig_test(
     name = "plugin_test",
     main = "plugin.zig",
     deps = [
+        "//src/backend",
+        "//src/backend:registry",
         "//src/compiler",
         "//src/runtime",
         "@xla//xla/pjrt/c:pjrt_c_api_hdrs",

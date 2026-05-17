@@ -1,18 +1,13 @@
 const std = @import("std");
-const mlx_metal = @import("c");
+const backend_api = @import("src/backend");
+const core = @import("src/core");
 
-pub const MAX_DEVICES = 64;
-
-pub const MemoryKind = enum {
-    device,
-    host_pinned,
-    host_unpinned,
-};
-
-pub const BackendKind = enum {
-    synthetic,
-    metal_mlx,
-};
+pub const MAX_DEVICES = core.MAX_DEVICES;
+pub const MemoryKind = core.MemoryKind;
+pub const BackendKind = core.BackendKind;
+pub const BufferType = core.BufferType;
+pub const ElementwiseBinaryOp = core.ElementwiseBinaryOp;
+pub const ElementwiseUnaryOp = core.ElementwiseUnaryOp;
 
 pub const Device = struct {
     id: i32,
@@ -49,6 +44,7 @@ pub const Topology = struct {
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
+    backend: backend_api.Backend,
     backend_kind: BackendKind,
     devices: []Device,
     memories: []Memory,
@@ -56,41 +52,37 @@ pub const Client = struct {
     memory_handles: []*Memory,
     topology: Topology,
 
-    pub fn initForBackend(allocator: std.mem.Allocator, backend_kind: BackendKind, device_count: usize) !*Client {
+    pub fn init(allocator: std.mem.Allocator, backend_impl: backend_api.Backend, device_count: usize) !*Client {
         if (device_count == 0 or device_count > MAX_DEVICES) return error.InvalidDeviceCount;
+        const backend_kind = backend_impl.kind();
 
         const client = try allocator.create(Client);
         errdefer allocator.destroy(client);
 
-        const devices = try allocator.alloc(Device, device_count);
+        const descriptors = try backend_impl.enumerateDevices(allocator, device_count);
+        defer backend_impl.releaseDeviceDescriptors(allocator, descriptors);
+        if (descriptors.len == 0 or descriptors.len > MAX_DEVICES) return error.InvalidDeviceCount;
+
+        const devices = try allocator.alloc(Device, descriptors.len);
         errdefer allocator.free(devices);
 
-        const memories = try allocator.alloc(Memory, device_count);
+        const memories = try allocator.alloc(Memory, descriptors.len);
         errdefer allocator.free(memories);
 
-        const device_handles = try allocator.alloc(*Device, device_count);
+        const device_handles = try allocator.alloc(*Device, descriptors.len);
         errdefer allocator.free(device_handles);
 
-        const memory_handles = try allocator.alloc(*Memory, device_count);
+        const memory_handles = try allocator.alloc(*Memory, descriptors.len);
         errdefer allocator.free(memory_handles);
 
-        const assignment = try allocator.alloc(i32, device_count);
+        const assignment = try allocator.alloc(i32, descriptors.len);
         errdefer allocator.free(assignment);
 
-        for (0..device_count) |i| {
-            const id: i32 = @intCast(i);
-            const default_name = switch (backend_kind) {
-                .synthetic => "Synthetic Metal device",
-                .metal_mlx => "Metal/MLX device",
-            };
-            const debug_string_text = switch (backend_kind) {
-                .synthetic => "PjRTx synthetic Metal device",
-                .metal_mlx => "PjRTx Metal/MLX device",
-            };
-            const name = try allocator.dupe(u8, default_name);
+        for (descriptors, 0..) |descriptor, i| {
+            const name = try allocator.dupe(u8, descriptor.name);
             errdefer allocator.free(name);
 
-            const debug_string = try allocator.dupe(u8, debug_string_text);
+            const debug_string = try allocator.dupe(u8, descriptor.debug_string);
             errdefer allocator.free(debug_string);
 
             const memory_debug_string = try allocator.dupe(u8, "device");
@@ -106,17 +98,22 @@ pub const Client = struct {
             errdefer allocator.free(ids);
 
             devices[i] = .{
-                .id = id,
-                .local_hardware_id = id,
+                .id = descriptor.id,
+                .local_hardware_id = descriptor.local_hardware_id,
+                .registry_id = descriptor.registry_id,
+                .process_index = descriptor.process_index,
+                .addressable = descriptor.addressable,
                 .name = name,
                 .debug_string = debug_string,
-                .default_memory_id = id,
+                .memory_bytes = descriptor.memory_bytes,
+                .has_unified_memory = descriptor.has_unified_memory,
+                .default_memory_id = descriptor.default_memory_id,
                 .default_memory = &memories[i],
                 .addressable_memories = device_memories,
             };
-            ids[0] = id;
+            ids[0] = descriptor.id;
             memories[i] = .{
-                .id = id,
+                .id = descriptor.default_memory_id,
                 .kind = .device,
                 .debug_string = memory_debug_string,
                 .addressable_device_ids = ids,
@@ -126,11 +123,12 @@ pub const Client = struct {
             memories[i].addressable_devices[0] = &devices[i];
             device_handles[i] = &devices[i];
             memory_handles[i] = &memories[i];
-            assignment[i] = id;
+            assignment[i] = descriptor.id;
         }
 
         client.* = .{
             .allocator = allocator,
+            .backend = backend_impl,
             .backend_kind = backend_kind,
             .devices = devices,
             .memories = memories,
@@ -139,21 +137,10 @@ pub const Client = struct {
             .topology = .{
                 .device_assignment = assignment,
                 .num_replicas = 1,
-                .num_partitions = @intCast(device_count),
+                .num_partitions = @intCast(descriptors.len),
             },
         };
         return client;
-    }
-
-    pub fn initSynthetic(allocator: std.mem.Allocator, device_count: usize) !*Client {
-        return initForBackend(allocator, .synthetic, device_count);
-    }
-
-    pub fn initMetalMlxBootstrap(allocator: std.mem.Allocator) !*Client {
-        var metal_devices: [MAX_DEVICES]mlx_metal.PjrtxMlxMetalDeviceInfo = undefined;
-        const copied = mlx_metal.pjrtx_mlx_metal_copy_devices(&metal_devices, MAX_DEVICES);
-        if (copied <= 0) return initForBackend(allocator, .metal_mlx, 1);
-        return initMetalMlxFromDevices(allocator, metal_devices[0..@intCast(copied)]);
     }
 
     pub fn deinit(self: *Client) void {
@@ -175,37 +162,6 @@ pub const Client = struct {
         self.allocator.destroy(self);
     }
 
-    fn initMetalMlxFromDevices(
-        allocator: std.mem.Allocator,
-        metal_devices: []const mlx_metal.PjrtxMlxMetalDeviceInfo,
-    ) !*Client {
-        const client = try initForBackend(allocator, .metal_mlx, metal_devices.len);
-        errdefer client.deinit();
-
-        for (metal_devices, 0..) |metal_device, i| {
-            const name_bytes = cNameBytes(&metal_device.name);
-            const name = try allocator.dupe(u8, name_bytes);
-            errdefer allocator.free(name);
-
-            var debug_buffer: [256]u8 = undefined;
-            var debug_writer = std.Io.Writer.fixed(&debug_buffer);
-            try debug_writer.print("PjRTx Metal/MLX device {d}: {s}", .{ i, name });
-            const debug_string = try allocator.dupe(u8, debug_writer.buffered());
-            errdefer allocator.free(debug_string);
-
-            allocator.free(client.devices[i].name);
-            allocator.free(client.devices[i].debug_string);
-            client.devices[i].name = name;
-            client.devices[i].debug_string = debug_string;
-            client.devices[i].local_hardware_id = metal_device.ordinal;
-            client.devices[i].registry_id = metal_device.registry_id;
-            client.devices[i].memory_bytes = metal_device.recommended_max_working_set_size;
-            client.devices[i].has_unified_memory = metal_device.has_unified_memory != 0;
-        }
-
-        return client;
-    }
-
     pub fn lookupDevice(self: *const Client, id: i32) ?*const Device {
         for (self.devices) |*device| {
             if (device.id == id) return device;
@@ -221,61 +177,9 @@ pub const Client = struct {
     }
 };
 
-fn cNameBytes(name: *const [128]u8) []const u8 {
-    const end = std.mem.indexOfScalar(u8, name, 0) orelse name.len;
-    return name[0..end];
-}
-
-fn fillCName(name: *[128]u8, text: []const u8) void {
-    @memset(name, 0);
-    const len = @min(name.len - 1, text.len);
-    for (text[0..len], 0..) |byte, i| name[i] = byte;
-}
-
-pub const BufferType = enum {
-    invalid,
-    pred,
-    s8,
-    s16,
-    s32,
-    s64,
-    u8,
-    u16,
-    u32,
-    u64,
-    f16,
-    f32,
-    f64,
-    bf16,
-
-    pub fn byteSize(self: BufferType) usize {
-        return switch (self) {
-            .invalid => 0,
-            .pred, .s8, .u8 => 1,
-            .s16, .u16, .f16, .bf16 => 2,
-            .s32, .u32, .f32 => 4,
-            .s64, .u64, .f64 => 8,
-        };
-    }
-};
-
-pub const ElementwiseBinaryOp = enum {
-    add,
-    subtract,
-    multiply,
-    divide,
-};
-
-pub const ElementwiseUnaryOp = enum {
-    negate,
-    exp,
-    tanh,
-    sqrt,
-    rsqrt,
-};
-
 pub const Buffer = struct {
     allocator: std.mem.Allocator,
+    backend: backend_api.Backend,
     backend_kind: BackendKind,
     element_type: BufferType,
     dims: []i64,
@@ -285,24 +189,12 @@ pub const Buffer = struct {
     memory: *Memory,
     shard_index: usize,
     bytes: []u8,
-    mlx_buffer: ?*mlx_metal.PjrtxMlxMetalBuffer = null,
+    backend_buffer: ?backend_api.BufferHandle = null,
     deleted: bool = false,
-
-    pub fn initHostCopy(
-        allocator: std.mem.Allocator,
-        element_type: BufferType,
-        dims_: []const i64,
-        device: *Device,
-        memory: *Memory,
-        shard_index: usize,
-        src: []const u8,
-    ) !*Buffer {
-        return initHostCopyForBackend(allocator, .synthetic, element_type, dims_, device, memory, shard_index, src);
-    }
 
     pub fn initHostCopyForBackend(
         allocator: std.mem.Allocator,
-        backend_kind: BackendKind,
+        backend_impl: backend_api.Backend,
         element_type: BufferType,
         dims_: []const i64,
         device: *Device,
@@ -319,17 +211,13 @@ pub const Buffer = struct {
         const bytes = try allocator.dupe(u8, src);
         errdefer allocator.free(bytes);
 
-        var mlx_buffer: ?*mlx_metal.PjrtxMlxMetalBuffer = null;
-        if (backend_kind == .metal_mlx and src.len != 0) {
-            const dtype = mlxDtype(element_type) orelse return error.UnsupportedElementType;
-            mlx_buffer = mlx_metal.pjrtx_mlx_metal_buffer_from_host_typed(device.local_hardware_id, src.ptr, src.len, dtype, dims.ptr, dims.len);
-            if (mlx_buffer == null) return error.MlxBufferAllocationFailed;
-        }
-        errdefer if (mlx_buffer) |owned| mlx_metal.pjrtx_mlx_metal_buffer_destroy(owned);
+        const backend_buffer = try backend_impl.bufferFromHost(device.local_hardware_id, element_type, dims, src);
+        errdefer if (backend_buffer) |owned| backend_impl.destroyBuffer(owned);
 
         buffer.* = .{
             .allocator = allocator,
-            .backend_kind = backend_kind,
+            .backend = backend_impl,
+            .backend_kind = backend_impl.kind(),
             .element_type = element_type,
             .dims = dims,
             .device_id = device.id,
@@ -338,7 +226,7 @@ pub const Buffer = struct {
             .memory = memory,
             .shard_index = shard_index,
             .bytes = bytes,
-            .mlx_buffer = mlx_buffer,
+            .backend_buffer = backend_buffer,
         };
         return buffer;
     }
@@ -357,15 +245,15 @@ pub const Buffer = struct {
         const bytes = try allocator.dupe(u8, src.bytes);
         errdefer allocator.free(bytes);
 
-        var mlx_buffer: ?*mlx_metal.PjrtxMlxMetalBuffer = null;
-        if (src.mlx_buffer) |src_mlx| {
-            mlx_buffer = mlx_metal.pjrtx_mlx_metal_buffer_clone(src_mlx);
-            if (mlx_buffer == null) return error.MlxCommandSubmissionFailed;
+        var backend_buffer: ?backend_api.BufferHandle = null;
+        if (src.backend_buffer) |src_backend| {
+            backend_buffer = try src.backend.cloneBuffer(src_backend);
         }
-        errdefer if (mlx_buffer) |owned| mlx_metal.pjrtx_mlx_metal_buffer_destroy(owned);
+        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
 
         buffer.* = .{
             .allocator = allocator,
+            .backend = src.backend,
             .backend_kind = src.backend_kind,
             .element_type = src.element_type,
             .dims = dims,
@@ -375,7 +263,7 @@ pub const Buffer = struct {
             .memory = src.memory,
             .shard_index = shard_index,
             .bytes = bytes,
-            .mlx_buffer = mlx_buffer,
+            .backend_buffer = backend_buffer,
         };
         return buffer;
     }
@@ -429,15 +317,15 @@ pub const Buffer = struct {
             else => unreachable,
         }
 
-        var mlx_buffer: ?*mlx_metal.PjrtxMlxMetalBuffer = null;
-        if (lhs.mlx_buffer != null and rhs.mlx_buffer != null) {
-            mlx_buffer = mlx_metal.pjrtx_mlx_metal_buffer_binary(lhs.mlx_buffer.?, rhs.mlx_buffer.?, mlxBinaryOpCode(op));
-            if (mlx_buffer == null) return error.MlxCommandSubmissionFailed;
+        var backend_buffer: ?backend_api.BufferHandle = null;
+        if (lhs.backend_buffer != null and rhs.backend_buffer != null) {
+            backend_buffer = try lhs.backend.binary(lhs.backend_buffer.?, rhs.backend_buffer.?, op);
         }
-        errdefer if (mlx_buffer) |owned| mlx_metal.pjrtx_mlx_metal_buffer_destroy(owned);
+        errdefer if (backend_buffer) |owned| lhs.backend.destroyBuffer(owned);
 
         buffer.* = .{
             .allocator = allocator,
+            .backend = lhs.backend,
             .backend_kind = lhs.backend_kind,
             .element_type = lhs.element_type,
             .dims = dims,
@@ -447,7 +335,7 @@ pub const Buffer = struct {
             .memory = lhs.memory,
             .shard_index = shard_index,
             .bytes = bytes,
-            .mlx_buffer = mlx_buffer,
+            .backend_buffer = backend_buffer,
         };
         return buffer;
     }
@@ -516,15 +404,15 @@ pub const Buffer = struct {
             else => unreachable,
         }
 
-        var mlx_buffer: ?*mlx_metal.PjrtxMlxMetalBuffer = null;
-        if (src.mlx_buffer) |src_mlx| {
-            mlx_buffer = mlx_metal.pjrtx_mlx_metal_buffer_unary(src_mlx, mlxUnaryOpCode(op));
-            if (mlx_buffer == null) return error.MlxCommandSubmissionFailed;
+        var backend_buffer: ?backend_api.BufferHandle = null;
+        if (src.backend_buffer) |src_backend| {
+            backend_buffer = try src.backend.unary(src_backend, op);
         }
-        errdefer if (mlx_buffer) |owned| mlx_metal.pjrtx_mlx_metal_buffer_destroy(owned);
+        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
 
         buffer.* = .{
             .allocator = allocator,
+            .backend = src.backend,
             .backend_kind = src.backend_kind,
             .element_type = src.element_type,
             .dims = dims,
@@ -534,7 +422,7 @@ pub const Buffer = struct {
             .memory = src.memory,
             .shard_index = shard_index,
             .bytes = bytes,
-            .mlx_buffer = mlx_buffer,
+            .backend_buffer = backend_buffer,
         };
         return buffer;
     }
@@ -556,16 +444,12 @@ pub const Buffer = struct {
         const bytes = try allocator.dupe(u8, src.bytes);
         errdefer allocator.free(bytes);
 
-        var mlx_buffer: ?*mlx_metal.PjrtxMlxMetalBuffer = null;
-        if (src.backend_kind == .metal_mlx and src.bytes.len != 0) {
-            const dtype = mlxDtype(src.element_type) orelse return error.UnsupportedElementType;
-            mlx_buffer = mlx_metal.pjrtx_mlx_metal_buffer_from_host_typed(src.device.local_hardware_id, src.bytes.ptr, src.bytes.len, dtype, new_dims.ptr, new_dims.len);
-            if (mlx_buffer == null) return error.MlxBufferAllocationFailed;
-        }
-        errdefer if (mlx_buffer) |owned| mlx_metal.pjrtx_mlx_metal_buffer_destroy(owned);
+        const backend_buffer = try src.backend.reshape(src.device.local_hardware_id, src.element_type, src.bytes, new_dims);
+        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
 
         buffer.* = .{
             .allocator = allocator,
+            .backend = src.backend,
             .backend_kind = src.backend_kind,
             .element_type = src.element_type,
             .dims = dims,
@@ -575,7 +459,7 @@ pub const Buffer = struct {
             .memory = src.memory,
             .shard_index = shard_index,
             .bytes = bytes,
-            .mlx_buffer = mlx_buffer,
+            .backend_buffer = backend_buffer,
         };
         return buffer;
     }
@@ -622,15 +506,15 @@ pub const Buffer = struct {
             );
         }
 
-        var mlx_buffer: ?*mlx_metal.PjrtxMlxMetalBuffer = null;
-        if (src.mlx_buffer) |src_mlx| {
-            mlx_buffer = mlx_metal.pjrtx_mlx_metal_buffer_transpose(src_mlx, permutation.ptr, permutation.len);
-            if (mlx_buffer == null) return error.MlxCommandSubmissionFailed;
+        var backend_buffer: ?backend_api.BufferHandle = null;
+        if (src.backend_buffer) |src_backend| {
+            backend_buffer = try src.backend.transpose(src_backend, permutation);
         }
-        errdefer if (mlx_buffer) |owned| mlx_metal.pjrtx_mlx_metal_buffer_destroy(owned);
+        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
 
         buffer.* = .{
             .allocator = allocator,
+            .backend = src.backend,
             .backend_kind = src.backend_kind,
             .element_type = src.element_type,
             .dims = dims,
@@ -640,7 +524,7 @@ pub const Buffer = struct {
             .memory = src.memory,
             .shard_index = shard_index,
             .bytes = bytes,
-            .mlx_buffer = mlx_buffer,
+            .backend_buffer = backend_buffer,
         };
         return buffer;
     }
@@ -688,15 +572,15 @@ pub const Buffer = struct {
             );
         }
 
-        var mlx_buffer: ?*mlx_metal.PjrtxMlxMetalBuffer = null;
-        if (src.mlx_buffer) |src_mlx| {
-            mlx_buffer = mlx_metal.pjrtx_mlx_metal_buffer_broadcast_in_dim(src_mlx, broadcast_dimensions.ptr, broadcast_dimensions.len, output_dims.ptr, output_dims.len);
-            if (mlx_buffer == null) return error.MlxCommandSubmissionFailed;
+        var backend_buffer: ?backend_api.BufferHandle = null;
+        if (src.backend_buffer) |src_backend| {
+            backend_buffer = try src.backend.broadcastInDim(src_backend, broadcast_dimensions, output_dims);
         }
-        errdefer if (mlx_buffer) |owned| mlx_metal.pjrtx_mlx_metal_buffer_destroy(owned);
+        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
 
         buffer.* = .{
             .allocator = allocator,
+            .backend = src.backend,
             .backend_kind = src.backend_kind,
             .element_type = src.element_type,
             .dims = dims,
@@ -706,7 +590,7 @@ pub const Buffer = struct {
             .memory = src.memory,
             .shard_index = shard_index,
             .bytes = bytes,
-            .mlx_buffer = mlx_buffer,
+            .backend_buffer = backend_buffer,
         };
         return buffer;
     }
@@ -755,23 +639,15 @@ pub const Buffer = struct {
             );
         }
 
-        var mlx_buffer: ?*mlx_metal.PjrtxMlxMetalBuffer = null;
-        if (src.mlx_buffer) |src_mlx| {
-            mlx_buffer = mlx_metal.pjrtx_mlx_metal_buffer_slice(
-                src_mlx,
-                start_indices.ptr,
-                limit_indices.ptr,
-                strides_.ptr,
-                start_indices.len,
-                output_dims.ptr,
-                output_dims.len,
-            );
-            if (mlx_buffer == null) return error.MlxCommandSubmissionFailed;
+        var backend_buffer: ?backend_api.BufferHandle = null;
+        if (src.backend_buffer) |src_backend| {
+            backend_buffer = try src.backend.slice(src_backend, start_indices, limit_indices, strides_, output_dims);
         }
-        errdefer if (mlx_buffer) |owned| mlx_metal.pjrtx_mlx_metal_buffer_destroy(owned);
+        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
 
         buffer.* = .{
             .allocator = allocator,
+            .backend = src.backend,
             .backend_kind = src.backend_kind,
             .element_type = src.element_type,
             .dims = dims,
@@ -781,7 +657,7 @@ pub const Buffer = struct {
             .memory = src.memory,
             .shard_index = shard_index,
             .bytes = bytes,
-            .mlx_buffer = mlx_buffer,
+            .backend_buffer = backend_buffer,
         };
         return buffer;
     }
@@ -845,15 +721,15 @@ pub const Buffer = struct {
             }
         }
 
-        var mlx_buffer: ?*mlx_metal.PjrtxMlxMetalBuffer = null;
-        if (lhs.mlx_buffer != null and rhs.mlx_buffer != null) {
-            mlx_buffer = mlx_metal.pjrtx_mlx_metal_buffer_concatenate(lhs.mlx_buffer.?, rhs.mlx_buffer.?, dimension, output_dims.ptr, output_dims.len);
-            if (mlx_buffer == null) return error.MlxCommandSubmissionFailed;
+        var backend_buffer: ?backend_api.BufferHandle = null;
+        if (lhs.backend_buffer != null and rhs.backend_buffer != null) {
+            backend_buffer = try lhs.backend.concatenate(lhs.backend_buffer.?, rhs.backend_buffer.?, dimension, output_dims);
         }
-        errdefer if (mlx_buffer) |owned| mlx_metal.pjrtx_mlx_metal_buffer_destroy(owned);
+        errdefer if (backend_buffer) |owned| lhs.backend.destroyBuffer(owned);
 
         buffer.* = .{
             .allocator = allocator,
+            .backend = lhs.backend,
             .backend_kind = lhs.backend_kind,
             .element_type = lhs.element_type,
             .dims = dims,
@@ -863,7 +739,7 @@ pub const Buffer = struct {
             .memory = lhs.memory,
             .shard_index = shard_index,
             .bytes = bytes,
-            .mlx_buffer = mlx_buffer,
+            .backend_buffer = backend_buffer,
         };
         return buffer;
     }
@@ -879,7 +755,7 @@ pub const Buffer = struct {
     }
 
     pub fn deinit(self: *Buffer) void {
-        if (self.mlx_buffer) |mlx_buffer| mlx_metal.pjrtx_mlx_metal_buffer_destroy(mlx_buffer);
+        if (self.backend_buffer) |backend_buffer| self.backend.destroyBuffer(backend_buffer);
         self.allocator.free(self.bytes);
         self.allocator.free(self.dims);
         self.allocator.destroy(self);
@@ -887,55 +763,20 @@ pub const Buffer = struct {
 
     pub fn copyToHost(self: *Buffer, dst: []u8) !void {
         if (dst.len < self.bytes.len) return error.DestinationTooSmall;
-        if (self.mlx_buffer) |mlx_buffer| {
-            const ok = mlx_metal.pjrtx_mlx_metal_buffer_copy_to_host(mlx_buffer, dst.ptr, dst.len);
-            if (ok == 0) return error.MlxBufferCopyFailed;
+        if (self.backend_buffer) |backend_buffer| {
+            self.backend.copyToHost(backend_buffer, dst) catch return error.BackendBufferCopyFailed;
             return;
         }
         @memcpy(dst[0..self.bytes.len], self.bytes);
     }
 
-    pub fn hasMlxStorage(self: *const Buffer) bool {
-        return self.mlx_buffer != null;
+    pub fn hasBackendStorage(self: *const Buffer) bool {
+        return self.backend_buffer != null;
     }
 };
 
-fn mlxBinaryOpCode(op: ElementwiseBinaryOp) c_int {
-    return switch (op) {
-        .add => mlx_metal.PJRTX_MLX_METAL_U8_BINARY_ADD,
-        .subtract => mlx_metal.PJRTX_MLX_METAL_U8_BINARY_SUBTRACT,
-        .multiply => mlx_metal.PJRTX_MLX_METAL_U8_BINARY_MULTIPLY,
-        .divide => mlx_metal.PJRTX_MLX_METAL_U8_BINARY_DIVIDE,
-    };
-}
-
-fn mlxUnaryOpCode(op: ElementwiseUnaryOp) c_int {
-    return switch (op) {
-        .negate => mlx_metal.PJRTX_MLX_METAL_U8_UNARY_NEGATE,
-        .exp => mlx_metal.PJRTX_MLX_METAL_UNARY_EXP,
-        .tanh => mlx_metal.PJRTX_MLX_METAL_UNARY_TANH,
-        .sqrt => mlx_metal.PJRTX_MLX_METAL_UNARY_SQRT,
-        .rsqrt => mlx_metal.PJRTX_MLX_METAL_UNARY_RSQRT,
-    };
-}
-
-fn mlxDtype(element_type: BufferType) ?c_int {
-    return switch (element_type) {
-        .u8 => mlx_metal.PJRTX_MLX_METAL_DTYPE_U8,
-        .f32 => mlx_metal.PJRTX_MLX_METAL_DTYPE_F32,
-        else => null,
-    };
-}
-
 fn denseByteSize(element_type: BufferType, dims: []const i64) usize {
-    const element_size = element_type.byteSize();
-    if (element_size == 0) return 0;
-    var elements: usize = 1;
-    for (dims) |dim| {
-        if (dim < 0) return 0;
-        elements = std.math.mul(usize, elements, @intCast(dim)) catch return 0;
-    }
-    return std.math.mul(usize, elements, element_size) catch 0;
+    return core.denseByteSize(element_type, dims);
 }
 
 fn validPermutation(permutation: []const i64, rank: usize) bool {
@@ -1023,8 +864,27 @@ fn readF32LE(bytes: []const u8, index: usize) f32 {
     return @bitCast(std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little));
 }
 
+fn syntheticBackendForTest() backend_api.Backend {
+    return @import("src/backend/synthetic").create();
+}
+
+fn initSyntheticClientForTest(device_count: usize) !*Client {
+    return Client.init(std.testing.allocator, syntheticBackendForTest(), device_count);
+}
+
+fn initHostCopyForTest(
+    element_type: BufferType,
+    dims: []const i64,
+    device: *Device,
+    memory: *Memory,
+    shard_index: usize,
+    src: []const u8,
+) !*Buffer {
+    return Buffer.initHostCopyForBackend(std.testing.allocator, syntheticBackendForTest(), element_type, dims, device, memory, shard_index, src);
+}
+
 test "synthetic client models multiple devices and memories" {
-    const client = try Client.initSynthetic(std.testing.allocator, 4);
+    const client = try initSyntheticClientForTest(4);
     defer client.deinit();
 
     try std.testing.expectEqual(@as(usize, 4), client.devices.len);
@@ -1042,57 +902,13 @@ test "synthetic client models multiple devices and memories" {
     try std.testing.expectEqual(@as(i32, 3), client.memories[3].addressable_devices[0].id);
 }
 
-test "metal mlx bootstrap client uses explicit backend kind" {
-    const client = try Client.initMetalMlxBootstrap(std.testing.allocator);
-    defer client.deinit();
-
-    try std.testing.expectEqual(BackendKind.metal_mlx, client.backend_kind);
-    try std.testing.expectEqual(@as(usize, 1), client.devices.len);
-    try std.testing.expect(client.devices[0].name.len != 0);
-    try std.testing.expect(std.mem.startsWith(u8, client.devices[0].debug_string, "PjRTx Metal/MLX device"));
-}
-
-test "metal mlx bootstrap accepts copied C device metadata" {
-    var metal_devices = [_]mlx_metal.PjrtxMlxMetalDeviceInfo{
-        .{
-            .ordinal = 7,
-            .registry_id = 42,
-            .recommended_max_working_set_size = 4096,
-            .has_unified_memory = 1,
-            .name = undefined,
-        },
-        .{
-            .ordinal = 8,
-            .registry_id = 43,
-            .recommended_max_working_set_size = 8192,
-            .has_unified_memory = 0,
-            .name = undefined,
-        },
-    };
-    fillCName(&metal_devices[0].name, "Synthetic MTL A");
-    fillCName(&metal_devices[1].name, "Synthetic MTL B");
-
-    const client = try Client.initMetalMlxFromDevices(std.testing.allocator, &metal_devices);
-    defer client.deinit();
-
-    try std.testing.expectEqual(BackendKind.metal_mlx, client.backend_kind);
-    try std.testing.expectEqual(@as(usize, 2), client.devices.len);
-    try std.testing.expectEqualStrings("Synthetic MTL A", client.devices[0].name);
-    try std.testing.expectEqual(@as(i32, 7), client.devices[0].local_hardware_id);
-    try std.testing.expectEqual(@as(u64, 42), client.devices[0].registry_id);
-    try std.testing.expectEqual(@as(u64, 4096), client.devices[0].memory_bytes);
-    try std.testing.expect(client.devices[0].has_unified_memory);
-    try std.testing.expectEqualStrings("Synthetic MTL B", client.devices[1].name);
-    try std.testing.expectEqual(@as(i32, 8), client.devices[1].local_hardware_id);
-}
-
 test "buffer keeps shard/device/memory ownership metadata" {
-    const client = try Client.initSynthetic(std.testing.allocator, 2);
+    const client = try initSyntheticClientForTest(2);
     defer client.deinit();
 
     const dims = [_]i64{ 2, 2 };
     const data = [_]u8{ 1, 2, 3, 4 };
-    const buffer = try Buffer.initHostCopy(std.testing.allocator, .u8, &dims, &client.devices[1], &client.memories[1], 1, &data);
+    const buffer = try initHostCopyForTest(.u8, &dims, &client.devices[1], &client.memories[1], 1, &data);
     defer buffer.deinit();
 
     try std.testing.expectEqual(@as(i32, 1), buffer.device_id);
@@ -1103,7 +919,7 @@ test "buffer keeps shard/device/memory ownership metadata" {
     try std.testing.expectEqualSlices(u8, &data, buffer.bytes);
 
     const rhs_data = [_]u8{ 10, 20, 30, 40 };
-    const rhs = try Buffer.initHostCopy(std.testing.allocator, .u8, &dims, &client.devices[1], &client.memories[1], 1, &rhs_data);
+    const rhs = try initHostCopyForTest(.u8, &dims, &client.devices[1], &client.memories[1], 1, &rhs_data);
     defer rhs.deinit();
     const sum = try Buffer.initU8Add(std.testing.allocator, buffer, rhs, 1);
     defer sum.deinit();
@@ -1127,15 +943,15 @@ test "buffer keeps shard/device/memory ownership metadata" {
 }
 
 test "buffer elementwise arithmetic supports f32 host execution" {
-    const client = try Client.initSynthetic(std.testing.allocator, 1);
+    const client = try initSyntheticClientForTest(1);
     defer client.deinit();
 
     const dims = [_]i64{2};
     const lhs_values = [_]f32{ 1.5, -2.0 };
     const rhs_values = [_]f32{ 2.25, 4.0 };
-    const lhs = try Buffer.initHostCopy(std.testing.allocator, .f32, &dims, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&lhs_values));
+    const lhs = try initHostCopyForTest(.f32, &dims, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&lhs_values));
     defer lhs.deinit();
-    const rhs = try Buffer.initHostCopy(std.testing.allocator, .f32, &dims, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&rhs_values));
+    const rhs = try initHostCopyForTest(.f32, &dims, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&rhs_values));
     defer rhs.deinit();
 
     const sum = try Buffer.initElementwiseBinary(std.testing.allocator, .add, lhs, rhs, 0);
@@ -1155,12 +971,12 @@ test "buffer elementwise arithmetic supports f32 host execution" {
 }
 
 test "buffer elementwise unary math supports f32 host execution" {
-    const client = try Client.initSynthetic(std.testing.allocator, 1);
+    const client = try initSyntheticClientForTest(1);
     defer client.deinit();
 
     const dims = [_]i64{2};
     const values = [_]f32{ 1.0, 4.0 };
-    const input = try Buffer.initHostCopy(std.testing.allocator, .f32, &dims, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&values));
+    const input = try initHostCopyForTest(.f32, &dims, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&values));
     defer input.deinit();
 
     const exp = try Buffer.initElementwiseUnary(std.testing.allocator, .exp, input, 0);
@@ -1185,12 +1001,12 @@ test "buffer elementwise unary math supports f32 host execution" {
 }
 
 test "buffer reshape preserves typed bytes and updates dimensions" {
-    const client = try Client.initSynthetic(std.testing.allocator, 1);
+    const client = try initSyntheticClientForTest(1);
     defer client.deinit();
 
     const dims = [_]i64{ 2, 2 };
     const values = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
-    const input = try Buffer.initHostCopy(std.testing.allocator, .f32, &dims, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&values));
+    const input = try initHostCopyForTest(.f32, &dims, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&values));
     defer input.deinit();
 
     const reshaped = try Buffer.initReshape(std.testing.allocator, input, &.{4}, 0);
@@ -1201,12 +1017,12 @@ test "buffer reshape preserves typed bytes and updates dimensions" {
 }
 
 test "buffer transpose permutes dense host bytes and updates dimensions" {
-    const client = try Client.initSynthetic(std.testing.allocator, 1);
+    const client = try initSyntheticClientForTest(1);
     defer client.deinit();
 
     const dims = [_]i64{ 2, 3 };
     const values = [_]u8{ 1, 2, 3, 4, 5, 6 };
-    const input = try Buffer.initHostCopy(std.testing.allocator, .u8, &dims, &client.devices[0], &client.memories[0], 0, &values);
+    const input = try initHostCopyForTest(.u8, &dims, &client.devices[0], &client.memories[0], 0, &values);
     defer input.deinit();
 
     const transposed = try Buffer.initTranspose(std.testing.allocator, input, &.{ 1, 0 }, &.{ 3, 2 }, 0);
@@ -1217,12 +1033,12 @@ test "buffer transpose permutes dense host bytes and updates dimensions" {
 }
 
 test "buffer broadcast_in_dim expands dense host bytes and updates dimensions" {
-    const client = try Client.initSynthetic(std.testing.allocator, 1);
+    const client = try initSyntheticClientForTest(1);
     defer client.deinit();
 
     const dims = [_]i64{3};
     const values = [_]u8{ 7, 8, 9 };
-    const input = try Buffer.initHostCopy(std.testing.allocator, .u8, &dims, &client.devices[0], &client.memories[0], 0, &values);
+    const input = try initHostCopyForTest(.u8, &dims, &client.devices[0], &client.memories[0], 0, &values);
     defer input.deinit();
 
     const broadcasted = try Buffer.initBroadcastInDim(std.testing.allocator, input, &.{1}, &.{ 2, 3 }, 0);
@@ -1233,12 +1049,12 @@ test "buffer broadcast_in_dim expands dense host bytes and updates dimensions" {
 }
 
 test "buffer slice copies strided dense host bytes and updates dimensions" {
-    const client = try Client.initSynthetic(std.testing.allocator, 1);
+    const client = try initSyntheticClientForTest(1);
     defer client.deinit();
 
     const dims = [_]i64{ 3, 4 };
     const values = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
-    const input = try Buffer.initHostCopy(std.testing.allocator, .u8, &dims, &client.devices[0], &client.memories[0], 0, &values);
+    const input = try initHostCopyForTest(.u8, &dims, &client.devices[0], &client.memories[0], 0, &values);
     defer input.deinit();
 
     const sliced = try Buffer.initSlice(
@@ -1257,16 +1073,16 @@ test "buffer slice copies strided dense host bytes and updates dimensions" {
 }
 
 test "buffer concatenate joins dense host bytes along an axis" {
-    const client = try Client.initSynthetic(std.testing.allocator, 1);
+    const client = try initSyntheticClientForTest(1);
     defer client.deinit();
 
     const lhs_dims = [_]i64{ 2, 2 };
     const rhs_dims = [_]i64{ 2, 3 };
     const lhs_values = [_]u8{ 1, 2, 3, 4 };
     const rhs_values = [_]u8{ 5, 6, 7, 8, 9, 10 };
-    const lhs = try Buffer.initHostCopy(std.testing.allocator, .u8, &lhs_dims, &client.devices[0], &client.memories[0], 0, &lhs_values);
+    const lhs = try initHostCopyForTest(.u8, &lhs_dims, &client.devices[0], &client.memories[0], 0, &lhs_values);
     defer lhs.deinit();
-    const rhs = try Buffer.initHostCopy(std.testing.allocator, .u8, &rhs_dims, &client.devices[0], &client.memories[0], 0, &rhs_values);
+    const rhs = try initHostCopyForTest(.u8, &rhs_dims, &client.devices[0], &client.memories[0], 0, &rhs_values);
     defer rhs.deinit();
 
     const concatenated = try Buffer.initConcatenate(std.testing.allocator, lhs, rhs, 1, &.{ 2, 5 }, 0);
@@ -1274,46 +1090,4 @@ test "buffer concatenate joins dense host bytes along an axis" {
 
     try std.testing.expectEqualSlices(i64, &.{ 2, 5 }, concatenated.dims);
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 5, 6, 7, 3, 4, 8, 9, 10 }, concatenated.bytes);
-}
-
-test "metal mlx buffer owns mlx handle when backend is available" {
-    const client = try Client.initMetalMlxBootstrap(std.testing.allocator);
-    defer client.deinit();
-
-    const dims = [_]i64{4};
-    const data = [_]u8{ 9, 8, 7, 6 };
-    const buffer = Buffer.initHostCopyForBackend(std.testing.allocator, .metal_mlx, .u8, &dims, &client.devices[0], &client.memories[0], 0, &data) catch |err| switch (err) {
-        error.MlxBufferAllocationFailed => return error.SkipZigTest,
-        else => return err,
-    };
-    defer buffer.deinit();
-
-    try std.testing.expect(buffer.hasMlxStorage());
-    var output: [4]u8 = undefined;
-    try buffer.copyToHost(&output);
-    try std.testing.expectEqualSlices(u8, &data, &output);
-
-    const cloned = try Buffer.initDeviceCopy(std.testing.allocator, buffer, 0);
-    defer cloned.deinit();
-    try std.testing.expect(cloned.hasMlxStorage());
-    var cloned_output: [4]u8 = undefined;
-    try cloned.copyToHost(&cloned_output);
-    try std.testing.expectEqualSlices(u8, &data, &cloned_output);
-
-    const rhs_data = [_]u8{ 1, 2, 3, 4 };
-    const rhs = Buffer.initHostCopyForBackend(std.testing.allocator, .metal_mlx, .u8, &dims, &client.devices[0], &client.memories[0], 0, &rhs_data) catch |err| switch (err) {
-        error.MlxBufferAllocationFailed => return error.SkipZigTest,
-        else => return err,
-    };
-    defer rhs.deinit();
-
-    const sum = Buffer.initU8Add(std.testing.allocator, buffer, rhs, 0) catch |err| switch (err) {
-        error.MlxCommandSubmissionFailed => return error.SkipZigTest,
-        else => return err,
-    };
-    defer sum.deinit();
-    try std.testing.expect(sum.hasMlxStorage());
-    var sum_output: [4]u8 = undefined;
-    try sum.copyToHost(&sum_output);
-    try std.testing.expectEqualSlices(u8, &.{ 10, 10, 10, 10 }, &sum_output);
 }

@@ -1,14 +1,31 @@
 load("@rules_zig//zig:defs.bzl", "zig_library", "zig_test")
 
+filegroup(
+    name = "sources",
+    srcs = [
+        "BUILD.bazel",
+        "runtime.zig",
+    ],
+    visibility = ["//visibility:public"],
+)
+
 zig_library(
     name = "runtime",
     import_name = "src/runtime",
     main = "runtime.zig",
     visibility = ["//visibility:public"],
-    deps = ["//src/backend:mlx_metal_api"],
+    deps = [
+        "//src/backend",
+        "//src/core",
+    ],
 )
 
 zig_test(
     name = "runtime_test",
-    deps = [":runtime"],
+    main = "runtime.zig",
+    deps = [
+        "//src/backend",
+        "//src/backend/synthetic:synthetic",
+        "//src/core",
+    ],
 )

@@ -2317,6 +2317,26 @@ int pjrtx_mlx_metal_buffer_has_host_shadow(PjrtxMlxMetalBuffer* buffer) {
   return buffer == nullptr ? 0 : 0;
 }
 
+int pjrtx_mlx_metal_buffer_eval(PjrtxMlxMetalBuffer* buffer) {
+  if (buffer == nullptr || buffer->array == nullptr) {
+    return 0;
+  }
+
+  try {
+    const mlx::core::Device device(mlx::core::Device::gpu,
+                                   buffer->device_ordinal);
+    if (!mlx::core::is_available(device)) {
+      return 0;
+    }
+    mlx::core::eval(*buffer->array);
+    return 1;
+  } catch (const std::exception&) {
+    return 0;
+  } catch (...) {
+    return 0;
+  }
+}
+
 int pjrtx_mlx_metal_buffer_copy_to_host(PjrtxMlxMetalBuffer* buffer, void* dst,
                                         uint64_t dst_size) {
   if (buffer == nullptr || dst == nullptr || dst_size < buffer->byte_size) {

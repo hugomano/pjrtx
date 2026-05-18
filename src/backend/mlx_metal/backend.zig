@@ -324,6 +324,11 @@ fn clamp(_: backend.Backend, min: backend.BufferHandle, value: backend.BufferHan
     return @ptrCast(handle);
 }
 
+fn evalBuffer(buffer: backend.BufferHandle) backend.Error!void {
+    const ok = c.pjrtx_mlx_metal_buffer_eval(@ptrCast(@alignCast(buffer)));
+    if (ok == 0) return error.CommandSubmissionFailed;
+}
+
 fn copyToHost(_: backend.Backend, src: backend.BufferHandle, dst: []u8) backend.Error!void {
     const ok = c.pjrtx_mlx_metal_buffer_copy_to_host(@ptrCast(@alignCast(src)), dst.ptr, dst.len);
     if (ok == 0) return error.BufferCopyFailed;
@@ -371,25 +376,55 @@ fn buildBackendProgram(allocator: std.mem.Allocator, plan: *const core.Executabl
         if (output_id.index < output_values.len) output_values[output_id.index] = true;
     }
 
+    const max_fusion_groups = try allocator.alloc(backend.FusionGroup, plan.instructions.len);
+    defer allocator.free(max_fusion_groups);
+
+    var current_fusion_group: ?usize = null;
+    var fusion_group_count: usize = 0;
     for (plan.instructions, 0..) |instruction, instruction_index| {
         for (instruction.inputs) |input_id| {
             if (input_id.index < last_uses.len) last_uses[input_id.index] = instruction_index;
         }
+        const node_kind = programNodeKind(instruction.kind);
+        const fusion_group = if (programNodeFusible(node_kind)) group: {
+            if (current_fusion_group == null) {
+                current_fusion_group = fusion_group_count;
+                max_fusion_groups[fusion_group_count] = .{
+                    .id = fusion_group_count,
+                    .first_node = instruction_index,
+                    .last_node = instruction_index,
+                    .node_count = 0,
+                };
+                fusion_group_count += 1;
+            }
+            max_fusion_groups[current_fusion_group.?].last_node = instruction_index;
+            max_fusion_groups[current_fusion_group.?].node_count += 1;
+            break :group current_fusion_group;
+        } else group: {
+            current_fusion_group = null;
+            break :group null;
+        };
         nodes[instruction_index] = .{
             .instruction_index = instruction_index,
-            .kind = programNodeKind(instruction.kind),
+            .kind = node_kind,
             .inputs = try allocator.dupe(core.ValueId, instruction.inputs),
             .outputs = try allocator.dupe(core.ValueId, instruction.outputs),
             .materializes = instructionMaterializes(instruction.kind),
+            .fusion_group = fusion_group,
         };
         initialized_nodes += 1;
     }
+
+    const fusion_groups = try allocator.dupe(backend.FusionGroup, max_fusion_groups[0..fusion_group_count]);
+    errdefer allocator.free(fusion_groups);
 
     return .{
         .allocator = allocator,
         .nodes = nodes,
         .last_uses = last_uses,
         .output_values = output_values,
+        .fusion_groups = fusion_groups,
+        .fusion_group_count = fusion_group_count,
     };
 }
 
@@ -410,6 +445,13 @@ fn instructionMaterializes(instruction_kind: core.PlanInstructionKind) bool {
     return switch (instruction_kind) {
         .reshape, .transpose, .broadcast_in_dim, .slice => false,
         else => true,
+    };
+}
+
+fn programNodeFusible(node_kind: backend.ProgramNodeKind) bool {
+    return switch (node_kind) {
+        .view, .elementwise => true,
+        else => false,
     };
 }
 
@@ -511,6 +553,7 @@ fn executeExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
             errdefer value_owned[key_output_id.index] = false;
             try storeOwnedValueHandle(backend_impl, value_handles, value_owned, value_output_id, sorted_values);
             destroyBuffer(backend_impl, directed_order);
+            try maybeEvalNodeOutputs(&executable.program, node, value_handles, instruction.outputs);
             releaseDeadInputs(backend_impl, &executable.program, value_handles, value_owned, instruction.inputs, instruction_index);
             continue;
         }
@@ -552,6 +595,7 @@ fn executeExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
             try storeOwnedValueHandle(backend_impl, value_handles, value_owned, values_id, top_values);
             errdefer value_owned[values_id.index] = false;
             try storeOwnedValueHandle(backend_impl, value_handles, value_owned, indices_id, top_indices);
+            try maybeEvalNodeOutputs(&executable.program, node, value_handles, instruction.outputs);
             releaseDeadInputs(backend_impl, &executable.program, value_handles, value_owned, instruction.inputs, instruction_index);
             continue;
         }
@@ -743,6 +787,7 @@ fn executeExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
         };
 
         try storeOwnedValueHandle(backend_impl, value_handles, value_owned, output_id, next);
+        try maybeEvalNodeOutputs(&executable.program, node, value_handles, instruction.outputs);
         releaseDeadInputs(backend_impl, &executable.program, value_handles, value_owned, instruction.inputs, instruction_index);
     }
 
@@ -799,6 +844,31 @@ fn releaseDeadInputs(
         value_handles[input_id.index] = null;
         value_owned[input_id.index] = false;
     }
+}
+
+fn maybeEvalNodeOutputs(
+    program: *const backend.Program,
+    node: backend.ProgramNode,
+    value_handles: []?backend.BufferHandle,
+    output_ids: []const core.ValueId,
+) backend.Error!void {
+    if (!nodeRequiresEval(program, node)) return;
+    for (output_ids) |output_id| {
+        if (output_id.index >= value_handles.len) return error.CommandSubmissionFailed;
+        const handle = value_handles[output_id.index] orelse return error.CommandSubmissionFailed;
+        try evalBuffer(handle);
+    }
+}
+
+fn nodeRequiresEval(program: *const backend.Program, node: backend.ProgramNode) bool {
+    if (node.fusion_group) |group_id| {
+        if (group_id >= program.fusion_groups.len) return false;
+        return program.fusion_groups[group_id].last_node == node.instruction_index;
+    }
+    return switch (node.kind) {
+        .constant, .parameter => false,
+        else => node.materializes,
+    };
 }
 
 fn destroyConstantHandles(backend_impl: backend.Backend, constant_handles: []?backend.BufferHandle) void {
@@ -2074,7 +2144,7 @@ test "mlx metal backend executable runs resident device buffers" {
     const dims = [_]i64{4};
     const assignment = [_]i32{0};
 
-    const values = try allocator.alloc(core.Value, 3);
+    const values = try allocator.alloc(core.Value, 4);
     errdefer allocator.free(values);
     for (values, 0..) |*value, i| {
         value.* = .{
@@ -2113,17 +2183,22 @@ test "mlx metal backend executable runs resident device buffers" {
         .values = values,
         .parameter_shardings = parameter_shardings,
         .output_shardings = output_shardings,
-        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
+        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 3 }}),
         .instructions = try allocator.dupe(core.PlanInstruction, &.{
             .{
                 .kind = .constant,
                 .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 1 }}),
-                .literal = try allocator.dupe(u8, &.{ 10, 20, 30, 40 }),
+                .literal = try allocator.dupe(u8, &.{ 2, 3, 4, 5 }),
             },
             .{
                 .kind = .add,
                 .inputs = try allocator.dupe(core.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
                 .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
+            },
+            .{
+                .kind = .multiply,
+                .inputs = try allocator.dupe(core.ValueId, &.{ .{ .index = 2 }, .{ .index = 1 } }),
+                .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 3 }}),
             },
         }),
     };
@@ -2132,12 +2207,22 @@ test "mlx metal backend executable runs resident device buffers" {
     const executable = (try b.compileExecutable(allocator, &plan, &.{local_hardware_id})) orelse return error.TestUnexpectedResult;
     defer b.destroyExecutable(executable);
     const compiled: *CompiledExecutable = @ptrCast(@alignCast(executable));
-    try std.testing.expectEqual(@as(usize, 2), compiled.program.nodes.len);
+    try std.testing.expectEqual(@as(usize, 3), compiled.program.nodes.len);
     try std.testing.expectEqual(backend.ProgramNodeKind.constant, compiled.program.nodes[0].kind);
     try std.testing.expectEqual(backend.ProgramNodeKind.elementwise, compiled.program.nodes[1].kind);
+    try std.testing.expectEqual(backend.ProgramNodeKind.elementwise, compiled.program.nodes[2].kind);
     try std.testing.expect(compiled.program.nodes[0].materializes);
-    try std.testing.expectEqual(@as(usize, 1), compiled.program.last_uses[1]);
-    try std.testing.expect(compiled.program.output_values[2]);
+    try std.testing.expectEqual(@as(?usize, null), compiled.program.nodes[0].fusion_group);
+    try std.testing.expectEqual(@as(?usize, 0), compiled.program.nodes[1].fusion_group);
+    try std.testing.expectEqual(@as(?usize, 0), compiled.program.nodes[2].fusion_group);
+    try std.testing.expectEqual(@as(usize, 1), compiled.program.fusion_group_count);
+    try std.testing.expectEqual(@as(usize, 1), compiled.program.fusion_groups.len);
+    try std.testing.expectEqual(@as(usize, 0), compiled.program.fusion_groups[0].id);
+    try std.testing.expectEqual(@as(usize, 1), compiled.program.fusion_groups[0].first_node);
+    try std.testing.expectEqual(@as(usize, 2), compiled.program.fusion_groups[0].last_node);
+    try std.testing.expectEqual(@as(usize, 2), compiled.program.fusion_groups[0].node_count);
+    try std.testing.expectEqual(@as(usize, 2), compiled.program.last_uses[1]);
+    try std.testing.expect(compiled.program.output_values[3]);
 
     const lhs = (try b.bufferFromHost(local_hardware_id, .u8, &dims, &.{ 1, 2, 3, 4 })) orelse return error.TestUnexpectedResult;
     defer b.destroyBuffer(lhs);
@@ -2151,9 +2236,10 @@ test "mlx metal backend executable runs resident device buffers" {
     try std.testing.expectEqual(@as(usize, 1), outputs.len);
     try std.testing.expectEqual(core.BufferType.u8, outputs[0].element_type);
     try std.testing.expectEqualSlices(i64, &dims, outputs[0].dims);
+    try std.testing.expectEqual(@as(c_int, 0), c.pjrtx_mlx_metal_buffer_has_host_shadow(@ptrCast(@alignCast(outputs[0].handle))));
     var actual: [4]u8 = undefined;
     try b.copyToHost(outputs[0].handle, &actual);
-    try std.testing.expectEqualSlices(u8, &.{ 11, 22, 33, 44 }, &actual);
+    try std.testing.expectEqualSlices(u8, &.{ 6, 15, 28, 45 }, &actual);
 
     const second_lhs = (try b.bufferFromHost(local_hardware_id, .u8, &dims, &.{ 2, 4, 6, 8 })) orelse return error.TestUnexpectedResult;
     defer b.destroyBuffer(second_lhs);
@@ -2164,8 +2250,9 @@ test "mlx metal backend executable runs resident device buffers" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), second_outputs.len);
+    try std.testing.expectEqual(@as(c_int, 0), c.pjrtx_mlx_metal_buffer_has_host_shadow(@ptrCast(@alignCast(second_outputs[0].handle))));
     try b.copyToHost(second_outputs[0].handle, &actual);
-    try std.testing.expectEqualSlices(u8, &.{ 12, 24, 36, 48 }, &actual);
+    try std.testing.expectEqualSlices(u8, &.{ 8, 21, 40, 65 }, &actual);
 }
 
 test "mlx metal backend executable materializes iota on device" {

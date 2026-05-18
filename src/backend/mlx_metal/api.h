@@ -209,6 +209,7 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_clamp(
     uint64_t output_rank);
 uint64_t pjrtx_mlx_metal_buffer_size(PjrtxMlxMetalBuffer* buffer);
 int pjrtx_mlx_metal_buffer_has_host_shadow(PjrtxMlxMetalBuffer* buffer);
+int pjrtx_mlx_metal_buffer_eval(PjrtxMlxMetalBuffer* buffer);
 int pjrtx_mlx_metal_buffer_copy_to_host(PjrtxMlxMetalBuffer* buffer, void* dst,
                                         uint64_t dst_size);
 void pjrtx_mlx_metal_buffer_destroy(PjrtxMlxMetalBuffer* buffer);

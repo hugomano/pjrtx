@@ -3418,6 +3418,8 @@ test "executable graph executes through runtime buffers" {
     const rhs = try Buffer.initHostCopyForBackend(allocator, client.backend, .u8, &dims, &client.devices[0], &client.memories[0], 0, &rhs_data);
     defer rhs.deinit();
 
+    const h2d_before_execute = client.memories[0].stats.host_to_device_bytes;
+    const d2h_before_execute = client.memories[0].stats.device_to_host_bytes;
     const outputs = try graph.executeDevice(allocator, client, &plan, 0, &.{ lhs, rhs });
     defer allocator.free(outputs);
     defer {
@@ -3426,7 +3428,12 @@ test "executable graph executes through runtime buffers" {
 
     try std.testing.expectEqual(@as(usize, 1), outputs.len);
     try std.testing.expectEqual(@as(usize, 0), outputs[0].shard_index);
+    try std.testing.expect(outputs[0].backend_buffer != null);
+    try std.testing.expectEqual(@as(usize, 0), outputs[0].bytes.len);
+    try std.testing.expectEqual(h2d_before_execute, client.memories[0].stats.host_to_device_bytes);
+    try std.testing.expectEqual(d2h_before_execute, client.memories[0].stats.device_to_host_bytes);
     try expectBufferBytes(outputs[0], &.{ 11, 22, 33, 44 });
+    try std.testing.expectEqual(d2h_before_execute + outputs[0].byte_size, client.memories[0].stats.device_to_host_bytes);
 }
 
 test "buffer keeps shard/device/memory ownership metadata" {

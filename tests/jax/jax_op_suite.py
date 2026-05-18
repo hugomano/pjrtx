@@ -99,8 +99,6 @@ def main() -> int:
     run_case(jax, "sort", lambda x: jnp.sort(x, axis=1), f32_a)
     run_case(jax, "sort_descending", lambda x: jnp.sort(x, axis=1, descending=True), f32_a)
     run_case(jax, "argsort", lambda x: jnp.argsort(x, axis=1), f32_a)
-    if os.environ.get("PJRTX_DUMP_TOPK"):
-        print(jax.jit(lambda x: jax.lax.top_k(x, 2), backend="cpu").lower(f32_a).compiler_ir(dialect="stablehlo"))
     run_case(jax, "top_k", lambda x: jax.lax.top_k(x, 2), f32_a)
     run_case(jax, "axis0_gather", lambda x, i: x[i], f32_a, gather_indices)
     run_case(jax, "axis1_gather", lambda x, i: x[:, i], f32_a, column_indices)

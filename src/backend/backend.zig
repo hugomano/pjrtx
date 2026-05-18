@@ -38,6 +38,14 @@ pub const ProgramNode = struct {
     inputs: []const core.ValueId,
     outputs: []const core.ValueId,
     materializes: bool = true,
+    fusion_group: ?usize = null,
+};
+
+pub const FusionGroup = struct {
+    id: usize,
+    first_node: usize,
+    last_node: usize,
+    node_count: usize,
 };
 
 pub const Program = struct {
@@ -45,6 +53,8 @@ pub const Program = struct {
     nodes: []ProgramNode,
     last_uses: []usize,
     output_values: []bool,
+    fusion_groups: []FusionGroup,
+    fusion_group_count: usize = 0,
 
     pub fn deinit(self: *Program) void {
         for (self.nodes) |node| {
@@ -53,6 +63,7 @@ pub const Program = struct {
         }
         self.allocator.free(self.output_values);
         self.allocator.free(self.last_uses);
+        self.allocator.free(self.fusion_groups);
         self.allocator.free(self.nodes);
         self.* = undefined;
     }

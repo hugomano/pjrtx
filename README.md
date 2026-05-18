@@ -203,9 +203,11 @@ execution.
   of the fast path until the backend has an explicit dtype reinterpretation API.
   MLX backend executables lower into an explicit backend program with nodes,
   backend value ids, liveness metadata, output-value retention, resident
-  constants, and per-device hardware assignments. The execute path still walks
-  this program in schedule order, but it now releases dead intermediates and
-  gives MLX lazy fusion a concrete graph boundary to attach to next. Compile-time
+  constants, fusible view/elementwise group metadata, and per-device hardware
+  assignments. The execute path still walks this program in schedule order, but
+  it now releases dead intermediates and enqueues MLX evaluation at fusion group
+  ends, non-fusible materialization nodes, and final PJRT outputs without
+  copying intermediates to host. Compile-time
   constants stay resident as device arrays and clone those handles during
   execute, which is the first weight-residency path. Elementwise arithmetic,
   extra unary/binary math (`atan2`, `expm1`,
@@ -300,7 +302,7 @@ bazel-bin/src/plugin/libpjrtx_metal_plugin.dylib
   MLX exposes the right primitive.
 - Add a backend legalization/pipeline stage to turn PjRTx value graphs into
   per-device command fragments: memory placement, layout, tiling/shard planning,
-  async dependencies, fusion candidate groups, and final backend kernel/library
+  async dependencies, evaluated fusion groups, and final backend kernel/library
   dispatch. CPU/host reference code remains test-only oracle code, not runtime
   execution.
 - Add focused MLX backend conformance tests for buffer/execution semantics

@@ -234,6 +234,8 @@ int main() {
     PjrtxMlxMetalBuffer* f32_sum = pjrtx_mlx_metal_buffer_binary(
         f32_buffer, f32_rhs_buffer, PJRTX_MLX_METAL_U8_BINARY_ADD);
     if (f32_sum != nullptr) {
+      assert(pjrtx_mlx_metal_buffer_eval(f32_sum) == 1);
+      assert(pjrtx_mlx_metal_buffer_has_host_shadow(f32_sum) == 0);
       float f32_sum_output[3] = {};
       assert(pjrtx_mlx_metal_buffer_copy_to_host(
                  f32_sum, f32_sum_output, sizeof(f32_sum_output)) == 1);
@@ -1095,6 +1097,7 @@ int main() {
   assert(pjrtx_mlx_metal_copy_devices(devices, 0) == 0);
   assert(pjrtx_mlx_metal_buffer_from_host(0, nullptr, 1) == nullptr);
   assert(pjrtx_mlx_metal_buffer_from_host(0, devices, 0) == nullptr);
+  assert(pjrtx_mlx_metal_buffer_eval(nullptr) == 0);
   assert(pjrtx_mlx_metal_buffer_clone(nullptr) == nullptr);
   assert(pjrtx_mlx_metal_buffer_astype(nullptr,
                                        PJRTX_MLX_METAL_DTYPE_F32) == nullptr);

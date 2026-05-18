@@ -98,6 +98,11 @@ pub const CompareOp = enum {
     lt,
 };
 
+pub const ScatterUpdateKind = enum {
+    set,
+    add,
+};
+
 pub const DeviceDescriptor = struct {
     id: i32,
     local_hardware_id: i32,
@@ -247,9 +252,12 @@ pub const PlanInstructionKind = enum {
     iota,
     gather,
     sort,
+    top_k,
     dot_general,
     reduce_sum,
     reduce_max,
+    reduce_and,
+    reduce_or,
     compare,
     select,
     clamp,
@@ -291,8 +299,15 @@ pub const PlanInstruction = struct {
     operand_batching_dims: ?[]const i64 = null,
     start_indices_batching_dims: ?[]const i64 = null,
     start_index_map: ?[]const i64 = null,
+    update_window_dims: ?[]const i64 = null,
+    inserted_window_dims: ?[]const i64 = null,
+    input_batching_dims: ?[]const i64 = null,
+    scatter_indices_batching_dims: ?[]const i64 = null,
+    scatter_dims_to_operand_dims: ?[]const i64 = null,
     index_vector_dim: ?i64 = null,
+    scatter_update_kind: ?ScatterUpdateKind = null,
     dimension: ?i64 = null,
+    top_k_k: ?i64 = null,
     iota_dimension: ?i64 = null,
     dimensions: ?[]const i64 = null,
     tuple_index: ?i64 = null,
@@ -344,6 +359,11 @@ pub const ExecutablePlan = struct {
             if (instruction.operand_batching_dims) |dims| self.allocator.free(dims);
             if (instruction.start_indices_batching_dims) |dims| self.allocator.free(dims);
             if (instruction.start_index_map) |dims| self.allocator.free(dims);
+            if (instruction.update_window_dims) |dims| self.allocator.free(dims);
+            if (instruction.inserted_window_dims) |dims| self.allocator.free(dims);
+            if (instruction.input_batching_dims) |dims| self.allocator.free(dims);
+            if (instruction.scatter_indices_batching_dims) |dims| self.allocator.free(dims);
+            if (instruction.scatter_dims_to_operand_dims) |dims| self.allocator.free(dims);
             if (instruction.dimensions) |dimensions| self.allocator.free(dimensions);
             if (instruction.custom_call_target) |target| self.allocator.free(target);
             if (instruction.reduce_dimensions) |reduce_dimensions| self.allocator.free(reduce_dimensions);

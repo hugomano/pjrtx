@@ -52,9 +52,12 @@ PJRTX_BACKEND=metal_mlx PJRTX_TRACE=1 bazel run //tests/jax:jax_plugin_smoke
 `//tests/jax:jax_op_suite` compares the currently lowered PjRTx fast path
 against JAX CPU for repeated `jax.jit` execution of elementwise float chains,
 reshape/transpose/broadcast, reductions, matmul, clipping via min/max, integer
-bitwise ops, StableHLO sort regions, and restricted single-axis gather forms. The
-suite asserts repeated execution against the MLX Metal device fast path with no
-runtime fallback.
+bitwise ops, StableHLO sort regions, descending sort, argsort, CHLO/StableHLO
+top-k composites, single-axis, point-style, and batched general gather forms,
+single-axis, point-style, windowed, and batched scatter
+set/add forms, and constant
+edge/interior padding. The suite asserts repeated
+execution against the MLX Metal device fast path with no runtime fallback.
 
 The default `.bazelrc` uses:
 
@@ -158,8 +161,8 @@ is a buffer allocation.
 Backend legalization is validated before the plugin accepts a compiled program.
 Failures are reported through `std.Io.Writer` diagnostics with the lowering
 pass, instruction index, op name, value id, dtype/rank/shape, sharding label, and
-backend feature label, so unsupported forms such as general gather or interior
-padding fail during compile instead of falling through to host/reference
+backend feature label, so unsupported forms such as batched gather metadata or
+general scatter fail during compile instead of falling through to host/reference
 execution.
 
 ## Current Status
@@ -208,13 +211,14 @@ execution.
   extra unary/binary math (`atan2`, `expm1`,
   `is_finite`, nearest-even `round`), logical/bitwise ops, compare/select for
   MLX-supported numeric dtypes,
-  reductions, `dot_general`, dtype casts, StableHLO `iota`, StableHLO `clamp`,
+  f32 sum/max and pred and/or reductions, `dot_general`, dtype casts, StableHLO `iota`, StableHLO `clamp`,
   shape/view ops, StableHLO `reverse`, dynamic slice, dynamic update-slice,
-  constant edge padding, restricted single-axis gather, and ascending/descending
+  constant edge/interior padding, single-axis, point-style, and batched general gather
+  forms, single-axis, point-style, windowed, and batched StableHLO scatter set/add, and ascending/descending
   StableHLO `sort` now run through MLX core operations on the GPU device when
-  MLX arrays and Metal devices are available. StableHLO interior padding and
-  general gather/scatter metadata still require broader backend legalization before they
-  enter the fast path.
+  MLX arrays and Metal devices are available. More exotic scatter metadata
+  still requires broader backend legalization before
+  they enter the fast path.
   The PjRTx C shim no longer builds direct Metal arithmetic kernels or calls
   host `xcrun`.
 - `src/compiler`: compile-option parsing and executable-plan construction for
@@ -255,14 +259,16 @@ execution.
   with explicit bounds, StableHLO `reverse` flips compiled axes, StableHLO
   concatenate joins two dense buffers along the compiled dimension, StableHLO
   `sort` uses the comparator direction parsed from the StableHLO region,
-  StableHLO `reduce_precision` is an identity
+  key/value sort lowers through MLX `argsort` plus device-side
+  `take_along_axis`, CHLO/StableHLO top-k composites lower to a device-only
+  sort/argsort/reverse/slice plan, StableHLO `reduce_precision` is an identity
   device copy, `partition_id` materializes scalar partition ids, deterministic
   bootstrap `rng`/`rng_bit_generator` paths exist for tests, and f32 dense
   `cholesky` currently has a correctness implementation that must move behind a
   backend-native linear algebra hook before it is accepted as a fast path.
   Region/control/complex-heavy
   operations that need real staged lowering (`while`, `tuple`,
-  `get_tuple_element`, `scatter`, `convolution`, `custom_call`,
+  `get_tuple_element`, general scatter, `convolution`, `custom_call`,
   `triangular_solve`, `fft`, `complex`/`real`/`imag`) fail with explicit
   `UNIMPLEMENTED` feature diagnostics instead of leaking through buffer-level
   execution.
@@ -289,9 +295,9 @@ bazel-bin/src/plugin/libpjrtx_metal_plugin.dylib
   diagnostics. Current backend legalization diagnostics identify the blocking
   pass, op/value, shape, sharding, and MLX feature label.
 - Expand the MLX backend implementation for the remaining LLM hot path:
-  general gather, interior pad lowering, scatter, custom comparator sort/top-k,
-  and custom-call
-  hooks where MLX exposes the right primitive.
+  richer custom comparator sort semantics, top-k fast paths using MLX library
+  primitives where they expose indices directly, and custom-call hooks where
+  MLX exposes the right primitive.
 - Add a backend legalization/pipeline stage to turn PjRTx value graphs into
   per-device command fragments: memory placement, layout, tiling/shard planning,
   async dependencies, fusion candidate groups, and final backend kernel/library

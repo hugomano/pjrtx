@@ -36,6 +36,7 @@ pub const ProgramFormat = enum {
 };
 
 pub const Dialect = enum {
+    chlo,
     func,
     stablehlo,
     sdy,
@@ -64,8 +65,15 @@ pub const Operation = struct {
     operand_batching_dims: []const i64 = &.{},
     start_indices_batching_dims: []const i64 = &.{},
     start_index_map: []const i64 = &.{},
+    update_window_dims: []const i64 = &.{},
+    inserted_window_dims: []const i64 = &.{},
+    input_batching_dims: []const i64 = &.{},
+    scatter_indices_batching_dims: []const i64 = &.{},
+    scatter_dims_to_operand_dims: []const i64 = &.{},
     index_vector_dim: ?i64 = null,
+    scatter_update_kind: ?core.ScatterUpdateKind = null,
     dimension: ?i64 = null,
+    top_k_k: ?i64 = null,
     iota_dimension: ?i64 = null,
     dimensions: []const i64 = &.{},
     tuple_index: ?i64 = null,
@@ -100,6 +108,11 @@ pub const Operation = struct {
         allocator.free(self.operand_batching_dims);
         allocator.free(self.start_indices_batching_dims);
         allocator.free(self.start_index_map);
+        allocator.free(self.update_window_dims);
+        allocator.free(self.inserted_window_dims);
+        allocator.free(self.input_batching_dims);
+        allocator.free(self.scatter_indices_batching_dims);
+        allocator.free(self.scatter_dims_to_operand_dims);
         allocator.free(self.dimensions);
         allocator.free(self.custom_call_target);
         allocator.free(self.reduce_dimensions);
@@ -668,9 +681,12 @@ fn instructionKindFromStablehlo(name: []const u8) PlanInstructionKind {
     if (std.mem.eql(u8, name, "iota")) return .iota;
     if (std.mem.eql(u8, name, "gather")) return .gather;
     if (std.mem.eql(u8, name, "sort")) return .sort;
+    if (std.mem.eql(u8, name, "top_k")) return .top_k;
     if (std.mem.eql(u8, name, "dot_general")) return .dot_general;
     if (std.mem.eql(u8, name, "reduce_sum")) return .reduce_sum;
     if (std.mem.eql(u8, name, "reduce_max")) return .reduce_max;
+    if (std.mem.eql(u8, name, "reduce_and")) return .reduce_and;
+    if (std.mem.eql(u8, name, "reduce_or")) return .reduce_or;
     if (std.mem.eql(u8, name, "compare")) return .compare;
     if (std.mem.eql(u8, name, "select")) return .select;
     if (std.mem.eql(u8, name, "clamp")) return .clamp;
@@ -763,9 +779,12 @@ fn isUnaryKind(kind: PlanInstructionKind) bool {
         .broadcast_in_dim,
         .slice,
         .sort,
+        .top_k,
         .reverse,
         .reduce_sum,
         .reduce_max,
+        .reduce_and,
+        .reduce_or,
         .cholesky,
         .fft,
         .get_tuple_element,
@@ -864,8 +883,15 @@ fn cloneValues(allocator: std.mem.Allocator, source: []const Value) ![]Value {
     return values;
 }
 
+fn isReduceKind(kind: PlanInstructionKind) bool {
+    return switch (kind) {
+        .reduce_sum, .reduce_max, .reduce_and, .reduce_or => true,
+        else => false,
+    };
+}
+
 fn instructionInputs(allocator: std.mem.Allocator, kind: PlanInstructionKind, op: Operation) ![]const ValueId {
-    if ((kind == .reduce_sum or kind == .reduce_max) and op.inputs.len >= 1) {
+    if (isReduceKind(kind) and op.inputs.len >= 1) {
         return allocator.dupe(ValueId, op.inputs[0..1]);
     }
     if (op.inputs.len != 0 or kind == .constant) return allocator.dupe(ValueId, op.inputs);
@@ -915,6 +941,11 @@ fn freeInstructions(allocator: std.mem.Allocator, instructions: []PlanInstructio
         if (instruction.operand_batching_dims) |dims| allocator.free(dims);
         if (instruction.start_indices_batching_dims) |dims| allocator.free(dims);
         if (instruction.start_index_map) |dims| allocator.free(dims);
+        if (instruction.update_window_dims) |dims| allocator.free(dims);
+        if (instruction.inserted_window_dims) |dims| allocator.free(dims);
+        if (instruction.input_batching_dims) |dims| allocator.free(dims);
+        if (instruction.scatter_indices_batching_dims) |dims| allocator.free(dims);
+        if (instruction.scatter_dims_to_operand_dims) |dims| allocator.free(dims);
         if (instruction.dimensions) |dimensions| allocator.free(dimensions);
         if (instruction.custom_call_target) |target| allocator.free(target);
         if (instruction.reduce_dimensions) |reduce_dimensions| allocator.free(reduce_dimensions);
@@ -966,11 +997,21 @@ fn makePlanInstruction(
     errdefer if (start_indices_batching_dims) |owned| allocator.free(owned);
     const start_index_map = if (kind == .gather) try allocator.dupe(i64, op.start_index_map) else null;
     errdefer if (start_index_map) |owned| allocator.free(owned);
+    const update_window_dims = if (kind == .scatter) try allocator.dupe(i64, op.update_window_dims) else null;
+    errdefer if (update_window_dims) |owned| allocator.free(owned);
+    const inserted_window_dims = if (kind == .scatter) try allocator.dupe(i64, op.inserted_window_dims) else null;
+    errdefer if (inserted_window_dims) |owned| allocator.free(owned);
+    const input_batching_dims = if (kind == .scatter) try allocator.dupe(i64, op.input_batching_dims) else null;
+    errdefer if (input_batching_dims) |owned| allocator.free(owned);
+    const scatter_indices_batching_dims = if (kind == .scatter) try allocator.dupe(i64, op.scatter_indices_batching_dims) else null;
+    errdefer if (scatter_indices_batching_dims) |owned| allocator.free(owned);
+    const scatter_dims_to_operand_dims = if (kind == .scatter) try allocator.dupe(i64, op.scatter_dims_to_operand_dims) else null;
+    errdefer if (scatter_dims_to_operand_dims) |owned| allocator.free(owned);
     const dimensions = if (kind == .reverse or kind == .fft) try allocator.dupe(i64, op.dimensions) else null;
     errdefer if (dimensions) |owned| allocator.free(owned);
     const custom_call_target = if (kind == .custom_call) try allocator.dupe(u8, op.custom_call_target) else null;
     errdefer if (custom_call_target) |owned| allocator.free(owned);
-    const reduce_dimensions = if (kind == .reduce_sum or kind == .reduce_max) try allocator.dupe(i64, op.reduce_dimensions) else null;
+    const reduce_dimensions = if (isReduceKind(kind)) try allocator.dupe(i64, op.reduce_dimensions) else null;
     errdefer if (reduce_dimensions) |owned| allocator.free(owned);
     const lhs_batch_dimensions = if (kind == .dot_general) try allocator.dupe(i64, op.lhs_batch_dimensions) else null;
     errdefer if (lhs_batch_dimensions) |owned| allocator.free(owned);
@@ -1002,8 +1043,15 @@ fn makePlanInstruction(
         .operand_batching_dims = operand_batching_dims,
         .start_indices_batching_dims = start_indices_batching_dims,
         .start_index_map = start_index_map,
-        .index_vector_dim = if (kind == .gather) op.index_vector_dim else null,
+        .update_window_dims = update_window_dims,
+        .inserted_window_dims = inserted_window_dims,
+        .input_batching_dims = input_batching_dims,
+        .scatter_indices_batching_dims = scatter_indices_batching_dims,
+        .scatter_dims_to_operand_dims = scatter_dims_to_operand_dims,
+        .index_vector_dim = if (kind == .gather or kind == .scatter) op.index_vector_dim else null,
+        .scatter_update_kind = if (kind == .scatter) op.scatter_update_kind else null,
         .dimension = if (kind == .concatenate or kind == .sort) op.dimension else null,
+        .top_k_k = if (kind == .top_k) op.top_k_k else null,
         .iota_dimension = if (kind == .iota) op.iota_dimension else null,
         .dimensions = dimensions,
         .tuple_index = if (kind == .get_tuple_element) op.tuple_index else null,
@@ -1037,7 +1085,7 @@ fn lowerAnalysisOpsToPlan(allocator: std.mem.Allocator, ops: []const Operation, 
 fn expectedInputCount(kind: PlanInstructionKind) ?usize {
     return switch (kind) {
         .constant, .iota, .partition_id => 0,
-        .dynamic_slice, .dynamic_update_slice, .concatenate, .custom_call, .rng_bit_generator, .scatter, .tuple, .while_ => null,
+        .dynamic_slice, .dynamic_update_slice, .concatenate, .custom_call, .rng_bit_generator, .scatter, .sort, .tuple, .while_ => null,
         .select, .clamp => 3,
         .rng => null,
         .unsupported => null,
@@ -1158,10 +1206,36 @@ fn verifyInstructionDescriptors(
                 return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "reshape must preserve dense byte size", "shape-type");
             }
         },
-        .transpose, .broadcast_in_dim, .slice, .dynamic_slice, .dynamic_update_slice, .pad, .reverse, .gather, .sort => {
+        .transpose, .broadcast_in_dim, .slice, .dynamic_slice, .dynamic_update_slice, .pad, .reverse, .gather => {
             const input = plan.values[instruction.inputs[0].index].descriptor;
             if (descriptorKnown(input) and descriptorKnown(output) and input.element_type != output.element_type) {
                 return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "view instruction must preserve dtype", "shape-type");
+            }
+        },
+        .sort => {
+            if (!((instruction.inputs.len == 1 and instruction.outputs.len == 1) or (instruction.inputs.len == 2 and instruction.outputs.len == 2))) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "sort must have either one input/output or key-value two input/output form", "instruction-arity");
+            }
+            for (instruction.inputs, instruction.outputs) |input_id, output_id| {
+                const input = plan.values[input_id.index].descriptor;
+                const sort_output = plan.values[output_id.index].descriptor;
+                if (descriptorKnown(input) and descriptorKnown(sort_output) and !sameTypeAndShape(input, sort_output)) {
+                    return failPlanVerification(writer, pass_name, instruction_index, output_id, "sort output must preserve each input dtype and shape", "shape-type");
+                }
+            }
+        },
+        .top_k => {
+            if (instruction.inputs.len != 1 or instruction.outputs.len != 2) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "top_k must have one input and two outputs", "instruction-arity");
+            }
+            const input = plan.values[instruction.inputs[0].index].descriptor;
+            const values = plan.values[instruction.outputs[0].index].descriptor;
+            const indices = plan.values[instruction.outputs[1].index].descriptor;
+            if (descriptorKnown(input) and descriptorKnown(values) and input.element_type != values.element_type) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "top_k values output must preserve input dtype", "shape-type");
+            }
+            if (descriptorKnown(indices) and indices.element_type != .s32 and indices.element_type != .u32) {
+                return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[1], "top_k indices output must be int32-like", "shape-type");
             }
         },
         .concatenate => {
@@ -1181,7 +1255,7 @@ fn verifyInstructionDescriptors(
                 return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "dot_general bootstrap lowering supports f32 tensors only", "dot-general");
             }
         },
-        .reduce_sum, .reduce_max => {
+        .reduce_sum, .reduce_max, .reduce_and, .reduce_or => {
             const input = plan.values[instruction.inputs[0].index].descriptor;
             if (descriptorKnown(input) and descriptorKnown(output) and input.element_type != output.element_type) {
                 return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "reduce output must preserve dtype", "shape-type");
@@ -1302,7 +1376,8 @@ pub fn verifyExecutablePlan(
     }
 
     if (plan.parameter_shardings.len != parameter_count) {
-        return failPlanVerification(writer, pass_name, null, null, "parameter sharding count must match parameter value count", "sharding");
+        try writer.print("invalid executable plan: pass={s} detail=\"parameter sharding count must match parameter value count: shardings={d} parameters={d}\" feature=sharding", .{ pass_name, plan.parameter_shardings.len, parameter_count });
+        return error.InvalidExecutablePlan;
     }
     if (plan.instructions.len == 0) {
         return failPlanVerification(writer, pass_name, null, null, "plan must contain at least one instruction", "instruction-graph");
@@ -1764,6 +1839,136 @@ fn valueIdsForOperandsLimit(builder: *CapiAnalysisBuilder, op: mlir.MlirOperatio
     return ids;
 }
 
+fn appendValueAlias(builder: *CapiAnalysisBuilder, value: mlir.MlirValue, id: ValueId) !void {
+    if (builder.lookupValue(value) != null) return;
+    try builder.value_map.append(builder.allocator, .{ .mlir_value = value, .id = id });
+}
+
+fn aliasFirstRegionBlockArgumentsToOperands(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation) AnalyzeError!void {
+    if (mlir.mlirOperationGetNumRegions(op) == 0) return;
+    const block = mlir.mlirRegionGetFirstBlock(mlir.mlirOperationGetRegion(op, 0));
+    if (mlir.mlirBlockIsNull(block)) return;
+    const arg_count = mlir.mlirBlockGetNumArguments(block);
+    const operand_count = mlir.mlirOperationGetNumOperands(op);
+    const count = @min(arg_count, operand_count);
+    const operand_ids = try valueIdsForOperandsLimit(builder, op, @intCast(count));
+    defer builder.allocator.free(operand_ids);
+    var index: isize = 0;
+    while (index < count) : (index += 1) {
+        try appendValueAlias(builder, mlir.mlirBlockGetArgument(block, index), operand_ids[@intCast(index)]);
+    }
+}
+
+fn aliasOperationResultsToFirstRegionReturn(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation) AnalyzeError!void {
+    if (mlir.mlirOperationGetNumRegions(op) == 0) return;
+    const block = mlir.mlirRegionGetFirstBlock(mlir.mlirOperationGetRegion(op, 0));
+    if (mlir.mlirBlockIsNull(block)) return;
+    const terminator = mlir.mlirBlockGetTerminator(block);
+    if (mlir.mlirOperationIsNull(terminator) or !std.mem.eql(u8, operationName(terminator), "stablehlo.return")) return;
+    const result_count = mlir.mlirOperationGetNumResults(op);
+    const operand_count = mlir.mlirOperationGetNumOperands(terminator);
+    const count = @min(result_count, operand_count);
+    var index: isize = 0;
+    while (index < count) : (index += 1) {
+        const result_id = builder.lookupValue(mlir.mlirOperationGetOperand(terminator, index)) orelse {
+            const loc = mlirLocationLineColumn(mlir.mlirOperationGetLocation(op));
+            try builder.diagnostic_writer.print(
+                "invalid StableHLO module: loc={d}:{d} op=stablehlo.composite result={d} detail=\"composite return operand does not reference a lowered value\" feature=stablehlo-composite",
+                .{ loc.line, loc.column, index },
+            );
+            return error.InvalidStablehloModule;
+        };
+        try appendValueAlias(builder, mlir.mlirOperationGetResult(op, index), result_id);
+    }
+}
+
+fn emptyI64(allocator: std.mem.Allocator) ![]const i64 {
+    return allocator.dupe(i64, &.{});
+}
+
+fn emptyU8(allocator: std.mem.Allocator) ![]const u8 {
+    return allocator.dupe(u8, &.{});
+}
+
+fn analyzeTopKOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation, dialect: Dialect, k: i64) AnalyzeError!void {
+    builder.saw_program_body = true;
+    try addDialect(&builder.dialects, builder.allocator, dialect);
+    const ty = resultOrOperandType(op);
+    const dtype = if (mlir.mlirTypeIsNull(ty)) try builder.allocator.dupe(u8, "unknown") else try typeDtype(builder.allocator, ty);
+    const dims = if (mlir.mlirTypeIsNull(ty)) try emptyI64(builder.allocator) else try typeDims(builder.allocator, ty);
+    const inputs = try valueIdsForOperands(builder, op);
+    const outputs = try registerResultValues(builder, op, .instruction_result);
+    const sharding = try operationShardingLabel(builder.allocator, op);
+    const loc = mlirLocationLineColumn(mlir.mlirOperationGetLocation(op));
+    const name = try builder.allocator.dupe(u8, "top_k");
+
+    try builder.ops.append(builder.allocator, .{
+        .name = name,
+        .line = loc.line,
+        .column = loc.column,
+        .inputs = inputs,
+        .outputs = outputs,
+        .dtype = dtype,
+        .rank = if (mlir.mlirTypeIsNull(ty)) null else typeRank(ty),
+        .dims = dims,
+        .permutation = try emptyI64(builder.allocator),
+        .broadcast_dimensions = try emptyI64(builder.allocator),
+        .start_indices = try emptyI64(builder.allocator),
+        .limit_indices = try emptyI64(builder.allocator),
+        .strides = try emptyI64(builder.allocator),
+        .slice_sizes = try emptyI64(builder.allocator),
+        .edge_padding_low = try emptyI64(builder.allocator),
+        .edge_padding_high = try emptyI64(builder.allocator),
+        .interior_padding = try emptyI64(builder.allocator),
+        .offset_dims = try emptyI64(builder.allocator),
+        .collapsed_slice_dims = try emptyI64(builder.allocator),
+        .operand_batching_dims = try emptyI64(builder.allocator),
+        .start_indices_batching_dims = try emptyI64(builder.allocator),
+        .start_index_map = try emptyI64(builder.allocator),
+        .update_window_dims = try emptyI64(builder.allocator),
+        .inserted_window_dims = try emptyI64(builder.allocator),
+        .input_batching_dims = try emptyI64(builder.allocator),
+        .scatter_indices_batching_dims = try emptyI64(builder.allocator),
+        .scatter_dims_to_operand_dims = try emptyI64(builder.allocator),
+        .top_k_k = k,
+        .dimensions = try emptyI64(builder.allocator),
+        .custom_call_target = try emptyU8(builder.allocator),
+        .reduce_dimensions = try emptyI64(builder.allocator),
+        .lhs_batch_dimensions = try emptyI64(builder.allocator),
+        .rhs_batch_dimensions = try emptyI64(builder.allocator),
+        .lhs_contracting_dimensions = try emptyI64(builder.allocator),
+        .rhs_contracting_dimensions = try emptyI64(builder.allocator),
+        .literal = try emptyU8(builder.allocator),
+        .sharding = sharding,
+    });
+}
+
+fn analyzeChloTopKOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation) AnalyzeError!void {
+    const k = intAttribute(getOperationAttribute(op, "k")) orelse {
+        const loc = mlirLocationLineColumn(mlir.mlirOperationGetLocation(op));
+        try writeSimpleDiagnostic(builder.diagnostic_writer, "unsupported op", loc.line, loc.column, "chlo.top_k requires static k", "chlo-top-k");
+        return error.UnsupportedOp;
+    };
+    try analyzeTopKOperationFromCapi(builder, op, .chlo, k);
+}
+
+fn analyzeCompositeTopKOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation) AnalyzeError!bool {
+    const name_attr = getOperationAttribute(op, "name");
+    if (!mlir.mlirAttributeIsNull(name_attr) and mlir.mlirAttributeIsAString(name_attr)) {
+        const composite_name = mlirStringSlice(mlir.mlirStringAttrGetValue(name_attr));
+        if (std.mem.indexOf(u8, composite_name, "top_k") == null) return false;
+    } else if (mlir.mlirOperationGetNumResults(op) != 2) {
+        return false;
+    }
+    const ty = resultOrOperandType(op);
+    if (mlir.mlirTypeIsNull(ty)) return false;
+    const dims = try typeDims(builder.allocator, ty);
+    defer builder.allocator.free(dims);
+    if (dims.len == 0) return false;
+    try analyzeTopKOperationFromCapi(builder, op, .stablehlo, dims[dims.len - 1]);
+    return true;
+}
+
 fn registerResultValues(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation, role: ValueRole) ![]const ValueId {
     const count: usize = @intCast(mlir.mlirOperationGetNumResults(op));
     const ids = try builder.allocator.alloc(ValueId, count);
@@ -1869,6 +2074,57 @@ fn stablehloGatherIndexVectorDim(attr: mlir.MlirAttribute) ?i64 {
     return mlir.stablehloGatherDimensionNumbersGetIndexVectorDim(attr);
 }
 
+fn stablehloScatterDims(allocator: std.mem.Allocator, attr: mlir.MlirAttribute, comptime which: []const u8) ![]const i64 {
+    if (mlir.mlirAttributeIsNull(attr) or !mlir.stablehloAttributeIsAScatterDimensionNumbers(attr)) return allocator.dupe(i64, &.{});
+    const count = if (std.mem.eql(u8, which, "update_window"))
+        mlir.stablehloScatterDimensionNumbersGetUpdateWindowDimsSize(attr)
+    else if (std.mem.eql(u8, which, "inserted_window"))
+        mlir.stablehloScatterDimensionNumbersGetInsertedWindowDimsSize(attr)
+    else if (std.mem.eql(u8, which, "input_batching"))
+        mlir.stablehloScatterDimensionNumbersGetInputBatchingDimsSize(attr)
+    else if (std.mem.eql(u8, which, "scatter_indices_batching"))
+        mlir.stablehloScatterDimensionNumbersGetScatterIndicesBatchingDimsSize(attr)
+    else
+        mlir.stablehloScatterDimensionNumbersGetScatteredDimsToOperandDimsSize(attr);
+    const values = try allocator.alloc(i64, @intCast(count));
+    var index: isize = 0;
+    while (index < count) : (index += 1) {
+        values[@intCast(index)] = if (std.mem.eql(u8, which, "update_window"))
+            mlir.stablehloScatterDimensionNumbersGetUpdateWindowDimsElem(attr, index)
+        else if (std.mem.eql(u8, which, "inserted_window"))
+            mlir.stablehloScatterDimensionNumbersGetInsertedWindowDimsElem(attr, index)
+        else if (std.mem.eql(u8, which, "input_batching"))
+            mlir.stablehloScatterDimensionNumbersGetInputBatchingDimsElem(attr, index)
+        else if (std.mem.eql(u8, which, "scatter_indices_batching"))
+            mlir.stablehloScatterDimensionNumbersGetScatterIndicesBatchingDimsElem(attr, index)
+        else
+            mlir.stablehloScatterDimensionNumbersGetScatteredDimsToOperandDimsElem(attr, index);
+    }
+    return values;
+}
+
+fn stablehloScatterIndexVectorDim(attr: mlir.MlirAttribute) ?i64 {
+    if (mlir.mlirAttributeIsNull(attr) or !mlir.stablehloAttributeIsAScatterDimensionNumbers(attr)) return null;
+    return mlir.stablehloDimensionNumbersGetIndexVectorDim(attr);
+}
+
+fn scatterUpdateKindFromRegion(op: mlir.MlirOperation) ?core.ScatterUpdateKind {
+    const n_regions = mlir.mlirOperationGetNumRegions(op);
+    var region_index: isize = 0;
+    while (region_index < n_regions) : (region_index += 1) {
+        var block = mlir.mlirRegionGetFirstBlock(mlir.mlirOperationGetRegion(op, region_index));
+        while (!mlir.mlirBlockIsNull(block)) : (block = mlir.mlirBlockGetNextInRegion(block)) {
+            var saw_add = false;
+            var child = mlir.mlirBlockGetFirstOperation(block);
+            while (!mlir.mlirOperationIsNull(child)) : (child = mlir.mlirOperationGetNextInBlock(child)) {
+                if (std.mem.eql(u8, operationName(child), "stablehlo.add")) saw_add = true;
+                if (std.mem.eql(u8, operationName(child), "stablehlo.return")) return if (saw_add) .add else .set;
+            }
+        }
+    }
+    return null;
+}
+
 fn compareDirectionFromAttr(attr: mlir.MlirAttribute) ?core.CompareOp {
     if (mlir.mlirAttributeIsNull(attr) or !mlir.stablehloAttributeIsAComparisonDirectionAttr(attr)) return null;
     const text = mlirStringSlice(mlir.stablehloComparisonDirectionAttrGetValue(attr));
@@ -1892,6 +2148,8 @@ fn reduceKindFromRegion(op: mlir.MlirOperation) []const u8 {
                 const name = operationName(child);
                 if (std.mem.eql(u8, name, "stablehlo.add")) return "reduce_sum";
                 if (std.mem.eql(u8, name, "stablehlo.maximum")) return "reduce_max";
+                if (std.mem.eql(u8, name, "stablehlo.and")) return "reduce_and";
+                if (std.mem.eql(u8, name, "stablehlo.or")) return "reduce_or";
             }
         }
     }
@@ -2000,7 +2258,28 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
     const start_index_map = if (std.mem.eql(u8, short_name, "gather")) try stablehloGatherDims(builder.allocator, gather_dimensions, "start_index_map") else try builder.allocator.dupe(i64, &.{});
     var owns_start_index_map = true;
     errdefer if (owns_start_index_map) builder.allocator.free(start_index_map);
-    const index_vector_dim = if (std.mem.eql(u8, short_name, "gather")) stablehloGatherIndexVectorDim(gather_dimensions) else null;
+    const scatter_dimensions = getOperationAttribute(op, "scatter_dimension_numbers");
+    const update_window_dims = if (std.mem.eql(u8, short_name, "scatter")) try stablehloScatterDims(builder.allocator, scatter_dimensions, "update_window") else try builder.allocator.dupe(i64, &.{});
+    var owns_update_window_dims = true;
+    errdefer if (owns_update_window_dims) builder.allocator.free(update_window_dims);
+    const inserted_window_dims = if (std.mem.eql(u8, short_name, "scatter")) try stablehloScatterDims(builder.allocator, scatter_dimensions, "inserted_window") else try builder.allocator.dupe(i64, &.{});
+    var owns_inserted_window_dims = true;
+    errdefer if (owns_inserted_window_dims) builder.allocator.free(inserted_window_dims);
+    const input_batching_dims = if (std.mem.eql(u8, short_name, "scatter")) try stablehloScatterDims(builder.allocator, scatter_dimensions, "input_batching") else try builder.allocator.dupe(i64, &.{});
+    var owns_input_batching_dims = true;
+    errdefer if (owns_input_batching_dims) builder.allocator.free(input_batching_dims);
+    const scatter_indices_batching_dims = if (std.mem.eql(u8, short_name, "scatter")) try stablehloScatterDims(builder.allocator, scatter_dimensions, "scatter_indices_batching") else try builder.allocator.dupe(i64, &.{});
+    var owns_scatter_indices_batching_dims = true;
+    errdefer if (owns_scatter_indices_batching_dims) builder.allocator.free(scatter_indices_batching_dims);
+    const scatter_dims_to_operand_dims = if (std.mem.eql(u8, short_name, "scatter")) try stablehloScatterDims(builder.allocator, scatter_dimensions, "scatter_dims_to_operand") else try builder.allocator.dupe(i64, &.{});
+    var owns_scatter_dims_to_operand_dims = true;
+    errdefer if (owns_scatter_dims_to_operand_dims) builder.allocator.free(scatter_dims_to_operand_dims);
+    const index_vector_dim = if (std.mem.eql(u8, short_name, "gather"))
+        stablehloGatherIndexVectorDim(gather_dimensions)
+    else if (std.mem.eql(u8, short_name, "scatter"))
+        stablehloScatterIndexVectorDim(scatter_dimensions)
+    else
+        null;
     const dimension = if (std.mem.eql(u8, short_name, "concatenate") or std.mem.eql(u8, short_name, "sort"))
         intAttribute(getOperationAttribute(op, "dimension"))
     else
@@ -2056,6 +2335,7 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
         compareDirectionFromSortRegion(op)
     else
         null;
+    const scatter_update_kind = if (std.mem.eql(u8, short_name, "scatter")) scatterUpdateKindFromRegion(op) else null;
     const input_count = if (std.mem.startsWith(u8, short_name, "reduce_")) @as(usize, 1) else @as(usize, @intCast(mlir.mlirOperationGetNumOperands(op)));
     const inputs = try valueIdsForOperandsLimit(builder, op, input_count);
     var owns_inputs = true;
@@ -2102,7 +2382,13 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
         .operand_batching_dims = operand_batching_dims,
         .start_indices_batching_dims = start_indices_batching_dims,
         .start_index_map = start_index_map,
+        .update_window_dims = update_window_dims,
+        .inserted_window_dims = inserted_window_dims,
+        .input_batching_dims = input_batching_dims,
+        .scatter_indices_batching_dims = scatter_indices_batching_dims,
+        .scatter_dims_to_operand_dims = scatter_dims_to_operand_dims,
         .index_vector_dim = index_vector_dim,
+        .scatter_update_kind = scatter_update_kind,
         .dimension = dimension,
         .iota_dimension = iota_dimension,
         .dimensions = dimensions,
@@ -2139,6 +2425,11 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
         owns_operand_batching_dims = false;
         owns_start_indices_batching_dims = false;
         owns_start_index_map = false;
+        owns_update_window_dims = false;
+        owns_inserted_window_dims = false;
+        owns_input_batching_dims = false;
+        owns_scatter_indices_batching_dims = false;
+        owns_scatter_dims_to_operand_dims = false;
         owns_dimensions = false;
         owns_custom_call_target = false;
         owns_reduce_dimensions = false;
@@ -2170,6 +2461,11 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
     owns_operand_batching_dims = false;
     owns_start_indices_batching_dims = false;
     owns_start_index_map = false;
+    owns_update_window_dims = false;
+    owns_inserted_window_dims = false;
+    owns_input_batching_dims = false;
+    owns_scatter_indices_batching_dims = false;
+    owns_scatter_dims_to_operand_dims = false;
     owns_dimensions = false;
     owns_custom_call_target = false;
     owns_reduce_dimensions = false;
@@ -2325,7 +2621,17 @@ fn appendFunctionReturnIds(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation
     builder.output_ids.clearRetainingCapacity();
     var operand_index: isize = 0;
     while (operand_index < operand_count) : (operand_index += 1) {
-        const id = builder.lookupValue(mlir.mlirOperationGetOperand(terminator, operand_index)) orelse return error.InvalidStablehloModule;
+        const return_operand = mlir.mlirOperationGetOperand(terminator, operand_index);
+        const id = builder.lookupValue(return_operand) orelse {
+            const loc = mlirLocationLineColumn(mlir.mlirOperationGetLocation(terminator));
+            var owner_name: []const u8 = "<none>";
+            if (mlir.mlirValueIsAOpResult(return_operand)) owner_name = operationName(mlir.mlirOpResultGetOwner(return_operand));
+            try builder.diagnostic_writer.print(
+                "invalid StableHLO module: loc={d}:{d} op=func.return operand={d} owner={s} detail=\"return operand does not reference a lowered value\" feature=value-graph",
+                .{ loc.line, loc.column, operand_index, owner_name },
+            );
+            return error.InvalidStablehloModule;
+        };
         try builder.output_ids.append(builder.allocator, id);
     }
 }
@@ -2337,13 +2643,33 @@ fn visitOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation)
 
     var recurse_children = true;
     if (std.mem.eql(u8, name, "func.func")) {
-        try analyzeFunctionFromCapi(builder, op);
+        const visibility = getOperationAttribute(op, "sym_visibility");
+        if (!mlir.mlirAttributeIsNull(visibility) and mlir.mlirAttributeIsAString(visibility) and std.mem.eql(u8, mlirStringSlice(mlir.mlirStringAttrGetValue(visibility)), "private")) {
+            recurse_children = false;
+        } else {
+            try analyzeFunctionFromCapi(builder, op);
+        }
     } else if (std.mem.startsWith(u8, name, "stablehlo.")) {
-        try analyzeStablehloOperationFromCapi(builder, op, name);
-        recurse_children = false;
+        if (std.mem.eql(u8, name, "stablehlo.composite")) {
+            if (try analyzeCompositeTopKOperationFromCapi(builder, op)) {
+                recurse_children = false;
+            } else {
+                builder.saw_program_body = true;
+                try addDialect(&builder.dialects, builder.allocator, .stablehlo);
+                try aliasFirstRegionBlockArgumentsToOperands(builder, op);
+            }
+        } else {
+            try analyzeStablehloOperationFromCapi(builder, op, name);
+            recurse_children = false;
+        }
     } else if (std.mem.startsWith(u8, name, "chlo.")) {
-        try writeSimpleDiagnostic(builder.diagnostic_writer, "unsupported op", loc.line, loc.column, "CHLO legalization is not wired yet", "chlo-legalization");
-        return error.UnsupportedOp;
+        if (std.mem.eql(u8, name, "chlo.top_k")) {
+            try analyzeChloTopKOperationFromCapi(builder, op);
+            recurse_children = false;
+        } else {
+            try writeSimpleDiagnostic(builder.diagnostic_writer, "unsupported op", loc.line, loc.column, "CHLO legalization is not wired yet", "chlo-legalization");
+            return error.UnsupportedOp;
+        }
     } else if (std.mem.startsWith(u8, name, "shape.")) {
         try writeSimpleDiagnostic(builder.diagnostic_writer, "unsupported op", loc.line, loc.column, "shape dialect interop is not wired yet", "shape-legalization");
         return error.UnsupportedOp;
@@ -2382,7 +2708,8 @@ fn visitOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation)
             }
         }
     }
-    if (std.mem.eql(u8, name, "func.func")) try appendFunctionReturnIds(builder, op);
+    if (std.mem.eql(u8, name, "stablehlo.composite")) try aliasOperationResultsToFirstRegionReturn(builder, op);
+    if (std.mem.eql(u8, name, "func.func") and recurse_children) try appendFunctionReturnIds(builder, op);
 }
 
 fn analyzeMlirSessionWithCapi(

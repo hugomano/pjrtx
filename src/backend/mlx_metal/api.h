@@ -72,6 +72,13 @@ enum {
 enum {
   PJRTX_MLX_METAL_REDUCE_SUM = 0,
   PJRTX_MLX_METAL_REDUCE_MAX = 1,
+  PJRTX_MLX_METAL_REDUCE_AND = 2,
+  PJRTX_MLX_METAL_REDUCE_OR = 3,
+};
+
+enum {
+  PJRTX_MLX_METAL_SCATTER_SET = 0,
+  PJRTX_MLX_METAL_SCATTER_ADD = 1,
 };
 
 enum {
@@ -146,9 +153,39 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_gather_axis(
     PjrtxMlxMetalBuffer* operand, PjrtxMlxMetalBuffer* indices, int64_t axis,
     int64_t index_vector_dim, const int64_t* output_dims,
     uint64_t output_rank);
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_gather(
+    PjrtxMlxMetalBuffer* operand, PjrtxMlxMetalBuffer* indices,
+    const int64_t* start_index_map, uint64_t num_start_axes,
+    const int64_t* collapsed_slice_dims, uint64_t num_collapsed_slice_dims,
+    const int64_t* operand_batching_dims, uint64_t num_operand_batching_dims,
+    const int64_t* start_indices_batching_dims,
+    uint64_t num_start_indices_batching_dims,
+    int64_t index_vector_dim, const int64_t* slice_sizes, uint64_t slice_rank,
+    const int64_t* offset_dims, uint64_t num_offset_dims,
+    const int64_t* output_dims, uint64_t output_rank);
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_scatter_axis(
+    PjrtxMlxMetalBuffer* operand, PjrtxMlxMetalBuffer* indices,
+    PjrtxMlxMetalBuffer* updates, int64_t axis, int64_t index_vector_dim,
+    int update_kind, const int64_t* output_dims, uint64_t output_rank);
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_scatter(
+    PjrtxMlxMetalBuffer* operand, PjrtxMlxMetalBuffer* indices,
+    PjrtxMlxMetalBuffer* updates, const int64_t* scatter_dims_to_operand_dims,
+    uint64_t num_scatter_axes, const int64_t* inserted_window_dims,
+    uint64_t num_inserted_window_dims, const int64_t* update_window_dims,
+    uint64_t num_update_window_dims, const int64_t* input_batching_dims,
+    uint64_t num_input_batching_dims,
+    const int64_t* scatter_indices_batching_dims,
+    uint64_t num_scatter_indices_batching_dims, int64_t index_vector_dim,
+    int update_kind, const int64_t* output_dims, uint64_t output_rank);
 PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_sort(
     PjrtxMlxMetalBuffer* src, int64_t dimension, const int64_t* output_dims,
     uint64_t output_rank);
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_argsort(
+    PjrtxMlxMetalBuffer* src, int64_t dimension, int output_dtype,
+    const int64_t* output_dims, uint64_t output_rank);
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_take_along_axis(
+    PjrtxMlxMetalBuffer* src, PjrtxMlxMetalBuffer* indices, int64_t dimension,
+    const int64_t* output_dims, uint64_t output_rank);
 PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_dot_general(
     PjrtxMlxMetalBuffer* lhs, PjrtxMlxMetalBuffer* rhs,
     const int64_t* lhs_batch_dimensions, uint64_t lhs_batch_rank,

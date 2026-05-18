@@ -686,7 +686,7 @@ pub const ExecutableGraph = struct {
                 instruction.dims orelse &.{},
                 device_index,
             ) catch |err| return mapBufferError(err),
-            .reduce_sum, .reduce_max => Buffer.initReduce(allocator, instruction.kind, value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument, instruction.reduce_dimensions orelse &.{}, instruction.dims orelse &.{}, device_index) catch |err| return mapBufferError(err),
+            .reduce_sum, .reduce_max, .reduce_and, .reduce_or => Buffer.initReduce(allocator, instruction.kind, value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument, instruction.reduce_dimensions orelse &.{}, instruction.dims orelse &.{}, device_index) catch |err| return mapBufferError(err),
             .gather => Buffer.initGather(
                 allocator,
                 value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
@@ -734,7 +734,7 @@ pub const ExecutableGraph = struct {
                 device_index,
             ) catch |err| return mapBufferError(err),
             .rng_bit_generator => unreachable,
-            .complex, .real, .imag, .fft, .convolution, .custom_call, .get_tuple_element, .scatter, .triangular_solve, .tuple, .while_, .unsupported => return error.UnsupportedRuntimeFeature,
+            .complex, .real, .imag, .fft, .convolution, .custom_call, .get_tuple_element, .scatter, .top_k, .triangular_solve, .tuple, .while_, .unsupported => return error.UnsupportedRuntimeFeature,
         };
 
         if (value_owned[output_id.index]) {
@@ -1951,13 +1951,16 @@ pub const Buffer = struct {
         output_dims: []const i64,
         shard_index: usize,
     ) !*Buffer {
-        if (src.element_type != .f32) return error.UnsupportedElementType;
-        if (kind != .reduce_sum and kind != .reduce_max) return error.UnsupportedElementType;
+        const output_type: BufferType = switch (kind) {
+            .reduce_sum, .reduce_max => if (src.element_type == .f32) .f32 else return error.UnsupportedElementType,
+            .reduce_and, .reduce_or => if (src.element_type == .pred) .pred else return error.UnsupportedElementType,
+            else => return error.UnsupportedElementType,
+        };
         if (!validReduce(src.dims, dimensions, output_dims)) return error.ShapeMismatch;
-        const output_byte_size = denseByteSize(.f32, output_dims);
+        const output_byte_size = denseByteSize(output_type, output_dims);
         if (src.backend_buffer) |src_backend| {
             if (src.backend.reduce(src_backend, kind, dimensions, output_dims) catch null) |backend_buffer| {
-                return initBackendOnly(allocator, src, .f32, output_dims, output_byte_size, backend_buffer, shard_index);
+                return initBackendOnly(allocator, src, output_type, output_dims, output_byte_size, backend_buffer, shard_index);
             }
         }
 
@@ -1970,13 +1973,17 @@ pub const Buffer = struct {
         const bytes = try allocator.alloc(u8, output_byte_size);
         errdefer allocator.free(bytes);
 
-        try evalReduceF32(allocator, kind, src.bytes, src.dims, dimensions, output_dims, bytes);
+        switch (output_type) {
+            .f32 => try evalReduceF32(allocator, kind, src.bytes, src.dims, dimensions, output_dims, bytes),
+            .pred => try evalReducePred(allocator, kind, src.bytes, src.dims, dimensions, output_dims, bytes),
+            else => unreachable,
+        }
 
         buffer.* = .{
             .allocator = allocator,
             .backend = src.backend,
             .backend_kind = src.backend_kind,
-            .element_type = .f32,
+            .element_type = output_type,
             .dims = dims,
             .device_id = src.device_id,
             .memory_id = src.memory_id,
@@ -2523,9 +2530,6 @@ pub const Buffer = struct {
         output_dims: []const i64,
         shard_index: usize,
     ) !*Buffer {
-        _ = offset_dims;
-        _ = operand_batching_dims;
-        _ = start_indices_batching_dims;
         if (operand.element_type.byteSize() == 0) return error.UnsupportedElementType;
         if (start_index_map.len == 0 or slice_sizes.len != operand.dims.len) return error.ShapeMismatch;
         if (index_vector_dim < 0) return error.ShapeMismatch;
@@ -2536,6 +2540,20 @@ pub const Buffer = struct {
                 if (operand.backend.gatherAxis(operand.backend_buffer.?, indices.backend_buffer.?, gather_axis, index_vector_dim, output_dims) catch null) |backend_buffer| {
                     return initBackendOnly(allocator, operand, operand.element_type, output_dims, denseByteSize(operand.element_type, output_dims), backend_buffer, shard_index);
                 }
+            }
+            if (operand.backend.gather(
+                operand.backend_buffer.?,
+                indices.backend_buffer.?,
+                start_index_map,
+                collapsed_slice_dims,
+                operand_batching_dims,
+                start_indices_batching_dims,
+                index_vector_dim,
+                slice_sizes,
+                offset_dims,
+                output_dims,
+            ) catch null) |backend_buffer| {
+                return initBackendOnly(allocator, operand, operand.element_type, output_dims, denseByteSize(operand.element_type, output_dims), backend_buffer, shard_index);
             }
             if (operand.bytes.len == 0 or indices.bytes.len == 0) return error.UnsupportedRuntimeFeature;
         }
@@ -3129,6 +3147,39 @@ fn evalReduceF32(
         const current = readF32LE(out_bytes, output_index);
         const value = readF32LE(src_bytes, input_index);
         writeF32LE(out_bytes, output_index, if (kind == .reduce_sum) current + value else @max(current, value));
+    }
+}
+
+fn evalReducePred(
+    allocator: std.mem.Allocator,
+    kind: core.PlanInstructionKind,
+    src_bytes: []const u8,
+    input_dims: []const i64,
+    dimensions: []const i64,
+    output_dims: []const i64,
+    out_bytes: []u8,
+) !void {
+    const input_strides = try rowMajorStrides(allocator, input_dims);
+    defer allocator.free(input_strides);
+    const output_strides = try rowMajorStrides(allocator, output_dims);
+    defer allocator.free(output_strides);
+    const coords = try allocator.alloc(usize, input_dims.len);
+    defer allocator.free(coords);
+    const output_axes = try outputAxesWithout(input_dims.len, dimensions, allocator);
+    defer allocator.free(output_axes);
+
+    const output_count = if (output_dims.len == 0) 1 else denseByteSize(.pred, output_dims);
+    @memset(out_bytes[0..output_count], if (kind == .reduce_and) 1 else 0);
+    for (src_bytes, 0..) |value, input_index| {
+        unravelIndex(input_index, input_dims, input_strides, coords);
+        var output_index: usize = 0;
+        for (output_axes, 0..) |input_axis, output_axis| {
+            output_index += coords[input_axis] * output_strides[output_axis];
+        }
+        out_bytes[output_index] = if (kind == .reduce_and)
+            @intFromBool(out_bytes[output_index] != 0 and value != 0)
+        else
+            @intFromBool(out_bytes[output_index] != 0 or value != 0);
     }
 }
 

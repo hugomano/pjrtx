@@ -186,9 +186,92 @@ fn gatherAxis(_: backend.Backend, operand: backend.BufferHandle, indices: backen
     return @ptrCast(handle);
 }
 
+fn gather(_: backend.Backend, operand: backend.BufferHandle, indices: backend.BufferHandle, start_index_map: []const i64, collapsed_slice_dims: []const i64, operand_batching_dims: []const i64, start_indices_batching_dims: []const i64, index_vector_dim: i64, slice_sizes: []const i64, offset_dims: []const i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    const handle = c.pjrtx_mlx_metal_buffer_gather(
+        @ptrCast(@alignCast(operand)),
+        @ptrCast(@alignCast(indices)),
+        start_index_map.ptr,
+        start_index_map.len,
+        collapsed_slice_dims.ptr,
+        collapsed_slice_dims.len,
+        operand_batching_dims.ptr,
+        operand_batching_dims.len,
+        start_indices_batching_dims.ptr,
+        start_indices_batching_dims.len,
+        index_vector_dim,
+        slice_sizes.ptr,
+        slice_sizes.len,
+        offset_dims.ptr,
+        offset_dims.len,
+        output_dims.ptr,
+        output_dims.len,
+    ) orelse return error.CommandSubmissionFailed;
+    return @ptrCast(handle);
+}
+
+fn scatterAxis(_: backend.Backend, operand: backend.BufferHandle, indices: backend.BufferHandle, updates: backend.BufferHandle, axis: i64, index_vector_dim: i64, update_kind: core.ScatterUpdateKind, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    const handle = c.pjrtx_mlx_metal_buffer_scatter_axis(
+        @ptrCast(@alignCast(operand)),
+        @ptrCast(@alignCast(indices)),
+        @ptrCast(@alignCast(updates)),
+        axis,
+        index_vector_dim,
+        mlxScatterUpdateCode(update_kind),
+        output_dims.ptr,
+        output_dims.len,
+    ) orelse return error.CommandSubmissionFailed;
+    return @ptrCast(handle);
+}
+
+fn scatter(_: backend.Backend, operand: backend.BufferHandle, indices: backend.BufferHandle, updates: backend.BufferHandle, scatter_dims_to_operand_dims: []const i64, inserted_window_dims: []const i64, update_window_dims: []const i64, input_batching_dims: []const i64, scatter_indices_batching_dims: []const i64, index_vector_dim: i64, update_kind: core.ScatterUpdateKind, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    const handle = c.pjrtx_mlx_metal_buffer_scatter(
+        @ptrCast(@alignCast(operand)),
+        @ptrCast(@alignCast(indices)),
+        @ptrCast(@alignCast(updates)),
+        scatter_dims_to_operand_dims.ptr,
+        scatter_dims_to_operand_dims.len,
+        inserted_window_dims.ptr,
+        inserted_window_dims.len,
+        update_window_dims.ptr,
+        update_window_dims.len,
+        input_batching_dims.ptr,
+        input_batching_dims.len,
+        scatter_indices_batching_dims.ptr,
+        scatter_indices_batching_dims.len,
+        index_vector_dim,
+        mlxScatterUpdateCode(update_kind),
+        output_dims.ptr,
+        output_dims.len,
+    ) orelse return error.CommandSubmissionFailed;
+    return @ptrCast(handle);
+}
+
 fn sort(_: backend.Backend, src: backend.BufferHandle, dimension: i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
     const handle = c.pjrtx_mlx_metal_buffer_sort(
         @ptrCast(@alignCast(src)),
+        dimension,
+        output_dims.ptr,
+        output_dims.len,
+    ) orelse return error.CommandSubmissionFailed;
+    return @ptrCast(handle);
+}
+
+fn argsort(_: backend.Backend, src: backend.BufferHandle, dimension: i64, output_type: core.BufferType, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    const dtype = mlxDtype(output_type) orelse return error.UnsupportedElementType;
+    const handle = c.pjrtx_mlx_metal_buffer_argsort(
+        @ptrCast(@alignCast(src)),
+        dimension,
+        dtype,
+        output_dims.ptr,
+        output_dims.len,
+    ) orelse return error.CommandSubmissionFailed;
+    return @ptrCast(handle);
+}
+
+fn takeAlongAxis(_: backend.Backend, src: backend.BufferHandle, indices: backend.BufferHandle, dimension: i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    const handle = c.pjrtx_mlx_metal_buffer_take_along_axis(
+        @ptrCast(@alignCast(src)),
+        @ptrCast(@alignCast(indices)),
         dimension,
         output_dims.ptr,
         output_dims.len,
@@ -218,6 +301,8 @@ fn reduce(_: backend.Backend, src: backend.BufferHandle, op: core.PlanInstructio
     const code: c_int = switch (op) {
         .reduce_sum => c.PJRTX_MLX_METAL_REDUCE_SUM,
         .reduce_max => c.PJRTX_MLX_METAL_REDUCE_MAX,
+        .reduce_and => c.PJRTX_MLX_METAL_REDUCE_AND,
+        .reduce_or => c.PJRTX_MLX_METAL_REDUCE_OR,
         else => return error.CommandSubmissionFailed,
     };
     const handle = c.pjrtx_mlx_metal_buffer_reduce(@ptrCast(@alignCast(src)), code, dimensions.ptr, dimensions.len, output_dims.ptr, output_dims.len) orelse return error.CommandSubmissionFailed;
@@ -314,9 +399,9 @@ fn programNodeKind(instruction_kind: core.PlanInstructionKind) backend.ProgramNo
         .copy_arg0 => .parameter,
         .reshape, .transpose, .broadcast_in_dim, .slice => .view,
         .add, .subtract, .multiply, .divide, .maximum, .minimum, .power, .atan2, .remainder, .and_, .or_, .xor, .shift_left, .shift_right_arithmetic, .shift_right_logical, .negate, .exp, .expm1, .tanh, .sqrt, .rsqrt, .abs, .ceil, .floor, .log, .log1p, .logistic, .sine, .cosine, .not_, .sign, .is_finite, .round_nearest_even, .compare, .select, .clamp => .elementwise,
-        .reduce_sum, .reduce_max => .reduction,
+        .reduce_sum, .reduce_max, .reduce_and, .reduce_or => .reduction,
         .dot_general => .matmul,
-        .sort, .gather, .dynamic_slice, .dynamic_update_slice, .pad, .reverse, .concatenate, .iota, .convert, .reduce_precision => .materialize,
+        .sort, .top_k, .gather, .scatter, .dynamic_slice, .dynamic_update_slice, .pad, .reverse, .concatenate, .iota, .convert, .reduce_precision => .materialize,
         else => .library_call,
     };
 }
@@ -402,6 +487,74 @@ fn executeExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
     for (executable.program.nodes) |node| {
         const instruction_index = node.instruction_index;
         const instruction = plan.instructions[instruction_index];
+        if (instruction.kind == .sort and instruction.inputs.len == 2 and instruction.outputs.len == 2) {
+            const dimension = instruction.dimension orelse return null;
+            const direction = instruction.compare_direction orelse .lt;
+            const keys = value_handles[instruction.inputs[0].index] orelse return error.CommandSubmissionFailed;
+            const values = value_handles[instruction.inputs[1].index] orelse return error.CommandSubmissionFailed;
+            const key_output_id = instruction.outputs[0];
+            const value_output_id = instruction.outputs[1];
+            if (key_output_id.index >= plan.values.len or value_output_id.index >= plan.values.len) return error.CommandSubmissionFailed;
+            const key_descriptor = plan.values[key_output_id.index].descriptor;
+            const value_descriptor = plan.values[value_output_id.index].descriptor;
+            const key_dims = instruction.dims orelse key_descriptor.dims;
+            const value_dims = value_descriptor.dims;
+            const sorted_keys = (try sort(backend_impl, keys, dimension, key_dims)) orelse return null;
+            const directed_keys = (try reverseIfDescending(backend_impl, sorted_keys, dimension, key_dims, direction)) orelse return null;
+            errdefer destroyBuffer(backend_impl, directed_keys);
+            const order = (try argsort(backend_impl, keys, dimension, value_descriptor.element_type, value_dims)) orelse return null;
+            const directed_order = (try reverseIfDescending(backend_impl, order, dimension, value_dims, direction)) orelse return null;
+            errdefer destroyBuffer(backend_impl, directed_order);
+            const sorted_values = (try takeAlongAxis(backend_impl, values, directed_order, dimension, value_dims)) orelse return null;
+
+            try storeOwnedValueHandle(backend_impl, value_handles, value_owned, key_output_id, directed_keys);
+            errdefer value_owned[key_output_id.index] = false;
+            try storeOwnedValueHandle(backend_impl, value_handles, value_owned, value_output_id, sorted_values);
+            destroyBuffer(backend_impl, directed_order);
+            releaseDeadInputs(backend_impl, &executable.program, value_handles, value_owned, instruction.inputs, instruction_index);
+            continue;
+        }
+        if (instruction.kind == .top_k and instruction.inputs.len == 1 and instruction.outputs.len == 2) {
+            const input_id = instruction.inputs[0];
+            const input = value_handles[input_id.index] orelse return error.CommandSubmissionFailed;
+            const input_descriptor = plan.values[input_id.index].descriptor;
+            if (input_descriptor.dims.len == 0) return null;
+            const axis: i64 = @intCast(input_descriptor.dims.len - 1);
+            const k = instruction.top_k_k orelse return null;
+            const values_id = instruction.outputs[0];
+            const indices_id = instruction.outputs[1];
+            if (values_id.index >= plan.values.len or indices_id.index >= plan.values.len) return error.CommandSubmissionFailed;
+            const values_descriptor = plan.values[values_id.index].descriptor;
+            const indices_descriptor = plan.values[indices_id.index].descriptor;
+
+            const starts = try allocator.alloc(i64, input_descriptor.dims.len);
+            defer allocator.free(starts);
+            const limits = try allocator.dupe(i64, input_descriptor.dims);
+            defer allocator.free(limits);
+            const strides = try allocator.alloc(i64, input_descriptor.dims.len);
+            defer allocator.free(strides);
+            @memset(starts, 0);
+            @memset(strides, 1);
+            limits[limits.len - 1] = k;
+
+            const sorted_values = (try sort(backend_impl, input, axis, input_descriptor.dims)) orelse return null;
+            const descending_values = (try reverseIfDescending(backend_impl, sorted_values, axis, input_descriptor.dims, .gt)) orelse return null;
+            errdefer destroyBuffer(backend_impl, descending_values);
+            const top_values = (try slice(backend_impl, descending_values, starts, limits, strides, values_descriptor.dims)) orelse return null;
+            destroyBuffer(backend_impl, descending_values);
+
+            const sorted_indices = (try argsort(backend_impl, input, axis, indices_descriptor.element_type, input_descriptor.dims)) orelse return null;
+            const descending_indices = (try reverseIfDescending(backend_impl, sorted_indices, axis, input_descriptor.dims, .gt)) orelse return null;
+            errdefer destroyBuffer(backend_impl, descending_indices);
+            const top_indices = (try slice(backend_impl, descending_indices, starts, limits, strides, indices_descriptor.dims)) orelse return null;
+            destroyBuffer(backend_impl, descending_indices);
+
+            try storeOwnedValueHandle(backend_impl, value_handles, value_owned, values_id, top_values);
+            errdefer value_owned[values_id.index] = false;
+            try storeOwnedValueHandle(backend_impl, value_handles, value_owned, indices_id, top_indices);
+            releaseDeadInputs(backend_impl, &executable.program, value_handles, value_owned, instruction.inputs, instruction_index);
+            continue;
+        }
         if (instruction.outputs.len != 1) return null;
         const output_id = instruction.outputs[0];
         if (output_id.index >= value_handles.len) return error.CommandSubmissionFailed;
@@ -499,30 +652,57 @@ fn executeExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
                 break :blk (try concatenate(backend_impl, lhs, rhs, instruction.dimension orelse return null, output_dims)) orelse return null;
             },
             .gather => blk: {
-                const gather_axis = supportedGatherAxis(instruction) orelse return null;
                 const operand = value_handles[instruction.inputs[0].index] orelse return error.CommandSubmissionFailed;
                 const indices = value_handles[instruction.inputs[1].index] orelse return error.CommandSubmissionFailed;
-                break :blk (try gatherAxis(backend_impl, operand, indices, gather_axis, instruction.index_vector_dim orelse 0, output_dims)) orelse return null;
+                break :blk (try gather(
+                    backend_impl,
+                    operand,
+                    indices,
+                    instruction.start_index_map orelse return null,
+                    instruction.collapsed_slice_dims orelse &.{},
+                    instruction.operand_batching_dims orelse &.{},
+                    instruction.start_indices_batching_dims orelse &.{},
+                    instruction.index_vector_dim orelse 0,
+                    instruction.slice_sizes orelse return null,
+                    instruction.offset_dims orelse &.{},
+                    output_dims,
+                )) orelse return null;
+            },
+            .scatter => blk: {
+                const operand = value_handles[instruction.inputs[0].index] orelse return error.CommandSubmissionFailed;
+                const indices = value_handles[instruction.inputs[1].index] orelse return error.CommandSubmissionFailed;
+                const updates = value_handles[instruction.inputs[2].index] orelse return error.CommandSubmissionFailed;
+                if (supportedScatterAxis(instruction)) |scatter_axis| {
+                    break :blk (try scatterAxis(
+                        backend_impl,
+                        operand,
+                        indices,
+                        updates,
+                        scatter_axis,
+                        instruction.index_vector_dim orelse 0,
+                        instruction.scatter_update_kind orelse .set,
+                        output_dims,
+                    )) orelse return null;
+                }
+                break :blk (try scatter(
+                    backend_impl,
+                    operand,
+                    indices,
+                    updates,
+                    instruction.scatter_dims_to_operand_dims orelse return null,
+                    instruction.inserted_window_dims orelse return null,
+                    instruction.update_window_dims orelse &.{},
+                    instruction.input_batching_dims orelse &.{},
+                    instruction.scatter_indices_batching_dims orelse &.{},
+                    instruction.index_vector_dim orelse 0,
+                    instruction.scatter_update_kind orelse .set,
+                    output_dims,
+                )) orelse return null;
             },
             .sort => blk: {
                 const input = value_handles[instruction.inputs[0].index] orelse return error.CommandSubmissionFailed;
                 const sorted = (try sort(backend_impl, input, instruction.dimension orelse return null, output_dims)) orelse return null;
-                switch (instruction.compare_direction orelse .lt) {
-                    .lt, .le => break :blk sorted,
-                    .gt, .ge => {
-                        const dimensions = [_]i64{instruction.dimension.?};
-                        const reversed = reverse(backend_impl, sorted, &dimensions, output_dims) catch |err| {
-                            destroyBuffer(backend_impl, sorted);
-                            return err;
-                        };
-                        destroyBuffer(backend_impl, sorted);
-                        break :blk reversed orelse return null;
-                    },
-                    else => {
-                        destroyBuffer(backend_impl, sorted);
-                        return null;
-                    },
-                }
+                break :blk (try reverseIfDescending(backend_impl, sorted, instruction.dimension.?, output_dims, instruction.compare_direction orelse .lt)) orelse return null;
             },
             .dot_general => blk: {
                 const lhs = value_handles[instruction.inputs[0].index] orelse return error.CommandSubmissionFailed;
@@ -538,7 +718,7 @@ fn executeExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
                     output_dims,
                 )) orelse return null;
             },
-            .reduce_sum, .reduce_max => blk: {
+            .reduce_sum, .reduce_max, .reduce_and, .reduce_or => blk: {
                 const input = value_handles[instruction.inputs[0].index] orelse return error.CommandSubmissionFailed;
                 break :blk (try reduce(backend_impl, input, instruction.kind, instruction.reduce_dimensions orelse &.{}, output_dims)) orelse return null;
             },
@@ -562,11 +742,7 @@ fn executeExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
             else => return null,
         };
 
-        if (value_owned[output_id.index]) {
-            if (value_handles[output_id.index]) |old| destroyBuffer(backend_impl, old);
-        }
-        value_handles[output_id.index] = next;
-        value_owned[output_id.index] = true;
+        try storeOwnedValueHandle(backend_impl, value_handles, value_owned, output_id, next);
         releaseDeadInputs(backend_impl, &executable.program, value_handles, value_owned, instruction.inputs, instruction_index);
     }
 
@@ -685,10 +861,14 @@ fn executableSupportsInstruction(kind_: core.PlanInstructionKind) bool {
         .reverse,
         .concatenate,
         .gather,
+        .scatter,
         .sort,
+        .top_k,
         .dot_general,
         .reduce_sum,
         .reduce_max,
+        .reduce_and,
+        .reduce_or,
         .compare,
         .select,
         .clamp,
@@ -708,21 +888,23 @@ fn executableLoweringIssue(plan: *const core.ExecutablePlan, device_local_hardwa
             .op = instruction.kind,
             .detail = "operation is not supported by the MLX backend executable",
         };
-        if (instruction.outputs.len != 1) return .{
+        const valid_output_count = instruction.outputs.len == 1 or ((instruction.kind == .sort or instruction.kind == .top_k) and instruction.outputs.len == 2);
+        if (!valid_output_count) return .{
             .instruction_index = instruction_index,
             .op = instruction.kind,
-            .detail = "MLX executable lowering requires exactly one output per instruction",
+            .detail = "MLX executable lowering requires one output per instruction except two-output sort/top_k",
             .feature = "mlx-executable-values",
         };
-        const output_id = instruction.outputs[0];
-        if (output_id.index >= plan.values.len) return .{
-            .instruction_index = instruction_index,
-            .value_id = output_id,
-            .op = instruction.kind,
-            .detail = "instruction output value is outside the executable value table",
-            .feature = "mlx-executable-values",
-        };
-        if (instructionLoweringIssue(plan, instruction, instruction_index, output_id)) |issue| return issue;
+        for (instruction.outputs) |output_id| {
+            if (output_id.index >= plan.values.len) return .{
+                .instruction_index = instruction_index,
+                .value_id = output_id,
+                .op = instruction.kind,
+                .detail = "instruction output value is outside the executable value table",
+                .feature = "mlx-executable-values",
+            };
+        }
+        if (instructionLoweringIssue(plan, instruction, instruction_index, instruction.outputs[0])) |issue| return issue;
     }
     return null;
 }
@@ -800,9 +982,11 @@ fn instructionLoweringIssue(plan: *const core.ExecutablePlan, instruction: core.
             .feature = "mlx-concatenate",
         } else null,
         .gather => validateGatherLowering(plan, instruction, instruction_index, output_id),
+        .scatter => validateScatterLowering(plan, instruction, instruction_index, output_id),
         .sort => validateSortLowering(instruction, instruction_index, output_id),
+        .top_k => validateTopKLowering(plan, instruction, instruction_index, output_id),
         .dot_general => validateDotGeneralLowering(plan, instruction, instruction_index, output_id),
-        .reduce_sum, .reduce_max => validateReduceLowering(plan, instruction, instruction_index, output_id),
+        .reduce_sum, .reduce_max, .reduce_and, .reduce_or => validateReduceLowering(plan, instruction, instruction_index, output_id),
         .compare => validateCompareLowering(plan, instruction, instruction_index, output_id),
         .select => validateSelectLowering(plan, instruction, instruction_index, output_id),
         .clamp => validateClampLowering(plan, instruction, instruction_index, output_id),
@@ -925,15 +1109,6 @@ fn validatePadLowering(plan: *const core.ExecutablePlan, instruction: core.PlanI
         .detail = "pad lowering requires interior padding metadata",
         .feature = "mlx-pad",
     };
-    for (interior) |padding| {
-        if (padding != 0) return .{
-            .instruction_index = instruction_index,
-            .value_id = output_id,
-            .op = instruction.kind,
-            .detail = "pad lowering does not support interior padding yet",
-            .feature = "mlx-pad-interior",
-        };
-    }
     if (instruction.inputs.len < 2) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
@@ -948,8 +1123,22 @@ fn validatePadLowering(plan: *const core.ExecutablePlan, instruction: core.PlanI
         .detail = "pad operand is outside the executable value table",
         .feature = "mlx-executable-values",
     };
+    const padding_descriptor = inputDescriptor(plan, instruction, 1) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = instruction.inputs[1],
+        .op = instruction.kind,
+        .detail = "pad scalar value is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
     const output_descriptor = plan.values[output_id.index].descriptor;
-    if (low.len != input_descriptor.dims.len or high.len != input_descriptor.dims.len or output_descriptor.dims.len != input_descriptor.dims.len) return .{
+    if (padding_descriptor.element_type != input_descriptor.element_type or padding_descriptor.dims.len != 0) return .{
+        .instruction_index = instruction_index,
+        .value_id = instruction.inputs[1],
+        .op = instruction.kind,
+        .detail = "pad lowering requires a scalar padding value with the operand dtype",
+        .feature = "mlx-pad-scalar",
+    };
+    if (low.len != input_descriptor.dims.len or high.len != input_descriptor.dims.len or interior.len != input_descriptor.dims.len or output_descriptor.dims.len != input_descriptor.dims.len) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
         .op = instruction.kind,
@@ -957,11 +1146,19 @@ fn validatePadLowering(plan: *const core.ExecutablePlan, instruction: core.PlanI
         .feature = "mlx-pad",
     };
     for (input_descriptor.dims, 0..) |dim, axis| {
-        if (low[axis] < 0 or high[axis] < 0 or output_descriptor.dims[axis] != dim + low[axis] + high[axis]) return .{
+        if (low[axis] < 0 or high[axis] < 0 or interior[axis] < 0) return .{
             .instruction_index = instruction_index,
             .value_id = output_id,
             .op = instruction.kind,
-            .detail = "pad output shape must equal input plus non-negative edge padding",
+            .detail = "pad lowering requires non-negative edge and interior padding",
+            .feature = "mlx-pad",
+        };
+        const interior_slots = if (dim > 0) (dim - 1) * interior[axis] else 0;
+        if (output_descriptor.dims[axis] != dim + low[axis] + high[axis] + interior_slots) return .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "pad output shape must equal StableHLO edge plus interior padding formula",
             .feature = "mlx-pad",
         };
     }
@@ -984,20 +1181,6 @@ fn validateGatherLowering(plan: *const core.ExecutablePlan, instruction: core.Pl
         .feature = "mlx-executable-values",
     };
     const output = plan.values[output_id.index].descriptor;
-    const axis = supportedGatherAxis(instruction) orelse return .{
-        .instruction_index = instruction_index,
-        .value_id = output_id,
-        .op = instruction.kind,
-        .detail = "gather lowering currently supports one collapsed gathered axis",
-        .feature = "mlx-gather-single-axis",
-    };
-    if (axis < 0 or axis >= @as(i64, @intCast(operand.dims.len))) return .{
-        .instruction_index = instruction_index,
-        .value_id = output_id,
-        .op = instruction.kind,
-        .detail = "gather axis is outside the operand rank",
-        .feature = "mlx-gather-axis",
-    };
     if (operand.element_type != output.element_type or !isSupportedInteger(indices.element_type)) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
@@ -1019,22 +1202,98 @@ fn validateGatherLowering(plan: *const core.ExecutablePlan, instruction: core.Pl
         .detail = "gather slice size rank must match operand rank",
         .feature = "mlx-gather-slice-sizes",
     };
-    for (slice_sizes, operand.dims, 0..) |slice_size, operand_dim, dim_index| {
-        if (dim_index == @as(usize, @intCast(axis))) continue;
-        if (slice_size != operand_dim) return .{
-            .instruction_index = instruction_index,
-            .value_id = output_id,
-            .op = instruction.kind,
-            .detail = "gather lowering supports full slices on non-gathered axes only",
-            .feature = "mlx-gather-slice-shape",
-        };
-    }
-    if (!gatherOutputShapeMatchesTake(operand.dims, indices.dims, instruction.index_vector_dim orelse 0, axis, output.dims)) return .{
+    if (!validGatherShape(
+        operand.dims,
+        indices.dims,
+        instruction.start_index_map orelse &.{},
+        instruction.collapsed_slice_dims orelse &.{},
+        instruction.operand_batching_dims orelse &.{},
+        instruction.start_indices_batching_dims orelse &.{},
+        instruction.index_vector_dim orelse 0,
+        slice_sizes,
+        instruction.offset_dims orelse &.{},
+        output.dims,
+    )) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
         .op = instruction.kind,
-        .detail = "gather output shape must match MLX take semantics for the gathered axis",
-        .feature = "mlx-gather-output-shape",
+        .detail = "gather metadata and output shape must match MLX general gather semantics",
+        .feature = "mlx-gather-general-shape",
+    };
+    return null;
+}
+
+fn validateScatterLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+    const operand = inputDescriptor(plan, instruction, 0) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
+        .op = instruction.kind,
+        .detail = "scatter operand is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const indices = inputDescriptor(plan, instruction, 1) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 1) instruction.inputs[1] else output_id,
+        .op = instruction.kind,
+        .detail = "scatter indices are outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const updates = inputDescriptor(plan, instruction, 2) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = if (instruction.inputs.len > 2) instruction.inputs[2] else output_id,
+        .op = instruction.kind,
+        .detail = "scatter updates are outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    const output = plan.values[output_id.index].descriptor;
+    if (operand.element_type != updates.element_type or operand.element_type != output.element_type or !dimsEqual(operand.dims, output.dims) or !isSupportedInteger(indices.element_type)) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "scatter lowering requires matching operand/update/output dtypes and integer indices",
+        .feature = "mlx-scatter-types",
+    };
+    if (instruction.scatter_update_kind == null) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "scatter combiner must be set or add",
+        .feature = "mlx-scatter-combiner",
+    };
+    if (supportedScatterAxis(instruction)) |axis| {
+        if (axis < 0 or axis >= @as(i64, @intCast(operand.dims.len))) return .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "scatter axis is outside the operand rank",
+            .feature = "mlx-scatter-axis",
+        };
+        if (!scatterUpdateShapeMatchesAxis(operand.dims, indices.dims, updates.dims, instruction.index_vector_dim orelse 0, axis)) return .{
+            .instruction_index = instruction_index,
+            .value_id = output_id,
+            .op = instruction.kind,
+            .detail = "scatter update shape must match MLX scatter semantics for the scattered axis",
+            .feature = "mlx-scatter-update-shape",
+        };
+        return null;
+    }
+    if (!validScatterShape(
+        operand.dims,
+        indices.dims,
+        updates.dims,
+        instruction.scatter_dims_to_operand_dims orelse &.{},
+        instruction.inserted_window_dims orelse &.{},
+        instruction.update_window_dims orelse &.{},
+        instruction.input_batching_dims orelse &.{},
+        instruction.scatter_indices_batching_dims orelse &.{},
+        instruction.index_vector_dim orelse 0,
+        output.dims,
+    )) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "scatter metadata and update shape must match MLX scatter semantics",
+        .feature = "mlx-scatter-shape",
     };
     return null;
 }
@@ -1047,6 +1306,13 @@ fn validateSortLowering(instruction: core.PlanInstruction, instruction_index: us
         .detail = "sort lowering requires a sort dimension",
         .feature = "mlx-sort",
     };
+    if (!(instruction.inputs.len == 1 and instruction.outputs.len == 1) and !(instruction.inputs.len == 2 and instruction.outputs.len == 2)) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "sort lowering supports single-value sort or key/value sort with two operands and two outputs",
+        .feature = "mlx-sort-arity",
+    };
     switch (instruction.compare_direction orelse .lt) {
         .lt, .le, .gt, .ge => return null,
         else => return .{
@@ -1057,6 +1323,38 @@ fn validateSortLowering(instruction: core.PlanInstruction, instruction_index: us
             .feature = "mlx-sort-comparator",
         },
     }
+}
+
+fn validateTopKLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+    if (instruction.inputs.len != 1 or instruction.outputs.len != 2) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "top_k lowering requires one input and values/indices outputs",
+        .feature = "mlx-top-k-arity",
+    };
+    const k = instruction.top_k_k orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "top_k lowering requires static k",
+        .feature = "mlx-top-k",
+    };
+    const input = inputDescriptor(plan, instruction, 0) orelse return .{
+        .instruction_index = instruction_index,
+        .value_id = instruction.inputs[0],
+        .op = instruction.kind,
+        .detail = "top_k input is outside the executable value table",
+        .feature = "mlx-executable-values",
+    };
+    if (input.dims.len == 0 or k < 0 or k > input.dims[input.dims.len - 1]) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "top_k supports static k along the last non-scalar dimension",
+        .feature = "mlx-top-k-shape",
+    };
+    return null;
 }
 
 fn validateDotGeneralLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
@@ -1109,12 +1407,24 @@ fn validateReduceLowering(plan: *const core.ExecutablePlan, instruction: core.Pl
         .feature = "mlx-executable-values",
     };
     const output = plan.values[output_id.index].descriptor;
-    if (input.element_type != .f32 or output.element_type != .f32) return .{
+    const supported_reduce_type = switch (instruction.kind) {
+        .reduce_sum, .reduce_max => input.element_type == .f32 and output.element_type == .f32,
+        .reduce_and, .reduce_or => input.element_type == .pred and output.element_type == .pred,
+        else => false,
+    };
+    if (!supported_reduce_type) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
         .op = instruction.kind,
-        .detail = "reduce lowering currently supports f32 sum/max only",
-        .feature = "mlx-reduce-f32",
+        .detail = "reduce lowering supports f32 sum/max and pred and/or only",
+        .feature = "mlx-reduce-types",
+    };
+    if (!validReduceShape(input.dims, instruction.reduce_dimensions orelse &.{}, output.dims)) return .{
+        .instruction_index = instruction_index,
+        .value_id = output_id,
+        .op = instruction.kind,
+        .detail = "reduce output shape must equal input shape with reduced axes removed",
+        .feature = "mlx-reduce-shape",
     };
     return null;
 }
@@ -1238,6 +1548,29 @@ fn dimsEqual(lhs: []const i64, rhs: []const i64) bool {
     return true;
 }
 
+fn validReduceShape(input_dims: []const i64, dimensions: []const i64, output_dims: []const i64) bool {
+    var reduced = [_]bool{false} ** 64;
+    if (input_dims.len > reduced.len) return false;
+    for (dimensions) |dim_i64| {
+        if (dim_i64 < 0 or dim_i64 >= @as(i64, @intCast(input_dims.len))) return false;
+        const dim: usize = @intCast(dim_i64);
+        if (reduced[dim]) return false;
+        reduced[dim] = true;
+    }
+    var expected_rank: usize = 0;
+    for (0..input_dims.len) |axis| {
+        if (!reduced[axis]) expected_rank += 1;
+    }
+    if (output_dims.len != expected_rank) return false;
+    var out_axis: usize = 0;
+    for (input_dims, 0..) |dim, axis| {
+        if (reduced[axis]) continue;
+        if (output_dims[out_axis] != dim) return false;
+        out_axis += 1;
+    }
+    return true;
+}
+
 fn isSupportedFloat(element_type: core.BufferType) bool {
     return switch (element_type) {
         .f16, .f32, .bf16 => true,
@@ -1329,6 +1662,46 @@ fn startHandles(allocator: std.mem.Allocator, value_handles: []const ?backend.Bu
     return handles;
 }
 
+fn storeOwnedValueHandle(
+    backend_impl: backend.Backend,
+    value_handles: []?backend.BufferHandle,
+    value_owned: []bool,
+    value_id: core.ValueId,
+    handle: backend.BufferHandle,
+) backend.Error!void {
+    if (value_id.index >= value_handles.len) return error.CommandSubmissionFailed;
+    if (value_owned[value_id.index]) {
+        if (value_handles[value_id.index]) |old| destroyBuffer(backend_impl, old);
+    }
+    value_handles[value_id.index] = handle;
+    value_owned[value_id.index] = true;
+}
+
+fn reverseIfDescending(
+    backend_impl: backend.Backend,
+    handle: backend.BufferHandle,
+    dimension: i64,
+    output_dims: []const i64,
+    direction: core.CompareOp,
+) backend.Error!?backend.BufferHandle {
+    return switch (direction) {
+        .lt, .le => handle,
+        .gt, .ge => blk: {
+            const dimensions = [_]i64{dimension};
+            const reversed = reverse(backend_impl, handle, &dimensions, output_dims) catch |err| {
+                destroyBuffer(backend_impl, handle);
+                return err;
+            };
+            destroyBuffer(backend_impl, handle);
+            break :blk reversed;
+        },
+        else => blk: {
+            destroyBuffer(backend_impl, handle);
+            break :blk null;
+        },
+    };
+}
+
 fn supportedGatherAxis(instruction: core.PlanInstruction) ?i64 {
     const start_index_map = instruction.start_index_map orelse return null;
     const slice_sizes = instruction.slice_sizes orelse return null;
@@ -1338,6 +1711,159 @@ fn supportedGatherAxis(instruction: core.PlanInstruction) ?i64 {
     if (axis < 0 or collapsed_slice_dims[0] != axis) return null;
     if (slice_sizes.len == 0 or axis >= @as(i64, @intCast(slice_sizes.len)) or slice_sizes[@intCast(axis)] != 1) return null;
     return axis;
+}
+
+fn gatherHasExplicitIndexVector(indices_dims: []const i64, start_axis_count: usize, index_vector_dim: i64) bool {
+    if (index_vector_dim < 0 or index_vector_dim >= @as(i64, @intCast(indices_dims.len))) return false;
+    return indices_dims[@intCast(index_vector_dim)] == @as(i64, @intCast(start_axis_count));
+}
+
+fn markUniqueAxis(seen: []bool, axis: i64) bool {
+    if (axis < 0 or axis >= @as(i64, @intCast(seen.len))) return false;
+    const index: usize = @intCast(axis);
+    if (seen[index]) return false;
+    seen[index] = true;
+    return true;
+}
+
+fn validGatherShape(operand_dims: []const i64, indices_dims: []const i64, start_index_map: []const i64, collapsed_slice_dims: []const i64, operand_batching_dims: []const i64, start_indices_batching_dims: []const i64, index_vector_dim: i64, slice_sizes: []const i64, offset_dims: []const i64, output_dims: []const i64) bool {
+    if (operand_dims.len > 64 or output_dims.len > 64 or start_index_map.len == 0 or slice_sizes.len != operand_dims.len) return false;
+    if (start_index_map.len > 1 and !gatherHasExplicitIndexVector(indices_dims, start_index_map.len, index_vector_dim)) return false;
+    if (operand_batching_dims.len != start_indices_batching_dims.len) return false;
+
+    var gathered = [_]bool{false} ** 64;
+    for (start_index_map) |axis| {
+        if (!markUniqueAxis(gathered[0..operand_dims.len], axis)) return false;
+    }
+    for (operand_batching_dims, start_indices_batching_dims) |operand_axis, indices_axis| {
+        if (!markUniqueAxis(gathered[0..operand_dims.len], operand_axis)) return false;
+        if (indices_axis < 0 or indices_axis >= @as(i64, @intCast(indices_dims.len)) or indices_axis == index_vector_dim) return false;
+        if (operand_dims[@intCast(operand_axis)] != indices_dims[@intCast(indices_axis)]) return false;
+        if (slice_sizes[@intCast(operand_axis)] != 1) return false;
+    }
+
+    var collapsed = [_]bool{false} ** 64;
+    for (collapsed_slice_dims) |axis| {
+        if (!markUniqueAxis(collapsed[0..operand_dims.len], axis)) return false;
+        if (slice_sizes[@intCast(axis)] != 1) return false;
+    }
+    for (operand_batching_dims) |axis| {
+        if (!markUniqueAxis(collapsed[0..operand_dims.len], axis)) return false;
+    }
+
+    var non_collapsed_slice_rank: usize = 0;
+    for (operand_dims, 0..) |dim, axis| {
+        if (dim < 0 or slice_sizes[axis] < 0 or slice_sizes[axis] > dim) return false;
+        if (!collapsed[axis]) non_collapsed_slice_rank += 1;
+    }
+    if (offset_dims.len != non_collapsed_slice_rank) return false;
+
+    const explicit_vector = gatherHasExplicitIndexVector(indices_dims, start_index_map.len, index_vector_dim);
+    const index_prefix_rank = indices_dims.len - @as(usize, if (explicit_vector) 1 else 0);
+    if (output_dims.len != index_prefix_rank + non_collapsed_slice_rank) return false;
+
+    var output_is_offset = [_]bool{false} ** 64;
+    for (offset_dims) |axis| {
+        if (!markUniqueAxis(output_is_offset[0..output_dims.len], axis)) return false;
+    }
+
+    var index_axis: usize = 0;
+    var slice_axis: usize = 0;
+    for (output_dims, 0..) |output_dim, output_axis| {
+        if (output_is_offset[output_axis]) {
+            while (slice_axis < operand_dims.len and collapsed[slice_axis]) slice_axis += 1;
+            if (slice_axis >= slice_sizes.len or output_dim != slice_sizes[slice_axis]) return false;
+            slice_axis += 1;
+        } else {
+            while (explicit_vector and index_axis == @as(usize, @intCast(index_vector_dim))) index_axis += 1;
+            if (index_axis >= indices_dims.len or output_dim != indices_dims[index_axis]) return false;
+            index_axis += 1;
+        }
+    }
+    return true;
+}
+
+fn supportedScatterAxis(instruction: core.PlanInstruction) ?i64 {
+    const scatter_dims_to_operand_dims = instruction.scatter_dims_to_operand_dims orelse return null;
+    const inserted_window_dims = instruction.inserted_window_dims orelse return null;
+    const input_batching_dims = instruction.input_batching_dims orelse &.{};
+    const scatter_indices_batching_dims = instruction.scatter_indices_batching_dims orelse &.{};
+    if (scatter_dims_to_operand_dims.len != 1 or inserted_window_dims.len != 1) return null;
+    if (input_batching_dims.len != 0 or scatter_indices_batching_dims.len != 0) return null;
+    const axis = scatter_dims_to_operand_dims[0];
+    if (axis < 0 or inserted_window_dims[0] != axis) return null;
+    return axis;
+}
+
+fn validScatterShape(operand_dims: []const i64, indices_dims: []const i64, update_dims: []const i64, scatter_dims_to_operand_dims: []const i64, inserted_window_dims: []const i64, update_window_dims: []const i64, input_batching_dims: []const i64, scatter_indices_batching_dims: []const i64, index_vector_dim: i64, output_dims: []const i64) bool {
+    if (operand_dims.len > 64 or !dimsEqual(operand_dims, output_dims)) return false;
+    if (scatter_dims_to_operand_dims.len == 0 or inserted_window_dims.len + update_window_dims.len + input_batching_dims.len != operand_dims.len or input_batching_dims.len != scatter_indices_batching_dims.len) return false;
+    const explicit_vector = gatherHasExplicitIndexVector(indices_dims, scatter_dims_to_operand_dims.len, index_vector_dim);
+    if (scatter_dims_to_operand_dims.len > 1 and !explicit_vector) return false;
+
+    var scatter_axes = [_]bool{false} ** 64;
+    for (scatter_dims_to_operand_dims) |axis| {
+        if (!markUniqueAxis(scatter_axes[0..operand_dims.len], axis)) return false;
+    }
+    for (input_batching_dims, scatter_indices_batching_dims) |operand_axis, indices_axis| {
+        if (!markUniqueAxis(scatter_axes[0..operand_dims.len], operand_axis)) return false;
+        if (indices_axis < 0 or indices_axis >= @as(i64, @intCast(indices_dims.len)) or indices_axis == index_vector_dim) return false;
+        if (operand_dims[@intCast(operand_axis)] != indices_dims[@intCast(indices_axis)]) return false;
+    }
+
+    var window_axes = [_]bool{false} ** 64;
+    for (inserted_window_dims) |axis| {
+        if (!markUniqueAxis(window_axes[0..operand_dims.len], axis)) return false;
+    }
+    for (update_window_dims) |axis| {
+        if (!markUniqueAxis(window_axes[0..operand_dims.len], axis)) return false;
+    }
+    for (input_batching_dims) |axis| {
+        if (axis < 0 or axis >= @as(i64, @intCast(operand_dims.len)) or window_axes[@intCast(axis)]) return false;
+    }
+
+    const index_prefix_rank = indices_dims.len - @as(usize, if (explicit_vector) 1 else 0);
+    if (update_dims.len != index_prefix_rank + update_window_dims.len) return false;
+    var update_axis: usize = 0;
+    for (indices_dims, 0..) |dim, axis| {
+        if (explicit_vector and axis == @as(usize, @intCast(index_vector_dim))) continue;
+        if (update_axis >= update_dims.len or update_dims[update_axis] != dim) return false;
+        update_axis += 1;
+    }
+    if (update_axis != index_prefix_rank) return false;
+    for (update_window_dims, 0..) |operand_axis, window_axis| {
+        if (operand_axis < 0 or operand_axis >= @as(i64, @intCast(operand_dims.len))) return false;
+        const dim = update_dims[index_prefix_rank + window_axis];
+        if (dim < 0 or dim > operand_dims[@intCast(operand_axis)]) return false;
+    }
+    return true;
+}
+
+fn scatterUpdateShapeMatchesAxis(operand_dims: []const i64, indices_dims: []const i64, update_dims: []const i64, index_vector_dim: i64, axis: i64) bool {
+    if (axis < 0 or axis >= @as(i64, @intCast(operand_dims.len))) return false;
+    var expected_rank: usize = operand_dims.len - 1;
+    for (indices_dims, 0..) |dim, dim_index| {
+        if (index_vector_dim >= 0 and dim_index == @as(usize, @intCast(index_vector_dim)) and dim == 1) continue;
+        expected_rank += 1;
+    }
+    if (update_dims.len != expected_rank) return false;
+
+    var update_index: usize = 0;
+    for (operand_dims[0..@intCast(axis)]) |dim| {
+        if (update_dims[update_index] != dim) return false;
+        update_index += 1;
+    }
+    for (indices_dims, 0..) |dim, dim_index| {
+        if (index_vector_dim >= 0 and dim_index == @as(usize, @intCast(index_vector_dim)) and dim == 1) continue;
+        if (update_dims[update_index] != dim) return false;
+        update_index += 1;
+    }
+    const axis_index: usize = @intCast(axis);
+    for (operand_dims[axis_index + 1 ..]) |dim| {
+        if (update_dims[update_index] != dim) return false;
+        update_index += 1;
+    }
+    return update_index == update_dims.len;
 }
 
 fn gatherOutputShapeMatchesTake(operand_dims: []const i64, indices_dims: []const i64, index_vector_dim: i64, axis: i64, output_dims: []const i64) bool {
@@ -1484,6 +2010,13 @@ fn mlxCompareOpCode(op: core.CompareOp) c_int {
     };
 }
 
+fn mlxScatterUpdateCode(update_kind: core.ScatterUpdateKind) c_int {
+    return switch (update_kind) {
+        .set => c.PJRTX_MLX_METAL_SCATTER_SET,
+        .add => c.PJRTX_MLX_METAL_SCATTER_ADD,
+    };
+}
+
 const vtable: backend.Backend.VTable = .{
     .kind = kind,
     .capabilities = capabilities,
@@ -1504,8 +2037,13 @@ const vtable: backend.Backend.VTable = .{
     .pad = pad,
     .reverse = reverse,
     .concatenate = concatenate,
+    .gather = gather,
     .gatherAxis = gatherAxis,
+    .scatter = scatter,
+    .scatterAxis = scatterAxis,
     .sort = sort,
+    .argsort = argsort,
+    .takeAlongAxis = takeAlongAxis,
     .dotGeneral = dotGeneral,
     .reduce = reduce,
     .compare = compare,
@@ -1913,5 +2451,5 @@ test "mlx metal backend executable rejects unsupported gather form during loweri
     try b.writeExecutableLoweringDiagnostic(&plan, &assignment, &diagnostics.writer);
     const message = diagnostics.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, message, "op=gather") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "feature=mlx-gather-single-axis") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "feature=mlx-gather-general-shape") != null);
 }

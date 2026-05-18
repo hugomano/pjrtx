@@ -59,7 +59,10 @@ def main() -> int:
     def llama_like(x, norm_w, wq, wk, wv, wo, w1, w2, w3):
         eps = jnp.array(1.0e-5, dtype=jnp.float32)
         scale = jnp.array(0.5, dtype=jnp.float32)
-        denom = jnp.sum(x * x, axis=-1, keepdims=True) * jnp.array(0.25, dtype=jnp.float32) + eps
+        denom = (
+            jnp.sum(x * x, axis=-1, keepdims=True) * jnp.array(0.25, dtype=jnp.float32)
+            + eps
+        )
         h = x * jax.lax.rsqrt(denom) * norm_w
 
         q = h @ wq
@@ -77,7 +80,9 @@ def main() -> int:
 
     rng = np.random.default_rng(7)
     x = rng.normal(size=(2, 4)).astype(np.float32) * np.float32(0.2)
-    norm_w = rng.normal(size=(4,)).astype(np.float32) * np.float32(0.1) + np.float32(1.0)
+    norm_w = rng.normal(size=(4,)).astype(np.float32) * np.float32(0.1) + np.float32(
+        1.0
+    )
     wq = rng.normal(size=(4, 4)).astype(np.float32) * np.float32(0.1)
     wk = rng.normal(size=(4, 4)).astype(np.float32) * np.float32(0.1)
     wv = rng.normal(size=(4, 4)).astype(np.float32) * np.float32(0.1)

@@ -1,5 +1,7 @@
 #include "src/backend/mlx_metal/api.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -318,6 +320,278 @@ bool axis_in_dimensions(int64_t axis, const std::vector<int64_t>& dimensions) {
     }
   }
   return false;
+}
+
+bool gather_index_vector_is_explicit(const std::vector<int64_t>& indices_dims,
+                                     size_t num_start_axes,
+                                     int64_t index_vector_dim) {
+  if (index_vector_dim < 0 ||
+      static_cast<size_t>(index_vector_dim) >= indices_dims.size()) {
+    return false;
+  }
+  return indices_dims[static_cast<size_t>(index_vector_dim)] ==
+         static_cast<int64_t>(num_start_axes);
+}
+
+bool gather_metadata_is_valid(const std::vector<int64_t>& operand_dims,
+                              const std::vector<int64_t>& indices_dims,
+                              const std::vector<int64_t>& start_index_map,
+                              const std::vector<int64_t>& collapsed_slice_dims,
+                              const std::vector<int64_t>& operand_batching_dims,
+                              const std::vector<int64_t>& start_indices_batching_dims,
+                              int64_t index_vector_dim,
+                              const std::vector<int64_t>& slice_sizes,
+                              const std::vector<int64_t>& offset_dims,
+                              const std::vector<int64_t>& output_dims) {
+  if (start_index_map.empty() || slice_sizes.size() != operand_dims.size()) {
+    return false;
+  }
+  if (start_index_map.size() > 1 &&
+      !gather_index_vector_is_explicit(
+          indices_dims, start_index_map.size(), index_vector_dim)) {
+    return false;
+  }
+  if (operand_batching_dims.size() != start_indices_batching_dims.size()) {
+    return false;
+  }
+
+  std::vector<bool> gathered_axes(operand_dims.size(), false);
+  for (int64_t axis : start_index_map) {
+    if (axis < 0 || static_cast<size_t>(axis) >= operand_dims.size() ||
+        gathered_axes[static_cast<size_t>(axis)]) {
+      return false;
+    }
+    gathered_axes[static_cast<size_t>(axis)] = true;
+  }
+  for (size_t i = 0; i < operand_batching_dims.size(); ++i) {
+    const int64_t operand_axis = operand_batching_dims[i];
+    const int64_t indices_axis = start_indices_batching_dims[i];
+    if (operand_axis < 0 || static_cast<size_t>(operand_axis) >= operand_dims.size() ||
+        indices_axis < 0 || static_cast<size_t>(indices_axis) >= indices_dims.size() ||
+        indices_axis == index_vector_dim ||
+        gathered_axes[static_cast<size_t>(operand_axis)] ||
+        operand_dims[static_cast<size_t>(operand_axis)] !=
+            indices_dims[static_cast<size_t>(indices_axis)] ||
+        slice_sizes[static_cast<size_t>(operand_axis)] != 1) {
+      return false;
+    }
+    gathered_axes[static_cast<size_t>(operand_axis)] = true;
+  }
+
+  std::vector<bool> collapsed_axes(operand_dims.size(), false);
+  for (int64_t axis : collapsed_slice_dims) {
+    if (axis < 0 || static_cast<size_t>(axis) >= operand_dims.size() ||
+        collapsed_axes[static_cast<size_t>(axis)] ||
+        slice_sizes[static_cast<size_t>(axis)] != 1) {
+      return false;
+    }
+    collapsed_axes[static_cast<size_t>(axis)] = true;
+  }
+  for (int64_t axis : operand_batching_dims) {
+    if (axis < 0 || static_cast<size_t>(axis) >= operand_dims.size() ||
+        collapsed_axes[static_cast<size_t>(axis)]) {
+      return false;
+    }
+    collapsed_axes[static_cast<size_t>(axis)] = true;
+  }
+
+  size_t non_collapsed_slice_rank = 0;
+  for (size_t axis = 0; axis < operand_dims.size(); ++axis) {
+    if (operand_dims[axis] < 0 || slice_sizes[axis] < 0 ||
+        slice_sizes[axis] > operand_dims[axis]) {
+      return false;
+    }
+    if (!collapsed_axes[axis]) {
+      non_collapsed_slice_rank += 1;
+    }
+  }
+  if (offset_dims.size() != non_collapsed_slice_rank) {
+    return false;
+  }
+
+  const bool explicit_vector = gather_index_vector_is_explicit(
+      indices_dims, start_index_map.size(), index_vector_dim);
+  const size_t index_prefix_rank =
+      indices_dims.size() - (explicit_vector ? 1 : 0);
+  if (output_dims.size() != index_prefix_rank + non_collapsed_slice_rank) {
+    return false;
+  }
+
+  std::vector<bool> output_is_offset(output_dims.size(), false);
+  for (int64_t dim : offset_dims) {
+    if (dim < 0 || static_cast<size_t>(dim) >= output_dims.size() ||
+        output_is_offset[static_cast<size_t>(dim)]) {
+      return false;
+    }
+    output_is_offset[static_cast<size_t>(dim)] = true;
+  }
+
+  size_t index_axis = 0;
+  size_t slice_axis = 0;
+  for (size_t output_axis = 0; output_axis < output_dims.size(); ++output_axis) {
+    if (output_is_offset[output_axis]) {
+      while (slice_axis < operand_dims.size() && collapsed_axes[slice_axis]) {
+        slice_axis += 1;
+      }
+      if (slice_axis >= slice_sizes.size() ||
+          output_dims[output_axis] != slice_sizes[slice_axis]) {
+        return false;
+      }
+      slice_axis += 1;
+    } else {
+      while (explicit_vector && index_axis == static_cast<size_t>(index_vector_dim)) {
+        index_axis += 1;
+      }
+      if (index_axis >= indices_dims.size() ||
+          output_dims[output_axis] != indices_dims[index_axis]) {
+        return false;
+      }
+      index_axis += 1;
+    }
+  }
+  return true;
+}
+
+std::vector<int64_t> gather_index_prefix_dims(const std::vector<int64_t>& indices_dims,
+                                              bool explicit_vector,
+                                              int64_t index_vector_dim) {
+  std::vector<int64_t> prefix;
+  prefix.reserve(indices_dims.size());
+  for (size_t axis = 0; axis < indices_dims.size(); ++axis) {
+    if (explicit_vector && axis == static_cast<size_t>(index_vector_dim)) {
+      continue;
+    }
+    prefix.push_back(indices_dims[axis]);
+  }
+  return prefix;
+}
+
+mlx::core::array gather_batch_index_array(
+    const std::vector<int64_t>& indices_dims,
+    const std::vector<int64_t>& index_prefix_dims, int64_t start_indices_axis,
+    bool explicit_vector, int64_t index_vector_dim, int dtype,
+    const mlx::core::Device& device) {
+  const size_t prefix_axis = static_cast<size_t>(
+      start_indices_axis - (explicit_vector && start_indices_axis > index_vector_dim ? 1 : 0));
+  const mlx::core::Dtype* mlx_dtype = mlx_dtype_from_code(dtype);
+  auto base = mlx::core::arange(
+      0.0, static_cast<double>(indices_dims[static_cast<size_t>(start_indices_axis)]),
+      1.0, *mlx_dtype, device);
+  mlx::core::Shape reshape_dims(index_prefix_dims.size(), 1);
+  reshape_dims[prefix_axis] =
+      static_cast<mlx::core::ShapeElem>(index_prefix_dims[prefix_axis]);
+  auto shaped = mlx::core::reshape(base, std::move(reshape_dims), device);
+  return mlx::core::broadcast_to(shaped, mlx_shape(index_prefix_dims), device);
+}
+
+bool scatter_index_vector_is_explicit(const std::vector<int64_t>& indices_dims,
+                                      size_t num_scatter_axes,
+                                      int64_t index_vector_dim) {
+  if (index_vector_dim < 0 ||
+      static_cast<size_t>(index_vector_dim) >= indices_dims.size()) {
+    return false;
+  }
+  return indices_dims[static_cast<size_t>(index_vector_dim)] ==
+         static_cast<int64_t>(num_scatter_axes);
+}
+
+bool scatter_metadata_is_valid(
+    const std::vector<int64_t>& operand_dims,
+    const std::vector<int64_t>& indices_dims,
+    const std::vector<int64_t>& update_dims,
+    const std::vector<int64_t>& scatter_dims_to_operand_dims,
+    const std::vector<int64_t>& inserted_window_dims,
+    const std::vector<int64_t>& update_window_dims,
+    const std::vector<int64_t>& input_batching_dims,
+    const std::vector<int64_t>& scatter_indices_batching_dims,
+    int64_t index_vector_dim,
+    const std::vector<int64_t>& output_dims) {
+  if (operand_dims.empty() || operand_dims != output_dims ||
+      scatter_dims_to_operand_dims.empty() ||
+      inserted_window_dims.size() + update_window_dims.size() +
+              input_batching_dims.size() !=
+          operand_dims.size() ||
+      input_batching_dims.size() != scatter_indices_batching_dims.size()) {
+    return false;
+  }
+  const bool explicit_vector = scatter_index_vector_is_explicit(
+      indices_dims, scatter_dims_to_operand_dims.size(), index_vector_dim);
+  if (scatter_dims_to_operand_dims.size() > 1 && !explicit_vector) {
+    return false;
+  }
+
+  std::vector<bool> axes(operand_dims.size(), false);
+  for (int64_t axis : scatter_dims_to_operand_dims) {
+    if (axis < 0 || static_cast<size_t>(axis) >= operand_dims.size() ||
+        axes[static_cast<size_t>(axis)]) {
+      return false;
+    }
+    axes[static_cast<size_t>(axis)] = true;
+  }
+  for (size_t i = 0; i < input_batching_dims.size(); ++i) {
+    const int64_t operand_axis = input_batching_dims[i];
+    const int64_t indices_axis = scatter_indices_batching_dims[i];
+    if (operand_axis < 0 || static_cast<size_t>(operand_axis) >= operand_dims.size() ||
+        indices_axis < 0 || static_cast<size_t>(indices_axis) >= indices_dims.size() ||
+        indices_axis == index_vector_dim ||
+        axes[static_cast<size_t>(operand_axis)] ||
+        operand_dims[static_cast<size_t>(operand_axis)] !=
+            indices_dims[static_cast<size_t>(indices_axis)]) {
+      return false;
+    }
+    axes[static_cast<size_t>(operand_axis)] = true;
+  }
+  std::vector<bool> inserted(operand_dims.size(), false);
+  for (int64_t axis : inserted_window_dims) {
+    if (axis < 0 || static_cast<size_t>(axis) >= operand_dims.size() ||
+        inserted[static_cast<size_t>(axis)]) {
+      return false;
+    }
+    inserted[static_cast<size_t>(axis)] = true;
+  }
+  std::vector<bool> update_window(operand_dims.size(), false);
+  for (int64_t axis : update_window_dims) {
+    if (axis < 0 || static_cast<size_t>(axis) >= operand_dims.size() ||
+        inserted[static_cast<size_t>(axis)] ||
+        update_window[static_cast<size_t>(axis)]) {
+      return false;
+    }
+    update_window[static_cast<size_t>(axis)] = true;
+  }
+  for (int64_t axis : input_batching_dims) {
+    if (axis < 0 || static_cast<size_t>(axis) >= operand_dims.size() ||
+        inserted[static_cast<size_t>(axis)] ||
+        update_window[static_cast<size_t>(axis)]) {
+      return false;
+    }
+  }
+
+  const size_t index_prefix_rank =
+      indices_dims.size() - (explicit_vector ? 1 : 0);
+  if (update_dims.size() != index_prefix_rank + update_window_dims.size()) {
+    return false;
+  }
+  size_t index_axis = 0;
+  for (size_t axis = 0; axis < indices_dims.size(); ++axis) {
+    if (explicit_vector && axis == static_cast<size_t>(index_vector_dim)) {
+      continue;
+    }
+    if (index_axis >= update_dims.size() || update_dims[index_axis] != indices_dims[axis]) {
+      return false;
+    }
+    index_axis += 1;
+  }
+  if (index_axis != index_prefix_rank) {
+    return false;
+  }
+  for (size_t window_axis = 0; window_axis < update_window_dims.size(); ++window_axis) {
+    const int64_t operand_axis = update_window_dims[window_axis];
+    const size_t update_axis = index_prefix_rank + window_axis;
+    if (update_dims[update_axis] > operand_dims[static_cast<size_t>(operand_axis)]) {
+      return false;
+    }
+  }
+  return true;
 }
 
 std::unique_ptr<mlx::core::array> make_start_array(
@@ -1121,10 +1395,20 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_pad(
   }
   std::vector<int64_t> low(edge_padding_low, edge_padding_low + rank);
   std::vector<int64_t> high(edge_padding_high, edge_padding_high + rank);
+  std::vector<int64_t> interior(interior_padding, interior_padding + rank);
   std::vector<int64_t> out_dims(output_dims, output_dims + output_rank);
+  bool has_interior_padding = false;
   for (uint64_t axis = 0; axis < rank; ++axis) {
-    if (low[axis] < 0 || high[axis] < 0 || interior_padding[axis] != 0 ||
-        out_dims[axis] != src->dims[axis] + low[axis] + high[axis]) {
+    if (low[axis] < 0 || high[axis] < 0 || interior[axis] < 0) {
+      return nullptr;
+    }
+    if (interior[axis] != 0) {
+      has_interior_padding = true;
+    }
+    const int64_t interior_slots =
+        src->dims[axis] > 0 ? (src->dims[axis] - 1) * interior[axis] : 0;
+    if (out_dims[axis] !=
+        src->dims[axis] + low[axis] + high[axis] + interior_slots) {
       return nullptr;
     }
   }
@@ -1140,9 +1424,30 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_pad(
   }
 
   try {
-    auto out = mlx::core::pad(*src->array, all_axes(rank), mlx_shape(low),
-                              mlx_shape(high), *padding_value->array,
-                              "constant", device);
+    mlx::core::array out =
+        has_interior_padding
+            ? mlx::core::full(mlx_shape(out_dims), *padding_value->array, device)
+            : mlx::core::pad(*src->array, all_axes(rank), mlx_shape(low),
+                             mlx_shape(high), *padding_value->array,
+                             "constant", device);
+    if (has_interior_padding) {
+      mlx::core::Shape start;
+      mlx::core::Shape stop;
+      mlx::core::Shape strides;
+      start.reserve(rank);
+      stop.reserve(rank);
+      strides.reserve(rank);
+      for (uint64_t axis = 0; axis < rank; ++axis) {
+        const int64_t stride = interior[axis] + 1;
+        start.push_back(static_cast<mlx::core::ShapeElem>(low[axis]));
+        stop.push_back(static_cast<mlx::core::ShapeElem>(
+            low[axis] + src->dims[axis] * stride));
+        strides.push_back(static_cast<mlx::core::ShapeElem>(stride));
+      }
+      out = mlx::core::slice_update(out, *src->array, std::move(start),
+                                    std::move(stop), std::move(strides),
+                                    device);
+    }
     auto array = std::make_unique<mlx::core::array>(std::move(out));
     return new PjrtxMlxMetalBuffer(std::move(array), byte_size, src->dtype,
                                    std::move(out_dims), src->device_ordinal);
@@ -1299,6 +1604,393 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_gather_axis(
   }
 }
 
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_gather(
+    PjrtxMlxMetalBuffer* operand, PjrtxMlxMetalBuffer* indices,
+    const int64_t* start_index_map, uint64_t num_start_axes,
+    const int64_t* collapsed_slice_dims, uint64_t num_collapsed_slice_dims,
+    const int64_t* operand_batching_dims, uint64_t num_operand_batching_dims,
+    const int64_t* start_indices_batching_dims,
+    uint64_t num_start_indices_batching_dims,
+    int64_t index_vector_dim, const int64_t* slice_sizes, uint64_t slice_rank,
+    const int64_t* offset_dims, uint64_t num_offset_dims,
+    const int64_t* output_dims, uint64_t output_rank) {
+  if (operand == nullptr || indices == nullptr || slice_sizes == nullptr ||
+      output_dims == nullptr || operand->byte_size == 0 ||
+      indices->byte_size == 0 ||
+      operand->device_ordinal != indices->device_ordinal ||
+      (num_start_axes > 0 && start_index_map == nullptr) ||
+      (num_collapsed_slice_dims > 0 && collapsed_slice_dims == nullptr) ||
+      (num_operand_batching_dims > 0 && operand_batching_dims == nullptr) ||
+      (num_start_indices_batching_dims > 0 &&
+       start_indices_batching_dims == nullptr) ||
+      (num_offset_dims > 0 && offset_dims == nullptr)) {
+    return nullptr;
+  }
+
+  std::vector<int64_t> axes_i64;
+  axes_i64.assign(start_index_map, start_index_map + num_start_axes);
+  std::vector<int64_t> collapsed;
+  if (num_collapsed_slice_dims > 0) {
+    collapsed.assign(collapsed_slice_dims,
+                     collapsed_slice_dims + num_collapsed_slice_dims);
+  }
+  std::vector<int64_t> operand_batching;
+  if (num_operand_batching_dims > 0) {
+    operand_batching.assign(operand_batching_dims,
+                            operand_batching_dims + num_operand_batching_dims);
+  }
+  std::vector<int64_t> start_indices_batching;
+  if (num_start_indices_batching_dims > 0) {
+    start_indices_batching.assign(
+        start_indices_batching_dims,
+        start_indices_batching_dims + num_start_indices_batching_dims);
+  }
+  std::vector<int64_t> slices(slice_sizes, slice_sizes + slice_rank);
+  std::vector<int64_t> offsets;
+  if (num_offset_dims > 0) {
+    offsets.assign(offset_dims, offset_dims + num_offset_dims);
+  }
+  std::vector<int64_t> out_dims(output_dims, output_dims + output_rank);
+  const uint64_t byte_size = byte_size_for_shape(operand->dtype, out_dims);
+  if (byte_size == 0 ||
+      !gather_metadata_is_valid(operand->dims, indices->dims, axes_i64,
+                                collapsed, operand_batching,
+                                start_indices_batching, index_vector_dim,
+                                slices, offsets, out_dims)) {
+    return nullptr;
+  }
+
+  const mlx::core::Device device(mlx::core::Device::gpu, operand->device_ordinal);
+  if (!mlx::core::is_available(device) || operand->array == nullptr ||
+      indices->array == nullptr) {
+    return nullptr;
+  }
+  if (!operand_batching.empty() && mlx_dtype_from_code(indices->dtype) == nullptr) {
+    return nullptr;
+  }
+
+  try {
+    const bool explicit_vector = gather_index_vector_is_explicit(
+        indices->dims, axes_i64.size(), index_vector_dim);
+    const std::vector<int64_t> index_prefix_dims =
+        gather_index_prefix_dims(indices->dims, explicit_vector, index_vector_dim);
+    std::vector<mlx::core::array> index_arrays;
+    index_arrays.reserve(axes_i64.size() + operand_batching.size());
+    if (axes_i64.size() == 1) {
+      mlx::core::array index_array = *indices->array;
+      if (explicit_vector) {
+        std::vector<int64_t> reshaped_dims = indices->dims;
+        reshaped_dims.erase(reshaped_dims.begin() +
+                            static_cast<size_t>(index_vector_dim));
+        index_array = mlx::core::reshape(index_array, mlx_shape(reshaped_dims),
+                                         device);
+      }
+      index_arrays.push_back(std::move(index_array));
+    } else {
+      for (size_t index = 0; index < axes_i64.size(); ++index) {
+        std::vector<int64_t> start(indices->dims.size(), 0);
+        std::vector<int64_t> stop = indices->dims;
+        std::vector<int64_t> strides(indices->dims.size(), 1);
+        start[static_cast<size_t>(index_vector_dim)] =
+            static_cast<int64_t>(index);
+        stop[static_cast<size_t>(index_vector_dim)] =
+            static_cast<int64_t>(index + 1);
+        auto part = mlx::core::slice(*indices->array, mlx_shape(start),
+                                     mlx_shape(stop), mlx_shape(strides),
+                                     device);
+        part = mlx::core::squeeze(part, static_cast<int>(index_vector_dim),
+                                  device);
+        index_arrays.push_back(std::move(part));
+      }
+    }
+    for (size_t i = 0; i < operand_batching.size(); ++i) {
+      index_arrays.push_back(gather_batch_index_array(
+          indices->dims, index_prefix_dims, start_indices_batching[i],
+          explicit_vector, index_vector_dim, indices->dtype, device));
+    }
+
+    std::vector<int> axes;
+    axes.reserve(axes_i64.size() + operand_batching.size());
+    for (int64_t axis : axes_i64) {
+      axes.push_back(static_cast<int>(axis));
+    }
+    for (int64_t axis : operand_batching) {
+      axes.push_back(static_cast<int>(axis));
+    }
+    auto out = mlx::core::gather(*operand->array, std::move(index_arrays),
+                                 std::move(axes), mlx_shape(slices), device);
+
+    const size_t index_prefix_rank = index_prefix_dims.size();
+    std::vector<int> squeeze_axes;
+    squeeze_axes.reserve(collapsed.size() + operand_batching.size());
+    for (int64_t dim : collapsed) {
+      squeeze_axes.push_back(
+          static_cast<int>(index_prefix_rank + static_cast<size_t>(dim)));
+    }
+    for (int64_t dim : operand_batching) {
+      squeeze_axes.push_back(
+          static_cast<int>(index_prefix_rank + static_cast<size_t>(dim)));
+    }
+    if (!squeeze_axes.empty()) {
+      std::sort(squeeze_axes.begin(), squeeze_axes.end());
+      out = mlx::core::squeeze(out, squeeze_axes, device);
+    }
+
+    std::vector<bool> output_is_offset(out_dims.size(), false);
+    for (int64_t dim : offsets) {
+      output_is_offset[static_cast<size_t>(dim)] = true;
+    }
+    std::vector<int> transpose_axes(out_dims.size(), 0);
+    size_t next_index_axis = 0;
+    size_t next_slice_axis = 0;
+    for (size_t output_axis = 0; output_axis < out_dims.size(); ++output_axis) {
+      if (output_is_offset[output_axis]) {
+        transpose_axes[output_axis] =
+            static_cast<int>(index_prefix_rank + next_slice_axis);
+        next_slice_axis += 1;
+      } else {
+        transpose_axes[output_axis] = static_cast<int>(next_index_axis);
+        next_index_axis += 1;
+      }
+    }
+    bool identity = true;
+    for (size_t axis = 0; axis < transpose_axes.size(); ++axis) {
+      if (transpose_axes[axis] != static_cast<int>(axis)) {
+        identity = false;
+        break;
+      }
+    }
+    if (!identity) {
+      out = mlx::core::transpose(out, std::move(transpose_axes), device);
+    }
+    if (out.shape() != mlx_shape(out_dims)) {
+      return nullptr;
+    }
+
+    auto array = std::make_unique<mlx::core::array>(std::move(out));
+    return new PjrtxMlxMetalBuffer(std::move(array), byte_size, operand->dtype,
+                                   std::move(out_dims),
+                                   operand->device_ordinal);
+  } catch (const std::exception&) {
+    return nullptr;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_scatter_axis(
+    PjrtxMlxMetalBuffer* operand, PjrtxMlxMetalBuffer* indices,
+    PjrtxMlxMetalBuffer* updates, int64_t axis, int64_t index_vector_dim,
+    int update_kind, const int64_t* output_dims, uint64_t output_rank) {
+  if (operand == nullptr || indices == nullptr || updates == nullptr ||
+      output_dims == nullptr || operand->byte_size == 0 ||
+      indices->byte_size == 0 || updates->byte_size == 0 ||
+      operand->dtype != updates->dtype ||
+      operand->device_ordinal != indices->device_ordinal ||
+      operand->device_ordinal != updates->device_ordinal) {
+    return nullptr;
+  }
+  std::vector<int64_t> out_dims(output_dims, output_dims + output_rank);
+  const uint64_t byte_size = byte_size_for_shape(operand->dtype, out_dims);
+  if (byte_size == 0 || out_dims != operand->dims || axis < 0 ||
+      static_cast<size_t>(axis) >= operand->dims.size()) {
+    return nullptr;
+  }
+
+  const mlx::core::Device device(mlx::core::Device::gpu, operand->device_ordinal);
+  if (!mlx::core::is_available(device) || operand->array == nullptr ||
+      indices->array == nullptr || updates->array == nullptr) {
+    return nullptr;
+  }
+
+  try {
+    mlx::core::array index_array = *indices->array;
+    if (index_vector_dim >= 0 &&
+        static_cast<size_t>(index_vector_dim) < indices->dims.size() &&
+        indices->dims[static_cast<size_t>(index_vector_dim)] == 1) {
+      std::vector<int64_t> reshaped_dims = indices->dims;
+      reshaped_dims.erase(reshaped_dims.begin() +
+                          static_cast<size_t>(index_vector_dim));
+      index_array = mlx::core::reshape(index_array, mlx_shape(reshaped_dims), device);
+    }
+    mlx::core::array out =
+        update_kind == PJRTX_MLX_METAL_SCATTER_ADD
+            ? mlx::core::scatter_add_axis(*operand->array, index_array,
+                                          *updates->array,
+                                          static_cast<int>(axis), device)
+            : mlx::core::put_along_axis(*operand->array, index_array,
+                                        *updates->array,
+                                        static_cast<int>(axis), device);
+    auto array = std::make_unique<mlx::core::array>(std::move(out));
+    return new PjrtxMlxMetalBuffer(std::move(array), byte_size, operand->dtype,
+                                   std::move(out_dims),
+                                   operand->device_ordinal);
+  } catch (const std::exception&) {
+    return nullptr;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_scatter(
+    PjrtxMlxMetalBuffer* operand, PjrtxMlxMetalBuffer* indices,
+    PjrtxMlxMetalBuffer* updates, const int64_t* scatter_dims_to_operand_dims,
+    uint64_t num_scatter_axes, const int64_t* inserted_window_dims,
+    uint64_t num_inserted_window_dims, const int64_t* update_window_dims,
+    uint64_t num_update_window_dims, const int64_t* input_batching_dims,
+    uint64_t num_input_batching_dims,
+    const int64_t* scatter_indices_batching_dims,
+    uint64_t num_scatter_indices_batching_dims, int64_t index_vector_dim,
+    int update_kind, const int64_t* output_dims, uint64_t output_rank) {
+  if (operand == nullptr || indices == nullptr || updates == nullptr ||
+      output_dims == nullptr || operand->byte_size == 0 ||
+      indices->byte_size == 0 || updates->byte_size == 0 ||
+      operand->dtype != updates->dtype ||
+      operand->device_ordinal != indices->device_ordinal ||
+      operand->device_ordinal != updates->device_ordinal ||
+      (num_scatter_axes > 0 && scatter_dims_to_operand_dims == nullptr) ||
+      (num_inserted_window_dims > 0 && inserted_window_dims == nullptr) ||
+      (num_update_window_dims > 0 && update_window_dims == nullptr) ||
+      (num_input_batching_dims > 0 && input_batching_dims == nullptr) ||
+      (num_scatter_indices_batching_dims > 0 &&
+       scatter_indices_batching_dims == nullptr)) {
+    return nullptr;
+  }
+  std::vector<int64_t> axes_i64;
+  if (num_scatter_axes > 0) {
+    axes_i64.assign(scatter_dims_to_operand_dims,
+                    scatter_dims_to_operand_dims + num_scatter_axes);
+  }
+  std::vector<int64_t> inserted;
+  if (num_inserted_window_dims > 0) {
+    inserted.assign(inserted_window_dims,
+                    inserted_window_dims + num_inserted_window_dims);
+  }
+  std::vector<int64_t> update_window;
+  if (num_update_window_dims > 0) {
+    update_window.assign(update_window_dims,
+                         update_window_dims + num_update_window_dims);
+  }
+  std::vector<int64_t> input_batching;
+  if (num_input_batching_dims > 0) {
+    input_batching.assign(input_batching_dims,
+                          input_batching_dims + num_input_batching_dims);
+  }
+  std::vector<int64_t> scatter_indices_batching;
+  if (num_scatter_indices_batching_dims > 0) {
+    scatter_indices_batching.assign(
+        scatter_indices_batching_dims,
+        scatter_indices_batching_dims + num_scatter_indices_batching_dims);
+  }
+  std::vector<int64_t> out_dims(output_dims, output_dims + output_rank);
+  const uint64_t byte_size = byte_size_for_shape(operand->dtype, out_dims);
+  if (byte_size == 0 ||
+      !scatter_metadata_is_valid(operand->dims, indices->dims, updates->dims,
+                                 axes_i64, inserted, update_window,
+                                 input_batching, scatter_indices_batching,
+                                 index_vector_dim, out_dims)) {
+    return nullptr;
+  }
+
+  const mlx::core::Device device(mlx::core::Device::gpu, operand->device_ordinal);
+  if (!mlx::core::is_available(device) || operand->array == nullptr ||
+      indices->array == nullptr || updates->array == nullptr) {
+    return nullptr;
+  }
+  if (!input_batching.empty() && mlx_dtype_from_code(indices->dtype) == nullptr) {
+    return nullptr;
+  }
+
+  try {
+    const bool explicit_vector = scatter_index_vector_is_explicit(
+        indices->dims, axes_i64.size(), index_vector_dim);
+    const std::vector<int64_t> index_prefix_dims =
+        gather_index_prefix_dims(indices->dims, explicit_vector, index_vector_dim);
+    std::vector<mlx::core::array> index_arrays;
+    index_arrays.reserve(axes_i64.size() + input_batching.size());
+    if (axes_i64.size() == 1) {
+      mlx::core::array index_array = *indices->array;
+      if (explicit_vector) {
+        std::vector<int64_t> reshaped_dims = indices->dims;
+        reshaped_dims.erase(reshaped_dims.begin() +
+                            static_cast<size_t>(index_vector_dim));
+        index_array = mlx::core::reshape(index_array, mlx_shape(reshaped_dims),
+                                         device);
+      }
+      index_arrays.push_back(std::move(index_array));
+    } else {
+      for (size_t index = 0; index < axes_i64.size(); ++index) {
+        std::vector<int64_t> start(indices->dims.size(), 0);
+        std::vector<int64_t> stop = indices->dims;
+        std::vector<int64_t> strides(indices->dims.size(), 1);
+        start[static_cast<size_t>(index_vector_dim)] =
+            static_cast<int64_t>(index);
+        stop[static_cast<size_t>(index_vector_dim)] =
+            static_cast<int64_t>(index + 1);
+        auto part = mlx::core::slice(*indices->array, mlx_shape(start),
+                                     mlx_shape(stop), mlx_shape(strides),
+                                     device);
+        part = mlx::core::squeeze(part, static_cast<int>(index_vector_dim),
+                                  device);
+        index_arrays.push_back(std::move(part));
+      }
+    }
+    for (size_t i = 0; i < input_batching.size(); ++i) {
+      index_arrays.push_back(gather_batch_index_array(
+          indices->dims, index_prefix_dims, scatter_indices_batching[i],
+          explicit_vector, index_vector_dim, indices->dtype, device));
+    }
+
+    std::vector<int> axes;
+    axes.reserve(axes_i64.size() + input_batching.size());
+    for (int64_t axis : axes_i64) {
+      axes.push_back(static_cast<int>(axis));
+    }
+    for (int64_t axis : input_batching) {
+      axes.push_back(static_cast<int>(axis));
+    }
+
+    const size_t index_prefix_rank = index_prefix_dims.size();
+    std::vector<int64_t> reshaped_update_dims(updates->dims.begin(),
+                                              updates->dims.begin() +
+                                                  static_cast<std::ptrdiff_t>(
+                                                      index_prefix_rank));
+    reshaped_update_dims.reserve(index_prefix_rank + operand->dims.size());
+    for (size_t axis = 0; axis < operand->dims.size(); ++axis) {
+      auto it = std::find(update_window.begin(), update_window.end(),
+                          static_cast<int64_t>(axis));
+      if (it == update_window.end()) {
+        reshaped_update_dims.push_back(1);
+      } else {
+        const size_t window_axis =
+            static_cast<size_t>(std::distance(update_window.begin(), it));
+        reshaped_update_dims.push_back(updates->dims[index_prefix_rank + window_axis]);
+      }
+    }
+    auto reshaped_updates =
+        mlx::core::reshape(*updates->array, mlx_shape(reshaped_update_dims),
+                           device);
+
+    mlx::core::array out =
+        update_kind == PJRTX_MLX_METAL_SCATTER_ADD
+            ? mlx::core::scatter_add(*operand->array, std::move(index_arrays),
+                                     reshaped_updates, std::move(axes), device)
+            : mlx::core::scatter(*operand->array, std::move(index_arrays),
+                                 reshaped_updates, std::move(axes), device);
+    if (out.shape() != mlx_shape(out_dims)) {
+      return nullptr;
+    }
+    auto array = std::make_unique<mlx::core::array>(std::move(out));
+    return new PjrtxMlxMetalBuffer(std::move(array), byte_size, operand->dtype,
+                                   std::move(out_dims),
+                                   operand->device_ordinal);
+  } catch (const std::exception&) {
+    return nullptr;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
 PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_sort(
     PjrtxMlxMetalBuffer* src, int64_t dimension, const int64_t* output_dims,
     uint64_t output_rank) {
@@ -1317,6 +2009,78 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_sort(
   }
   try {
     auto out = mlx::core::sort(*src->array, static_cast<int>(dimension), device);
+    auto array = std::make_unique<mlx::core::array>(std::move(out));
+    return new PjrtxMlxMetalBuffer(std::move(array), src->byte_size,
+                                   src->dtype, std::move(out_dims),
+                                   src->device_ordinal);
+  } catch (const std::exception&) {
+    return nullptr;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_argsort(
+    PjrtxMlxMetalBuffer* src, int64_t dimension, int output_dtype,
+    const int64_t* output_dims, uint64_t output_rank) {
+  if (src == nullptr || output_dims == nullptr || src->byte_size == 0 ||
+      output_rank != src->dims.size() || src->array == nullptr ||
+      dimension < 0 || static_cast<size_t>(dimension) >= src->dims.size()) {
+    return nullptr;
+  }
+  std::vector<int64_t> out_dims(output_dims, output_dims + output_rank);
+  if (out_dims != src->dims) {
+    return nullptr;
+  }
+  const mlx::core::Device device(mlx::core::Device::gpu, src->device_ordinal);
+  if (!mlx::core::is_available(device)) {
+    return nullptr;
+  }
+  try {
+    auto order = mlx::core::argsort(*src->array, static_cast<int>(dimension),
+                                    device);
+    auto out = mlx_astype_array(order, output_dtype, device);
+    uint64_t byte_size = byte_size_for_shape(output_dtype, out_dims);
+    if (byte_size == 0) {
+      return nullptr;
+    }
+    auto array = std::make_unique<mlx::core::array>(std::move(out));
+    return new PjrtxMlxMetalBuffer(std::move(array), byte_size, output_dtype,
+                                   std::move(out_dims), src->device_ordinal);
+  } catch (const std::exception&) {
+    return nullptr;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_take_along_axis(
+    PjrtxMlxMetalBuffer* src, PjrtxMlxMetalBuffer* indices, int64_t dimension,
+    const int64_t* output_dims, uint64_t output_rank) {
+  if (src == nullptr || indices == nullptr || output_dims == nullptr ||
+      src->byte_size == 0 || indices->byte_size == 0 ||
+      src->array == nullptr || indices->array == nullptr ||
+      output_rank != src->dims.size() || output_rank != indices->dims.size() ||
+      src->device_ordinal != indices->device_ordinal || dimension < 0 ||
+      static_cast<size_t>(dimension) >= src->dims.size()) {
+    return nullptr;
+  }
+  std::vector<int64_t> out_dims(output_dims, output_dims + output_rank);
+  if (out_dims != src->dims || out_dims != indices->dims) {
+    return nullptr;
+  }
+  const mlx::core::Device device(mlx::core::Device::gpu, src->device_ordinal);
+  if (!mlx::core::is_available(device)) {
+    return nullptr;
+  }
+  try {
+    auto index_array = mlx_astype_array(*indices->array,
+                                        PJRTX_MLX_METAL_DTYPE_S32, device);
+    auto out = mlx::core::take_along_axis(
+        *src->array, index_array, static_cast<int>(dimension), device);
+    if (out.shape() != mlx_shape(out_dims)) {
+      return nullptr;
+    }
     auto array = std::make_unique<mlx::core::array>(std::move(out));
     return new PjrtxMlxMetalBuffer(std::move(array), src->byte_size,
                                    src->dtype, std::move(out_dims),
@@ -1386,8 +2150,17 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_reduce(
     PjrtxMlxMetalBuffer* src, int op, const int64_t* dimensions,
     uint64_t num_dimensions, const int64_t* output_dims, uint64_t output_rank) {
   if (src == nullptr || output_dims == nullptr ||
-      (num_dimensions > 0 && dimensions == nullptr) ||
+      (num_dimensions > 0 && dimensions == nullptr)) {
+    return nullptr;
+  }
+  if ((op == PJRTX_MLX_METAL_REDUCE_SUM ||
+       op == PJRTX_MLX_METAL_REDUCE_MAX) &&
       src->dtype != PJRTX_MLX_METAL_DTYPE_F32) {
+    return nullptr;
+  }
+  if ((op == PJRTX_MLX_METAL_REDUCE_AND ||
+       op == PJRTX_MLX_METAL_REDUCE_OR) &&
+      src->dtype != PJRTX_MLX_METAL_DTYPE_PRED) {
     return nullptr;
   }
   std::vector<int64_t> out_dims(output_dims, output_dims + output_rank);
@@ -1408,7 +2181,11 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_reduce(
     mlx::core::array out =
         op == PJRTX_MLX_METAL_REDUCE_SUM
             ? mlx::core::sum(*src->array, axes, false, device)
-            : mlx::core::max(*src->array, axes, false, device);
+            : op == PJRTX_MLX_METAL_REDUCE_MAX
+                  ? mlx::core::max(*src->array, axes, false, device)
+                  : op == PJRTX_MLX_METAL_REDUCE_AND
+                        ? mlx::core::all(*src->array, axes, false, device)
+                        : mlx::core::any(*src->array, axes, false, device);
     auto array = std::make_unique<mlx::core::array>(std::move(out));
     return new PjrtxMlxMetalBuffer(std::move(array), byte_size, src->dtype,
                                    std::move(out_dims),

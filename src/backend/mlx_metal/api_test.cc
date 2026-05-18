@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 
 bool near(float lhs, float rhs) { return std::fabs(lhs - rhs) < 0.0001f; }
 bool near_relaxed(float lhs, float rhs) { return std::fabs(lhs - rhs) < 0.01f; }
@@ -451,6 +452,24 @@ int main() {
         assert(near(pad_output[i], expected[i]));
       }
     }
+
+    const int64_t pad_interior_strided[] = {1};
+    const int64_t pad_interior_output_dims[] = {6};
+    PjrtxMlxMetalBuffer* interior_padded = pjrtx_mlx_metal_buffer_pad(
+        pad_buffer, pad_value_buffer, pad_low, pad_high, pad_interior_strided,
+        1, pad_interior_output_dims, 1);
+    assert(interior_padded != nullptr);
+    float interior_pad_output[6] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               interior_padded, interior_pad_output,
+               sizeof(interior_pad_output)) == 1);
+    {
+      const float expected[] = {0.0f, 2.0f, 0.0f, 3.0f, 0.0f, 0.0f};
+      for (int i = 0; i < 6; ++i) {
+        assert(near(interior_pad_output[i], expected[i]));
+      }
+    }
+    pjrtx_mlx_metal_buffer_destroy(interior_padded);
     pjrtx_mlx_metal_buffer_destroy(padded);
     pjrtx_mlx_metal_buffer_destroy(pad_value_buffer);
     pjrtx_mlx_metal_buffer_destroy(pad_buffer);
@@ -569,6 +588,383 @@ int main() {
     pjrtx_mlx_metal_buffer_destroy(gather_axis1_indices);
     pjrtx_mlx_metal_buffer_destroy(gather_axis1_operand);
 
+    const int32_t gather_nd_indices_input[] = {2, 1, 0, 0};
+    const int64_t gather_nd_indices_dims[] = {2, 2};
+    const int64_t gather_nd_start_map[] = {0, 1};
+    const int64_t gather_nd_collapsed[] = {0, 1};
+    const int64_t gather_nd_slice_sizes[] = {1, 1};
+    const int64_t gather_nd_output_dims[] = {2};
+    PjrtxMlxMetalBuffer* gather_nd_operand =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, gather_operand_input,
+            sizeof(gather_operand_input), PJRTX_MLX_METAL_DTYPE_F32,
+            gather_operand_dims, 2);
+    PjrtxMlxMetalBuffer* gather_nd_indices =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, gather_nd_indices_input,
+            sizeof(gather_nd_indices_input), PJRTX_MLX_METAL_DTYPE_S32,
+            gather_nd_indices_dims, 2);
+    assert(gather_nd_operand != nullptr);
+    assert(gather_nd_indices != nullptr);
+    PjrtxMlxMetalBuffer* gathered_nd = pjrtx_mlx_metal_buffer_gather(
+        gather_nd_operand, gather_nd_indices, gather_nd_start_map, 2,
+        gather_nd_collapsed, 2, nullptr, 0, nullptr, 0, 1,
+        gather_nd_slice_sizes, 2, nullptr, 0, gather_nd_output_dims, 1);
+    assert(gathered_nd != nullptr);
+    float gather_nd_output[2] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               gathered_nd, gather_nd_output, sizeof(gather_nd_output)) == 1);
+    {
+      const float expected[] = {6.0f, 1.0f};
+      for (int i = 0; i < 2; ++i) {
+        assert(near(gather_nd_output[i], expected[i]));
+      }
+    }
+    pjrtx_mlx_metal_buffer_destroy(gathered_nd);
+    pjrtx_mlx_metal_buffer_destroy(gather_nd_indices);
+    pjrtx_mlx_metal_buffer_destroy(gather_nd_operand);
+
+    const int64_t batched_gather_operand_dims[] = {2, 3, 4};
+    const int64_t batched_gather_indices_dims[] = {2, 2, 1};
+    const int64_t batched_gather_start_map[] = {1};
+    const int64_t batched_gather_collapsed[] = {1};
+    const int64_t batched_gather_operand_batching[] = {0};
+    const int64_t batched_gather_start_batching[] = {0};
+    const int64_t batched_gather_slice_sizes[] = {1, 1, 4};
+    const int64_t batched_gather_offset_dims[] = {2};
+    const int64_t batched_gather_output_dims[] = {2, 2, 4};
+    const float batched_gather_operand_input[] = {
+        0.0f,  1.0f,  2.0f,  3.0f,  4.0f,  5.0f,
+        6.0f,  7.0f,  8.0f,  9.0f,  10.0f, 11.0f,
+        12.0f, 13.0f, 14.0f, 15.0f, 16.0f, 17.0f,
+        18.0f, 19.0f, 20.0f, 21.0f, 22.0f, 23.0f,
+    };
+    const int32_t batched_gather_indices_input[] = {2, 0, 1, 2};
+    PjrtxMlxMetalBuffer* batched_gather_operand =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, batched_gather_operand_input,
+            sizeof(batched_gather_operand_input), PJRTX_MLX_METAL_DTYPE_F32,
+            batched_gather_operand_dims, 3);
+    PjrtxMlxMetalBuffer* batched_gather_indices =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, batched_gather_indices_input,
+            sizeof(batched_gather_indices_input), PJRTX_MLX_METAL_DTYPE_S32,
+            batched_gather_indices_dims, 3);
+    assert(batched_gather_operand != nullptr);
+    assert(batched_gather_indices != nullptr);
+    PjrtxMlxMetalBuffer* batched_gathered = pjrtx_mlx_metal_buffer_gather(
+        batched_gather_operand, batched_gather_indices,
+        batched_gather_start_map, 1, batched_gather_collapsed, 1,
+        batched_gather_operand_batching, 1, batched_gather_start_batching, 1,
+        2, batched_gather_slice_sizes, 3, batched_gather_offset_dims, 1,
+        batched_gather_output_dims, 3);
+    assert(batched_gathered != nullptr);
+    float batched_gather_output[16] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               batched_gathered, batched_gather_output,
+               sizeof(batched_gather_output)) == 1);
+    {
+      const float expected[] = {
+          8.0f,  9.0f,  10.0f, 11.0f, 0.0f,  1.0f,  2.0f,  3.0f,
+          16.0f, 17.0f, 18.0f, 19.0f, 20.0f, 21.0f, 22.0f, 23.0f,
+      };
+      for (std::size_t i = 0; i < 16; ++i) {
+        assert(near(batched_gather_output[i], expected[i]));
+      }
+    }
+    pjrtx_mlx_metal_buffer_destroy(batched_gathered);
+    pjrtx_mlx_metal_buffer_destroy(batched_gather_indices);
+    pjrtx_mlx_metal_buffer_destroy(batched_gather_operand);
+
+    const int64_t scatter_dims[] = {4};
+    const int64_t scatter_indices_dims[] = {2};
+    const float scatter_operand_input[] = {0.0f, 10.0f, 20.0f, 30.0f};
+    const int32_t scatter_indices_input[] = {1, 3};
+    const float scatter_updates_input[] = {5.0f, 7.0f};
+    PjrtxMlxMetalBuffer* scatter_operand =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, scatter_operand_input,
+            sizeof(scatter_operand_input), PJRTX_MLX_METAL_DTYPE_F32,
+            scatter_dims, 1);
+    PjrtxMlxMetalBuffer* scatter_indices =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, scatter_indices_input,
+            sizeof(scatter_indices_input), PJRTX_MLX_METAL_DTYPE_S32,
+            scatter_indices_dims, 1);
+    PjrtxMlxMetalBuffer* scatter_updates =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, scatter_updates_input,
+            sizeof(scatter_updates_input), PJRTX_MLX_METAL_DTYPE_F32,
+            scatter_indices_dims, 1);
+    assert(scatter_operand != nullptr);
+    assert(scatter_indices != nullptr);
+    assert(scatter_updates != nullptr);
+    PjrtxMlxMetalBuffer* scattered = pjrtx_mlx_metal_buffer_scatter_axis(
+        scatter_operand, scatter_indices, scatter_updates, 0, 1,
+        PJRTX_MLX_METAL_SCATTER_SET, scatter_dims, 1);
+    assert(scattered != nullptr);
+    float scatter_output[4] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               scattered, scatter_output, sizeof(scatter_output)) == 1);
+    {
+      const float expected[] = {0.0f, 5.0f, 20.0f, 7.0f};
+      for (int i = 0; i < 4; ++i) {
+        assert(near(scatter_output[i], expected[i]));
+      }
+    }
+    PjrtxMlxMetalBuffer* scatter_added = pjrtx_mlx_metal_buffer_scatter_axis(
+        scatter_operand, scatter_indices, scatter_updates, 0, 1,
+        PJRTX_MLX_METAL_SCATTER_ADD, scatter_dims, 1);
+    assert(scatter_added != nullptr);
+    float scatter_add_output[4] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               scatter_added, scatter_add_output,
+               sizeof(scatter_add_output)) == 1);
+    {
+      const float expected[] = {0.0f, 15.0f, 20.0f, 37.0f};
+      for (int i = 0; i < 4; ++i) {
+        assert(near(scatter_add_output[i], expected[i]));
+      }
+    }
+    pjrtx_mlx_metal_buffer_destroy(scatter_added);
+    pjrtx_mlx_metal_buffer_destroy(scattered);
+    pjrtx_mlx_metal_buffer_destroy(scatter_updates);
+    pjrtx_mlx_metal_buffer_destroy(scatter_indices);
+    pjrtx_mlx_metal_buffer_destroy(scatter_operand);
+
+    const int64_t point_scatter_dims[] = {3, 2};
+    const int64_t point_scatter_indices_dims[] = {2, 2};
+    const int64_t point_scatter_axes[] = {0, 1};
+    const int64_t point_scatter_updates_dims[] = {2};
+    const float point_scatter_operand_input[] = {1.0f, 2.0f, 3.0f,
+                                                 4.0f, 5.0f, 6.0f};
+    const int32_t point_scatter_indices_input[] = {2, 1, 0, 0};
+    const float point_scatter_updates_input[] = {50.0f, 60.0f};
+    PjrtxMlxMetalBuffer* point_scatter_operand =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, point_scatter_operand_input,
+            sizeof(point_scatter_operand_input), PJRTX_MLX_METAL_DTYPE_F32,
+            point_scatter_dims, 2);
+    PjrtxMlxMetalBuffer* point_scatter_indices =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, point_scatter_indices_input,
+            sizeof(point_scatter_indices_input), PJRTX_MLX_METAL_DTYPE_S32,
+            point_scatter_indices_dims, 2);
+    PjrtxMlxMetalBuffer* point_scatter_updates =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, point_scatter_updates_input,
+            sizeof(point_scatter_updates_input), PJRTX_MLX_METAL_DTYPE_F32,
+            point_scatter_updates_dims, 1);
+    assert(point_scatter_operand != nullptr);
+    assert(point_scatter_indices != nullptr);
+    assert(point_scatter_updates != nullptr);
+    PjrtxMlxMetalBuffer* point_scattered = pjrtx_mlx_metal_buffer_scatter(
+        point_scatter_operand, point_scatter_indices, point_scatter_updates,
+        point_scatter_axes, 2, point_scatter_axes, 2, nullptr, 0, nullptr, 0,
+        nullptr, 0, 1,
+        PJRTX_MLX_METAL_SCATTER_SET, point_scatter_dims, 2);
+    assert(point_scattered != nullptr);
+    float point_scatter_output[6] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               point_scattered, point_scatter_output,
+               sizeof(point_scatter_output)) == 1);
+    {
+      const float expected[] = {60.0f, 2.0f, 3.0f, 4.0f, 5.0f, 50.0f};
+      for (int i = 0; i < 6; ++i) {
+        assert(near(point_scatter_output[i], expected[i]));
+      }
+    }
+    PjrtxMlxMetalBuffer* point_scatter_added = pjrtx_mlx_metal_buffer_scatter(
+        point_scatter_operand, point_scatter_indices, point_scatter_updates,
+        point_scatter_axes, 2, point_scatter_axes, 2, nullptr, 0, nullptr, 0,
+        nullptr, 0, 1,
+        PJRTX_MLX_METAL_SCATTER_ADD, point_scatter_dims, 2);
+    assert(point_scatter_added != nullptr);
+    float point_scatter_add_output[6] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               point_scatter_added, point_scatter_add_output,
+               sizeof(point_scatter_add_output)) == 1);
+    {
+      const float expected[] = {61.0f, 2.0f, 3.0f, 4.0f, 5.0f, 56.0f};
+      for (int i = 0; i < 6; ++i) {
+        assert(near(point_scatter_add_output[i], expected[i]));
+      }
+    }
+    pjrtx_mlx_metal_buffer_destroy(point_scatter_added);
+    pjrtx_mlx_metal_buffer_destroy(point_scattered);
+    pjrtx_mlx_metal_buffer_destroy(point_scatter_updates);
+    pjrtx_mlx_metal_buffer_destroy(point_scatter_indices);
+    pjrtx_mlx_metal_buffer_destroy(point_scatter_operand);
+
+    const int64_t window_scatter_dims[] = {3, 4};
+    const int64_t window_scatter_indices_dims[] = {2};
+    const int64_t window_scatter_axis[] = {0};
+    const int64_t window_scatter_update_window[] = {1};
+    const int64_t window_scatter_updates_dims[] = {2, 2};
+    const float window_scatter_operand_input[] = {
+        1.0f,  2.0f,  3.0f,  4.0f,  5.0f,  6.0f,
+        7.0f,  8.0f,  9.0f,  10.0f, 11.0f, 12.0f,
+    };
+    const int32_t window_scatter_indices_input[] = {2, 0};
+    const float window_scatter_updates_input[] = {50.0f, 60.0f, 70.0f, 80.0f};
+    PjrtxMlxMetalBuffer* window_scatter_operand =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, window_scatter_operand_input,
+            sizeof(window_scatter_operand_input), PJRTX_MLX_METAL_DTYPE_F32,
+            window_scatter_dims, 2);
+    PjrtxMlxMetalBuffer* window_scatter_indices =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, window_scatter_indices_input,
+            sizeof(window_scatter_indices_input), PJRTX_MLX_METAL_DTYPE_S32,
+            window_scatter_indices_dims, 1);
+    PjrtxMlxMetalBuffer* window_scatter_updates =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, window_scatter_updates_input,
+            sizeof(window_scatter_updates_input), PJRTX_MLX_METAL_DTYPE_F32,
+            window_scatter_updates_dims, 2);
+    assert(window_scatter_operand != nullptr);
+    assert(window_scatter_indices != nullptr);
+    assert(window_scatter_updates != nullptr);
+    PjrtxMlxMetalBuffer* window_scattered = pjrtx_mlx_metal_buffer_scatter(
+        window_scatter_operand, window_scatter_indices, window_scatter_updates,
+        window_scatter_axis, 1, window_scatter_axis, 1,
+        window_scatter_update_window, 1, nullptr, 0, nullptr, 0, 1,
+        PJRTX_MLX_METAL_SCATTER_SET,
+        window_scatter_dims, 2);
+    assert(window_scattered != nullptr);
+    float window_scatter_output[12] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               window_scattered, window_scatter_output,
+               sizeof(window_scatter_output)) == 1);
+    {
+      const float expected[] = {
+          70.0f, 80.0f, 3.0f,  4.0f,  5.0f,  6.0f,
+          7.0f,  8.0f,  50.0f, 60.0f, 11.0f, 12.0f,
+      };
+      for (int i = 0; i < 12; ++i) {
+        assert(near(window_scatter_output[i], expected[i]));
+      }
+    }
+    PjrtxMlxMetalBuffer* window_scatter_added = pjrtx_mlx_metal_buffer_scatter(
+        window_scatter_operand, window_scatter_indices, window_scatter_updates,
+        window_scatter_axis, 1, window_scatter_axis, 1,
+        window_scatter_update_window, 1, nullptr, 0, nullptr, 0, 1,
+        PJRTX_MLX_METAL_SCATTER_ADD,
+        window_scatter_dims, 2);
+    assert(window_scatter_added != nullptr);
+    float window_scatter_add_output[12] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               window_scatter_added, window_scatter_add_output,
+               sizeof(window_scatter_add_output)) == 1);
+    {
+      const float expected[] = {
+          71.0f, 82.0f, 3.0f,  4.0f,  5.0f,  6.0f,
+          7.0f,  8.0f,  59.0f, 70.0f, 11.0f, 12.0f,
+      };
+      for (int i = 0; i < 12; ++i) {
+        assert(near(window_scatter_add_output[i], expected[i]));
+      }
+    }
+    pjrtx_mlx_metal_buffer_destroy(window_scatter_added);
+    pjrtx_mlx_metal_buffer_destroy(window_scattered);
+    pjrtx_mlx_metal_buffer_destroy(window_scatter_updates);
+    pjrtx_mlx_metal_buffer_destroy(window_scatter_indices);
+    pjrtx_mlx_metal_buffer_destroy(window_scatter_operand);
+
+    const int64_t batched_scatter_dims[] = {2, 3, 4};
+    const int64_t batched_scatter_indices_dims[] = {2, 2, 1};
+    const int64_t batched_scatter_axis[] = {1};
+    const int64_t batched_scatter_input_batching[] = {0};
+    const int64_t batched_scatter_indices_batching[] = {0};
+    const int64_t batched_scatter_update_window[] = {2};
+    const int64_t batched_scatter_updates_dims[] = {2, 2, 4};
+    const float batched_scatter_operand_input[] = {
+        0.0f,  1.0f,  2.0f,  3.0f,  4.0f,  5.0f,
+        6.0f,  7.0f,  8.0f,  9.0f,  10.0f, 11.0f,
+        12.0f, 13.0f, 14.0f, 15.0f, 16.0f, 17.0f,
+        18.0f, 19.0f, 20.0f, 21.0f, 22.0f, 23.0f,
+    };
+    const int32_t batched_scatter_indices_input[] = {2, 0, 1, 2};
+    const float batched_scatter_updates_input[] = {
+        100.0f, 101.0f, 102.0f, 103.0f,
+        104.0f, 105.0f, 106.0f, 107.0f,
+        108.0f, 109.0f, 110.0f, 111.0f,
+        112.0f, 113.0f, 114.0f, 115.0f,
+    };
+    PjrtxMlxMetalBuffer* batched_scatter_operand =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, batched_scatter_operand_input,
+            sizeof(batched_scatter_operand_input), PJRTX_MLX_METAL_DTYPE_F32,
+            batched_scatter_dims, 3);
+    PjrtxMlxMetalBuffer* batched_scatter_indices =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, batched_scatter_indices_input,
+            sizeof(batched_scatter_indices_input), PJRTX_MLX_METAL_DTYPE_S32,
+            batched_scatter_indices_dims, 3);
+    PjrtxMlxMetalBuffer* batched_scatter_updates =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, batched_scatter_updates_input,
+            sizeof(batched_scatter_updates_input), PJRTX_MLX_METAL_DTYPE_F32,
+            batched_scatter_updates_dims, 3);
+    assert(batched_scatter_operand != nullptr);
+    assert(batched_scatter_indices != nullptr);
+    assert(batched_scatter_updates != nullptr);
+    PjrtxMlxMetalBuffer* batched_scattered = pjrtx_mlx_metal_buffer_scatter(
+        batched_scatter_operand, batched_scatter_indices,
+        batched_scatter_updates, batched_scatter_axis, 1,
+        batched_scatter_axis, 1, batched_scatter_update_window, 1,
+        batched_scatter_input_batching, 1,
+        batched_scatter_indices_batching, 1, 2,
+        PJRTX_MLX_METAL_SCATTER_SET, batched_scatter_dims, 3);
+    assert(batched_scattered != nullptr);
+    float batched_scatter_output[24] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               batched_scattered, batched_scatter_output,
+               sizeof(batched_scatter_output)) == 1);
+    {
+      const float expected[] = {
+          104.0f, 105.0f, 106.0f, 107.0f,
+          4.0f,   5.0f,   6.0f,   7.0f,
+          100.0f, 101.0f, 102.0f, 103.0f,
+          12.0f,  13.0f,  14.0f,  15.0f,
+          108.0f, 109.0f, 110.0f, 111.0f,
+          112.0f, 113.0f, 114.0f, 115.0f,
+      };
+      for (int i = 0; i < 24; ++i) {
+        assert(near(batched_scatter_output[i], expected[i]));
+      }
+    }
+    PjrtxMlxMetalBuffer* batched_scatter_added = pjrtx_mlx_metal_buffer_scatter(
+        batched_scatter_operand, batched_scatter_indices,
+        batched_scatter_updates, batched_scatter_axis, 1,
+        batched_scatter_axis, 1, batched_scatter_update_window, 1,
+        batched_scatter_input_batching, 1,
+        batched_scatter_indices_batching, 1, 2,
+        PJRTX_MLX_METAL_SCATTER_ADD, batched_scatter_dims, 3);
+    assert(batched_scatter_added != nullptr);
+    float batched_scatter_add_output[24] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               batched_scatter_added, batched_scatter_add_output,
+               sizeof(batched_scatter_add_output)) == 1);
+    {
+      const float expected[] = {
+          104.0f, 106.0f, 108.0f, 110.0f,
+          4.0f,   5.0f,   6.0f,   7.0f,
+          108.0f, 110.0f, 112.0f, 114.0f,
+          12.0f,  13.0f,  14.0f,  15.0f,
+          124.0f, 126.0f, 128.0f, 130.0f,
+          132.0f, 134.0f, 136.0f, 138.0f,
+      };
+      for (int i = 0; i < 24; ++i) {
+        assert(near(batched_scatter_add_output[i], expected[i]));
+      }
+    }
+    pjrtx_mlx_metal_buffer_destroy(batched_scatter_added);
+    pjrtx_mlx_metal_buffer_destroy(batched_scattered);
+    pjrtx_mlx_metal_buffer_destroy(batched_scatter_updates);
+    pjrtx_mlx_metal_buffer_destroy(batched_scatter_indices);
+    pjrtx_mlx_metal_buffer_destroy(batched_scatter_operand);
+
     const int64_t sort_dims[] = {2, 3};
     const float sort_input[] = {3.0f, 1.0f, 2.0f, 6.0f, 4.0f, 5.0f};
     PjrtxMlxMetalBuffer* sort_buffer = pjrtx_mlx_metal_buffer_from_host_typed(
@@ -588,7 +984,72 @@ int main() {
       }
     }
     pjrtx_mlx_metal_buffer_destroy(sorted);
+
+    PjrtxMlxMetalBuffer* order = pjrtx_mlx_metal_buffer_argsort(
+        sort_buffer, 1, PJRTX_MLX_METAL_DTYPE_S32, sort_dims, 2);
+    assert(order != nullptr);
+    int32_t order_output[6] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               order, order_output, sizeof(order_output)) == 1);
+    {
+      const int32_t expected[] = {1, 2, 0, 1, 2, 0};
+      for (int i = 0; i < 6; ++i) {
+        assert(order_output[i] == expected[i]);
+      }
+    }
+    const int32_t value_input[] = {10, 11, 12, 20, 21, 22};
+    PjrtxMlxMetalBuffer* value_buffer = pjrtx_mlx_metal_buffer_from_host_typed(
+        devices[0].ordinal, value_input, sizeof(value_input),
+        PJRTX_MLX_METAL_DTYPE_S32, sort_dims, 2);
+    assert(value_buffer != nullptr);
+    PjrtxMlxMetalBuffer* sorted_values =
+        pjrtx_mlx_metal_buffer_take_along_axis(value_buffer, order, 1,
+                                               sort_dims, 2);
+    assert(sorted_values != nullptr);
+    int32_t value_output[6] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               sorted_values, value_output, sizeof(value_output)) == 1);
+    {
+      const int32_t expected[] = {11, 12, 10, 21, 22, 20};
+      for (int i = 0; i < 6; ++i) {
+        assert(value_output[i] == expected[i]);
+      }
+    }
+    pjrtx_mlx_metal_buffer_destroy(sorted_values);
+    pjrtx_mlx_metal_buffer_destroy(value_buffer);
+    pjrtx_mlx_metal_buffer_destroy(order);
     pjrtx_mlx_metal_buffer_destroy(sort_buffer);
+
+    const int64_t pred_reduce_dims[] = {2, 3};
+    const int64_t pred_reduce_axes[] = {1};
+    const int64_t pred_reduce_output_dims[] = {2};
+    const uint8_t pred_reduce_input[] = {1, 0, 1, 1, 1, 1};
+    PjrtxMlxMetalBuffer* pred_reduce_buffer =
+        pjrtx_mlx_metal_buffer_from_host_typed(
+            devices[0].ordinal, pred_reduce_input, sizeof(pred_reduce_input),
+            PJRTX_MLX_METAL_DTYPE_PRED, pred_reduce_dims, 2);
+    assert(pred_reduce_buffer != nullptr);
+    PjrtxMlxMetalBuffer* pred_reduce_all = pjrtx_mlx_metal_buffer_reduce(
+        pred_reduce_buffer, PJRTX_MLX_METAL_REDUCE_AND, pred_reduce_axes, 1,
+        pred_reduce_output_dims, 1);
+    PjrtxMlxMetalBuffer* pred_reduce_any = pjrtx_mlx_metal_buffer_reduce(
+        pred_reduce_buffer, PJRTX_MLX_METAL_REDUCE_OR, pred_reduce_axes, 1,
+        pred_reduce_output_dims, 1);
+    assert(pred_reduce_all != nullptr);
+    assert(pred_reduce_any != nullptr);
+    uint8_t pred_all_output[2] = {};
+    uint8_t pred_any_output[2] = {};
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               pred_reduce_all, pred_all_output, sizeof(pred_all_output)) == 1);
+    assert(pjrtx_mlx_metal_buffer_copy_to_host(
+               pred_reduce_any, pred_any_output, sizeof(pred_any_output)) == 1);
+    assert(pred_all_output[0] == 0);
+    assert(pred_all_output[1] == 1);
+    assert(pred_any_output[0] == 1);
+    assert(pred_any_output[1] == 1);
+    pjrtx_mlx_metal_buffer_destroy(pred_reduce_any);
+    pjrtx_mlx_metal_buffer_destroy(pred_reduce_all);
+    pjrtx_mlx_metal_buffer_destroy(pred_reduce_buffer);
 
     pjrtx_mlx_metal_buffer_destroy(dynamic_source);
     pjrtx_mlx_metal_buffer_destroy(dynamic_start_buffers[1]);

@@ -66,7 +66,7 @@ pip.parse(
 use_repo(pip, "jax_sandbox_deps")
 
 non_module_deps = use_extension("//third_party:non_module_deps.bzl", "non_module_deps")
-use_repo(non_module_deps, "arocc", "fmt", "metal_cpp", "mlx", "translate-c", "xla")
+use_repo(non_module_deps, "arocc", "fmt", "jax_upstream", "metal_cpp", "mlx_metal", "translate-c", "xla")
 
 xla = use_extension("//third_party/xla:xla.bzl", "xla")
 use_repo(

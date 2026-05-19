@@ -1,0 +1,29 @@
+sources
+  source.0 stablehlo stablehlo.tanh
+target: unknown
+graph values
+  graph.value.0 role=parameter dtype=f32
+  graph.value.1 role=instruction_result dtype=f32
+graph instructions
+  graph.instruction.0 kind=elementwise_unary
+mlir pass records
+graph rewrite records
+fusion groups
+placement records
+collective records
+cost ledger
+  cost.0 class=transcendental formula=numel
+lowering records
+  lowering.0 decision=backend_kernel_graph
+memory traffic records
+  traffic.0 lowering=0 memory=1 kind=global_memory instructions=0 costs=0 bytes_read=16 bytes_written=16
+schedule overlap records
+schedule commands
+  command.0 kind=backend_execute
+kernel codegen records
+backend bindings
+  binding.0 backend=metal_v0 op=metal_mls_graph_execute
+profile events
+  profile.0 kind=backend_execute command=0 instructions=0 bytes=32 logical_ops=4 status=ok forced_sync=false start_ns=<redacted> duration_ns=<redacted>
+explain records
+  explain.0 pass=lowering subject=binding.0 decision=kernel_graph profiles=0

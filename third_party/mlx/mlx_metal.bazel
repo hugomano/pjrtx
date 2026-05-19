@@ -1,0 +1,45 @@
+load("@rules_cc//cc:defs.bzl", "cc_import", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "mlx_metallib",
+    srcs = ["mlx/lib/mlx.metallib"],
+)
+
+filegroup(
+    name = "libjaccl_dylib",
+    srcs = ["mlx/lib/libjaccl.dylib"],
+)
+
+filegroup(
+    name = "libmlx_dylib",
+    srcs = ["mlx/lib/libmlx.dylib"],
+)
+
+cc_import(
+    name = "libjaccl",
+    shared_library = "mlx/lib/libjaccl.dylib",
+)
+
+cc_import(
+    name = "libmlx",
+    shared_library = "mlx/lib/libmlx.dylib",
+)
+
+cc_library(
+    name = "metal_runtime",
+    hdrs = glob([
+        "mlx/include/**/*.h",
+        "mlx/include/**/*.hpp",
+    ]),
+    includes = [
+        "mlx/include",
+        "mlx/include/metal_cpp",
+    ],
+    deps = [
+        ":libjaccl",
+        ":libmlx",
+        "@metal_cpp//:metal_cpp",
+    ],
+)

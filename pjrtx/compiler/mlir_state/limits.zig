@@ -1,0 +1,33 @@
+/// Hard limits make attribute-backed MLIR state bounded until the final dialect
+/// replaces these temporary dictionary/array encodings.
+pub const max_fusion_candidates = 16;
+pub const max_placement_records = 128;
+pub const max_placement_outputs = 8;
+pub const max_tile_rank = 8;
+pub const max_collective_records = 8;
+pub const max_lowering_records = 128;
+pub const max_cost_ledger_entries = 256;
+pub const max_memory_traffic_records = 256;
+pub const max_kernel_codegen_records = 32;
+pub const max_kernel_ref_ids = 32;
+pub const max_schedule_commands = 64;
+pub const max_schedule_overlaps = 128;
+pub const max_schedule_refs = 64;
+pub const max_schedule_dependencies = 16;
+pub const max_backend_bindings = 16;
+pub const max_backend_executable_calls = 32;
+pub const max_backend_kernel_graph_edges = 64;
+pub const max_target_devices = 16;
+pub const max_target_memory_spaces = 32;
+pub const max_target_transfer_edges = 64;
+pub const max_target_execution_units = 32;
+pub const max_target_refs = 32;
+pub const max_target_dtype_rates = 32;
+pub const max_runtime_allocations = 128;
+pub const max_runtime_buffer_uses = 256;
+pub const max_runtime_stream_steps = 64;
+pub const max_runtime_wait_events = 16;
+pub const max_runtime_profile_events = 128;
+pub const max_runtime_profile_joins = 256;
+pub const max_runtime_profile_join_events = 16;
+pub const max_backend_profile_joins = max_backend_executable_calls;

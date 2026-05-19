@@ -1,13 +1,46 @@
 load("@rules_python//python/uv:lock.bzl", uv_lock = "lock")
 load("@rules_python//python:py_binary.bzl", "py_binary")
+load("@rules_python//python:py_library.bzl", "py_library")
 load("@rules_python//python:py_test.bzl", "py_test")
+
+JAX_DEPS = [
+    "@jax_sandbox_deps//jax:pkg",
+]
+
+PYTEST_DEPS = JAX_DEPS + [
+    "@jax_sandbox_deps//absl_py:pkg",
+    "@jax_sandbox_deps//flatbuffers:pkg",
+    "@jax_sandbox_deps//hypothesis:pkg",
+    "@jax_sandbox_deps//parameterized:pkg",
+    "@jax_sandbox_deps//pytest:pkg",
+]
+
+py_library(
+    name = "pjrtx_harness",
+    srcs = [
+        "jax_plugin_smoke.py",
+        "pjrtx_harness.py",
+    ],
+    data = ["//src/plugin:pjrtx_metal_plugin"],
+    deps = JAX_DEPS,
+)
+
+py_library(
+    name = "pjrtx_pytest_plugin",
+    srcs = [
+        "pjrtx_pytest_plugin.py",
+    ],
+    deps = [
+        ":pjrtx_harness",
+    ] + PYTEST_DEPS,
+)
 
 py_binary(
     name = "jax_plugin_smoke",
     srcs = ["jax_plugin_smoke.py"],
     data = ["//src/plugin:pjrtx_metal_plugin"],
     main = "jax_plugin_smoke.py",
-    deps = ["@jax_sandbox_deps//jax:pkg"],
+    deps = JAX_DEPS,
 )
 
 py_binary(
@@ -18,7 +51,7 @@ py_binary(
     ],
     data = ["//src/plugin:pjrtx_metal_plugin"],
     main = "jax_llama_like_inference.py",
-    deps = ["@jax_sandbox_deps//jax:pkg"],
+    deps = JAX_DEPS,
 )
 
 py_binary(
@@ -29,7 +62,108 @@ py_binary(
     ],
     data = ["//src/plugin:pjrtx_metal_plugin"],
     main = "jax_op_suite.py",
-    deps = ["@jax_sandbox_deps//jax:pkg"],
+    deps = JAX_DEPS,
+)
+
+py_binary(
+    name = "jax_custom_call",
+    srcs = [
+        "jax_custom_call.py",
+        "jax_plugin_smoke.py",
+    ],
+    data = ["//src/plugin:pjrtx_metal_plugin"],
+    main = "jax_custom_call.py",
+    deps = JAX_DEPS,
+)
+
+py_binary(
+    name = "jax_rng_u64",
+    srcs = [
+        "jax_rng_u64.py",
+        "jax_plugin_smoke.py",
+    ],
+    data = ["//src/plugin:pjrtx_metal_plugin"],
+    main = "jax_rng_u64.py",
+    deps = JAX_DEPS,
+)
+
+py_binary(
+    name = "jax_upstream_subset",
+    srcs = [
+        "jax_upstream_subset.py",
+    ],
+    data = [
+        "jax_upstream_allowlist.txt",
+        "@jax_upstream//:source",
+        "//src/plugin:pjrtx_metal_plugin",
+    ],
+    main = "jax_upstream_subset.py",
+    deps = [
+        ":pjrtx_pytest_plugin",
+    ] + PYTEST_DEPS,
+)
+
+py_binary(
+    name = "jax_upstream_all",
+    srcs = [
+        "jax_upstream_subset.py",
+    ],
+    args = ["--all-tests"],
+    data = [
+        "@jax_upstream//:source",
+        "//src/plugin:pjrtx_metal_plugin",
+    ],
+    main = "jax_upstream_subset.py",
+    deps = [
+        ":pjrtx_pytest_plugin",
+    ] + PYTEST_DEPS,
+)
+
+py_test(
+    name = "jax_upstream_subset_test",
+    srcs = [
+        "jax_upstream_subset.py",
+    ],
+    data = [
+        "jax_upstream_allowlist.txt",
+        "@jax_upstream//:source",
+        "//src/plugin:pjrtx_metal_plugin",
+    ],
+    env = {
+        "PJRTX_BACKEND": "metal_mlx",
+        "PJRTX_TRACE": "1",
+    },
+    main = "jax_upstream_subset.py",
+    tags = ["manual"],
+    deps = [
+        ":pjrtx_pytest_plugin",
+    ] + PYTEST_DEPS,
+)
+
+py_test(
+    name = "jax_upstream_all_test",
+    srcs = [
+        "jax_upstream_subset.py",
+    ],
+    args = ["--all-tests"],
+    data = [
+        "@jax_upstream//:source",
+        "//src/plugin:pjrtx_metal_plugin",
+    ],
+    env = {
+        "PJRTX_BACKEND": "metal_mlx",
+        "PJRTX_TRACE": "1",
+    },
+    main = "jax_upstream_subset.py",
+    size = "enormous",
+    tags = [
+        "manual",
+        "pjrtx_full_jax",
+    ],
+    timeout = "eternal",
+    deps = [
+        ":pjrtx_pytest_plugin",
+    ] + PYTEST_DEPS,
 )
 
 py_test(
@@ -38,7 +172,40 @@ py_test(
     data = ["//src/plugin:pjrtx_metal_plugin"],
     main = "jax_plugin_smoke.py",
     tags = ["manual"],
-    deps = ["@jax_sandbox_deps//jax:pkg"],
+    deps = JAX_DEPS,
+)
+
+py_test(
+    name = "jax_pytest_smoke_test",
+    srcs = [
+        "jax_pytest_smoke_test.py",
+    ],
+    data = ["//src/plugin:pjrtx_metal_plugin"],
+    env = {
+        "PJRTX_BACKEND": "metal_mlx",
+        "PJRTX_TRACE": "1",
+    },
+    main = "jax_pytest_smoke_test.py",
+    tags = ["manual"],
+    deps = [
+        ":pjrtx_harness",
+    ] + PYTEST_DEPS,
+)
+
+py_test(
+    name = "jax_custom_call_test",
+    srcs = [
+        "jax_custom_call.py",
+        "jax_plugin_smoke.py",
+    ],
+    data = ["//src/plugin:pjrtx_metal_plugin"],
+    env = {
+        "PJRTX_BACKEND": "metal_mlx",
+        "PJRTX_TRACE": "1",
+    },
+    main = "jax_custom_call.py",
+    tags = ["manual"],
+    deps = JAX_DEPS,
 )
 
 py_test(
@@ -51,7 +218,20 @@ py_test(
     env = {"PJRTX_BACKEND": "metal_mlx"},
     main = "jax_op_suite.py",
     tags = ["manual"],
-    deps = ["@jax_sandbox_deps//jax:pkg"],
+    deps = JAX_DEPS,
+)
+
+py_test(
+    name = "jax_rng_u64_test",
+    srcs = [
+        "jax_rng_u64.py",
+        "jax_plugin_smoke.py",
+    ],
+    data = ["//src/plugin:pjrtx_metal_plugin"],
+    env = {"PJRTX_BACKEND": "metal_mlx"},
+    main = "jax_rng_u64.py",
+    tags = ["manual"],
+    deps = JAX_DEPS,
 )
 
 py_test(
@@ -64,7 +244,7 @@ py_test(
     env = {"PJRTX_BACKEND": "metal_mlx"},
     main = "jax_llama_like_inference.py",
     tags = ["manual"],
-    deps = ["@jax_sandbox_deps//jax:pkg"],
+    deps = JAX_DEPS,
 )
 
 uv_lock(

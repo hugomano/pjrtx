@@ -1,0 +1,8 @@
+filegroup(
+    name = "mlir",
+    srcs = glob([
+        "*.mlir",
+        "corpus/*.mlir",
+    ]),
+    visibility = ["//visibility:public"],
+)

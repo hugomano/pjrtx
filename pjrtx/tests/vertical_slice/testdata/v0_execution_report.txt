@@ -1,0 +1,70 @@
+allocation plan
+  buffer.0 value=0 placement=host memory=0 bytes=32 lifetime=command.0..command.0
+  buffer.1 value=1 placement=host memory=0 bytes=48 lifetime=command.0..command.0
+  buffer.2 value=2 placement=host memory=0 bytes=12 lifetime=command.0..command.0
+  buffer.3 value=0 placement=device memory=1 bytes=32 lifetime=command.0..command.1
+  buffer.4 value=1 placement=device memory=1 bytes=48 lifetime=command.0..command.1
+  buffer.5 value=2 placement=device memory=1 bytes=12 lifetime=command.0..command.1
+  buffer.6 value=6 placement=device memory=1 bytes=24 lifetime=command.1..command.2
+  buffer.7 value=6 placement=host memory=0 bytes=24 lifetime=command.2..command.2
+  buffer.8 value=3 placement=device memory=1 bytes=24 lifetime=command.1..command.1
+command buffer uses
+  command.0 buffer.0 access=read
+  command.0 buffer.1 access=read
+  command.0 buffer.2 access=read
+  command.0 buffer.3 access=write
+  command.0 buffer.4 access=write
+  command.0 buffer.5 access=write
+  command.1 buffer.3 access=read
+  command.1 buffer.4 access=read
+  command.1 buffer.8 access=write
+  command.1 buffer.5 access=read
+  command.1 buffer.8 access=read
+  command.1 buffer.6 access=write
+  command.2 buffer.6 access=read
+  command.2 buffer.7 access=write
+peak_device_bytes=140
+stream plan
+  command.0 stream.0 start=event.0 done=event.1 waits=none
+  command.1 stream.0 start=event.2 done=event.3 waits=event.1
+  command.2 stream.0 start=event.4 done=event.5 waits=event.3
+runtime execution
+peak_device_bytes=140
+commands
+  command.0 kind=host_to_device stream=0 predicted_bytes=92 observed_bytes=92 predicted_ops=0 observed_ops=0 event=profile.0 ideal_transfer_ps=1438
+  command.1 kind=backend_execute stream=0 predicted_bytes=260 observed_bytes=260 predicted_ops=66 observed_ops=66 event=profile.1 ideal_transfer_ps=0
+  command.2 kind=device_to_host stream=0 predicted_bytes=24 observed_bytes=24 predicted_ops=0 observed_ops=0 event=profile.4 ideal_transfer_ps=375
+streams
+  command.0 start=event.0 done=event.1 waits=0
+  command.1 start=event.2 done=event.3 waits=1
+  command.2 start=event.4 done=event.5 waits=1
+lowering profiles
+  lowering.0 command=1 decision=backend_kernel_graph instructions=0 predicted_bytes=104 observed_bytes=104 predicted_ops=48 observed_ops=48 event=profile.2
+  lowering.1 command=1 decision=elementwise_fusion instructions=1,2,3 predicted_bytes=156 observed_bytes=156 predicted_ops=18 observed_ops=18 event=profile.3
+hardware utilization
+memory spaces
+  memory.0 host_pinned peak_live_bytes=92 allocated_bytes=116
+  memory.1 device_hbm peak_live_bytes=140 allocated_bytes=140
+  memory.2 local_sram peak_live_bytes=0 allocated_bytes=0
+memory traffic
+  traffic.0 lowering=0 memory=1 kind=global_memory bytes_read=80 bytes_written=24 total_bytes=104 bandwidth_bytes_per_second=1000000000000 ideal_memory_ps=104
+  traffic.1 lowering=0 memory=2 kind=local_memory bytes_read=80 bytes_written=24 total_bytes=104 bandwidth_bytes_per_second=20000000000000 ideal_memory_ps=6
+  traffic.2 lowering=1 memory=1 kind=global_memory bytes_read=36 bytes_written=24 total_bytes=60 bandwidth_bytes_per_second=1000000000000 ideal_memory_ps=60
+  traffic.3 lowering=1 memory=2 kind=local_memory bytes_read=84 bytes_written=72 total_bytes=156 bandwidth_bytes_per_second=20000000000000 ideal_memory_ps=8
+lowering roofline
+  lowering.0 decision=backend_kernel_graph predicted_ops=48 predicted_bytes=104 observed_ops=48 observed_bytes=104 ideal_compute_ps=2 ideal_memory_ps=104 limiting=memory event=profile.2
+  lowering.1 decision=elementwise_fusion predicted_ops=18 predicted_bytes=156 observed_ops=18 observed_bytes=156 ideal_compute_ps=16 ideal_memory_ps=60 limiting=memory event=profile.3
+transfer edges
+  edge.0 memory.0->memory.1 predicted_bytes=92 bandwidth_bytes_per_second=64000000000 ideal_transfer_ps=1438
+  edge.1 memory.1->memory.0 predicted_bytes=24 bandwidth_bytes_per_second=64000000000 ideal_transfer_ps=375
+  edge.2 memory.1->memory.2 predicted_bytes=0 bandwidth_bytes_per_second=20000000000000 ideal_transfer_ps=0
+  edge.3 memory.2->memory.1 predicted_bytes=0 bandwidth_bytes_per_second=20000000000000 ideal_transfer_ps=0
+execution units
+  unit.0 trn2_tensor_engine kind=matrix predicted_ops=48 predicted_bytes=104
+    rate dtype=bf16 class=matmul peak_ops_per_second=100000000000000 source=synthetic predicted_ops=0 predicted_bytes=0 ideal_compute_ps=0
+    rate dtype=f32 class=matmul peak_ops_per_second=25000000000000 source=synthetic predicted_ops=48 predicted_bytes=104 ideal_compute_ps=2
+  unit.1 trn2_vector_engine kind=vector predicted_ops=18 predicted_bytes=156
+    rate dtype=f32 class=elementwise peak_ops_per_second=5000000000000 source=synthetic predicted_ops=12 predicted_bytes=108 ideal_compute_ps=3
+    rate dtype=f32 class=transcendental peak_ops_per_second=500000000000 source=synthetic predicted_ops=6 predicted_bytes=48 ideal_compute_ps=12
+  unit.2 trn2_dma_engine kind=dma predicted_ops=0 predicted_bytes=0
+  unit.3 trn2_collective_engine kind=collective predicted_ops=0 predicted_bytes=0

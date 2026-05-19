@@ -29,6 +29,8 @@ pub const BufferType = enum {
     f32,
     f64,
     bf16,
+    c64,
+    c128,
 
     pub fn byteSize(self: BufferType) usize {
         return switch (self) {
@@ -36,7 +38,8 @@ pub const BufferType = enum {
             .pred, .s8, .u8 => 1,
             .s16, .u16, .f16, .bf16 => 2,
             .s32, .u32, .f32 => 4,
-            .s64, .u64, .f64 => 8,
+            .s64, .u64, .f64, .c64 => 8,
+            .c128 => 16,
         };
     }
 };
@@ -101,6 +104,24 @@ pub const CompareOp = enum {
 pub const ScatterUpdateKind = enum {
     set,
     add,
+};
+
+pub const FftKind = enum {
+    fft,
+    ifft,
+    rfft,
+    irfft,
+};
+
+pub const RngDistribution = enum {
+    uniform,
+    normal,
+};
+
+pub const TriangularSolveTranspose = enum {
+    no_transpose,
+    transpose,
+    adjoint,
 };
 
 pub const DeviceDescriptor = struct {
@@ -192,10 +213,79 @@ pub const ValueRole = enum {
     output,
 };
 
+pub const ValueStorageKind = enum {
+    tensor,
+    tuple,
+    token,
+    complex_pair,
+};
+
 pub const Value = struct {
     id: ValueId,
     role: ValueRole,
     descriptor: BufferDescriptor,
+    storage: ValueStorageKind = .tensor,
+    elements: []const ValueId = &.{},
+};
+
+pub const OutputAliasKind = enum(u8) {
+    /// The output value is the same logical value as the parameter.
+    identity,
+    /// The output may reuse the parameter's storage if the backend materializes it in place.
+    donation,
+};
+
+pub const OutputAlias = struct {
+    output_index: u32,
+    parameter_index: u32,
+    kind: OutputAliasKind,
+};
+
+pub const RegionId = struct {
+    index: u32,
+
+    pub const invalid: RegionId = .{ .index = std.math.maxInt(u32) };
+};
+
+pub const RegionValueId = struct {
+    index: u32,
+
+    pub const invalid: RegionValueId = .{ .index = std.math.maxInt(u32) };
+};
+
+pub const RegionKind = enum {
+    generic,
+    reducer,
+    comparator,
+    scatter_update,
+    while_cond,
+    while_body,
+    composite,
+};
+
+pub const RegionValueRole = enum {
+    argument,
+    constant,
+    instruction_result,
+};
+
+pub const RegionValue = struct {
+    id: RegionValueId,
+    role: RegionValueRole,
+    descriptor: BufferDescriptor,
+    literal: ?[]const u8 = null,
+};
+
+pub const PlanRegion = struct {
+    id: RegionId,
+    parent_instruction_index: usize,
+    kind: RegionKind,
+    values: []const RegionValue = &.{},
+    argument_descriptors: []const BufferDescriptor = &.{},
+    instructions: []const RegionInstruction = &.{},
+    return_descriptors: []const BufferDescriptor = &.{},
+    terminator_operands: []const RegionValueId = &.{},
+    terminator_operand_descriptors: []const BufferDescriptor = &.{},
 };
 
 pub const PlanInstructionKind = enum {
@@ -256,8 +346,11 @@ pub const PlanInstructionKind = enum {
     dot_general,
     reduce_sum,
     reduce_max,
+    reduce_min,
     reduce_and,
     reduce_or,
+    reduce_window_sum,
+    reduce_window_max,
     compare,
     select,
     clamp,
@@ -268,6 +361,7 @@ pub const PlanInstructionKind = enum {
     fft,
     get_tuple_element,
     imag,
+    optimization_barrier,
     partition_id,
     real,
     reduce_precision,
@@ -280,10 +374,22 @@ pub const PlanInstructionKind = enum {
     unsupported,
 };
 
+pub const RegionInstruction = struct {
+    kind: PlanInstructionKind,
+    line: usize = 0,
+    column: usize = 0,
+    inputs: []const RegionValueId = &.{},
+    outputs: []const RegionValueId = &.{},
+    operand_descriptors: []const BufferDescriptor = &.{},
+    result_descriptors: []const BufferDescriptor = &.{},
+    compare_direction: ?CompareOp = null,
+};
+
 pub const PlanInstruction = struct {
     kind: PlanInstructionKind,
     inputs: []const ValueId = &.{},
     outputs: []const ValueId = &.{},
+    region_ids: []const RegionId = &.{},
     dims: ?[]const i64 = null,
     permutation: ?[]const i64 = null,
     broadcast_dimensions: ?[]const i64 = null,
@@ -294,6 +400,11 @@ pub const PlanInstruction = struct {
     edge_padding_low: ?[]const i64 = null,
     edge_padding_high: ?[]const i64 = null,
     interior_padding: ?[]const i64 = null,
+    window_dimensions: ?[]const i64 = null,
+    window_strides: ?[]const i64 = null,
+    base_dilations: ?[]const i64 = null,
+    window_dilations: ?[]const i64 = null,
+    window_reversal: ?[]const bool = null,
     offset_dims: ?[]const i64 = null,
     collapsed_slice_dims: ?[]const i64 = null,
     operand_batching_dims: ?[]const i64 = null,
@@ -309,15 +420,32 @@ pub const PlanInstruction = struct {
     dimension: ?i64 = null,
     top_k_k: ?i64 = null,
     iota_dimension: ?i64 = null,
+    fft_kind: ?FftKind = null,
     dimensions: ?[]const i64 = null,
     tuple_index: ?i64 = null,
     lower: ?bool = null,
+    triangular_left_side: ?bool = null,
+    triangular_lower: ?bool = null,
+    triangular_unit_diagonal: ?bool = null,
+    triangular_transpose: ?TriangularSolveTranspose = null,
     custom_call_target: ?[]const u8 = null,
+    rng_distribution: ?RngDistribution = null,
     reduce_dimensions: ?[]const i64 = null,
     lhs_batch_dimensions: ?[]const i64 = null,
     rhs_batch_dimensions: ?[]const i64 = null,
     lhs_contracting_dimensions: ?[]const i64 = null,
     rhs_contracting_dimensions: ?[]const i64 = null,
+    input_batch_dimension: ?i64 = null,
+    input_feature_dimension: ?i64 = null,
+    input_spatial_dimensions: ?[]const i64 = null,
+    kernel_input_feature_dimension: ?i64 = null,
+    kernel_output_feature_dimension: ?i64 = null,
+    kernel_spatial_dimensions: ?[]const i64 = null,
+    output_batch_dimension: ?i64 = null,
+    output_feature_dimension: ?i64 = null,
+    output_spatial_dimensions: ?[]const i64 = null,
+    feature_group_count: ?i64 = null,
+    batch_group_count: ?i64 = null,
     compare_direction: ?CompareOp = null,
     literal: ?[]const u8 = null,
 };
@@ -326,9 +454,12 @@ pub const ExecutablePlan = struct {
     allocator: std.mem.Allocator,
     options: CompileOptions,
     values: []Value = &.{},
+    regions: []PlanRegion = &.{},
     parameter_shardings: []ShardingPlan,
     output_shardings: []ShardingPlan,
     output_ids: []const ValueId = &.{},
+    donated_parameter_indices: []const u32 = &.{},
+    output_aliases: []const OutputAlias = &.{},
     instructions: []PlanInstruction,
 
     pub fn deinit(self: *ExecutablePlan) void {
@@ -344,6 +475,7 @@ pub const ExecutablePlan = struct {
         for (self.instructions) |instruction| {
             if (instruction.inputs.len != 0) self.allocator.free(instruction.inputs);
             if (instruction.outputs.len != 0) self.allocator.free(instruction.outputs);
+            if (instruction.region_ids.len != 0) self.allocator.free(instruction.region_ids);
             if (instruction.dims) |dims| self.allocator.free(dims);
             if (instruction.permutation) |permutation| self.allocator.free(permutation);
             if (instruction.broadcast_dimensions) |broadcast_dimensions| self.allocator.free(broadcast_dimensions);
@@ -354,6 +486,11 @@ pub const ExecutablePlan = struct {
             if (instruction.edge_padding_low) |padding| self.allocator.free(padding);
             if (instruction.edge_padding_high) |padding| self.allocator.free(padding);
             if (instruction.interior_padding) |padding| self.allocator.free(padding);
+            if (instruction.window_dimensions) |dims| self.allocator.free(dims);
+            if (instruction.window_strides) |dims| self.allocator.free(dims);
+            if (instruction.base_dilations) |dims| self.allocator.free(dims);
+            if (instruction.window_dilations) |dims| self.allocator.free(dims);
+            if (instruction.window_reversal) |dims| self.allocator.free(dims);
             if (instruction.offset_dims) |dims| self.allocator.free(dims);
             if (instruction.collapsed_slice_dims) |dims| self.allocator.free(dims);
             if (instruction.operand_batching_dims) |dims| self.allocator.free(dims);
@@ -371,15 +508,55 @@ pub const ExecutablePlan = struct {
             if (instruction.rhs_batch_dimensions) |dims| self.allocator.free(dims);
             if (instruction.lhs_contracting_dimensions) |dims| self.allocator.free(dims);
             if (instruction.rhs_contracting_dimensions) |dims| self.allocator.free(dims);
+            if (instruction.input_spatial_dimensions) |dims| self.allocator.free(dims);
+            if (instruction.kernel_spatial_dimensions) |dims| self.allocator.free(dims);
+            if (instruction.output_spatial_dimensions) |dims| self.allocator.free(dims);
             if (instruction.literal) |literal| self.allocator.free(literal);
         }
         for (self.values) |value| {
             if (value.descriptor.dims.len != 0) self.allocator.free(value.descriptor.dims);
+            if (value.elements.len != 0) self.allocator.free(value.elements);
+        }
+        for (self.regions) |region| {
+            for (region.values) |value| {
+                if (value.descriptor.dims.len != 0) self.allocator.free(value.descriptor.dims);
+                if (value.literal) |literal| self.allocator.free(literal);
+            }
+            for (region.argument_descriptors) |descriptor| {
+                if (descriptor.dims.len != 0) self.allocator.free(descriptor.dims);
+            }
+            for (region.instructions) |instruction| {
+                if (instruction.inputs.len != 0) self.allocator.free(instruction.inputs);
+                if (instruction.outputs.len != 0) self.allocator.free(instruction.outputs);
+                for (instruction.operand_descriptors) |descriptor| {
+                    if (descriptor.dims.len != 0) self.allocator.free(descriptor.dims);
+                }
+                for (instruction.result_descriptors) |descriptor| {
+                    if (descriptor.dims.len != 0) self.allocator.free(descriptor.dims);
+                }
+                if (instruction.operand_descriptors.len != 0) self.allocator.free(instruction.operand_descriptors);
+                if (instruction.result_descriptors.len != 0) self.allocator.free(instruction.result_descriptors);
+            }
+            for (region.return_descriptors) |descriptor| {
+                if (descriptor.dims.len != 0) self.allocator.free(descriptor.dims);
+            }
+            for (region.terminator_operand_descriptors) |descriptor| {
+                if (descriptor.dims.len != 0) self.allocator.free(descriptor.dims);
+            }
+            if (region.values.len != 0) self.allocator.free(region.values);
+            if (region.argument_descriptors.len != 0) self.allocator.free(region.argument_descriptors);
+            if (region.instructions.len != 0) self.allocator.free(region.instructions);
+            if (region.return_descriptors.len != 0) self.allocator.free(region.return_descriptors);
+            if (region.terminator_operands.len != 0) self.allocator.free(region.terminator_operands);
+            if (region.terminator_operand_descriptors.len != 0) self.allocator.free(region.terminator_operand_descriptors);
         }
         if (self.values.len != 0) self.allocator.free(self.values);
+        if (self.regions.len != 0) self.allocator.free(self.regions);
         self.allocator.free(self.parameter_shardings);
         self.allocator.free(self.output_shardings);
         self.allocator.free(self.output_ids);
+        if (self.donated_parameter_indices.len != 0) self.allocator.free(self.donated_parameter_indices);
+        if (self.output_aliases.len != 0) self.allocator.free(self.output_aliases);
         self.allocator.free(self.instructions);
     }
 };

@@ -1,0 +1,9 @@
+mlir_state_summary
+  state=fusion_planned
+  target name=npu_v0 kind=npu_v0 replicas=1 partitions=1 fingerprint=7c07b825000a0151
+  fusion_candidates count=2
+  candidate.0 kind=matmul_epilogue root=stablehlo.tanh operations=4 reason=dot+broadcast/add/tanh epilogue candidate decision=rejected plan=0 bytes_saved=72 launch_reduction=0 decision_reason=dot+broadcast/add/tanh is a legal epilogue candidate, but V0 rejects matmul epilogue fusion until kernel IR, math policy, and backend epilogue support are explicit
+  candidate.1 kind=elementwise_chain root=stablehlo.tanh operations=3 reason=broadcast/add/tanh strict elementwise chain decision=accepted plan=1 bytes_saved=48 launch_reduction=2 decision_reason=compatible broadcast/add/tanh chain preserves strict elementwise semantics and removes intermediate materialization pressure
+  fusion_plan count=2
+  fusion.0 decision=rejected kind=matmul_epilogue instructions=0,1,2,3 bytes_saved=72 launch_reduction=0 pressure=split_kernels:2,fused_kernels:1,split_peak:108,fused_live:188,additional_live:80,global_saved:72 reason=dot+broadcast/add/tanh is a legal epilogue candidate, but V0 rejects matmul epilogue fusion until kernel IR, math policy, and backend epilogue support are explicit
+  fusion.1 decision=accepted kind=elementwise_chain instructions=1,2,3 bytes_saved=48 launch_reduction=2 pressure=split_kernels:0,fused_kernels:0,split_peak:0,fused_live:0,additional_live:0,global_saved:0 reason=compatible broadcast/add/tanh chain preserves strict elementwise semantics and removes intermediate materialization pressure

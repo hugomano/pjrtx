@@ -1,0 +1,17 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+sh_test(
+    name = "boundary_test",
+    srcs = ["pjrtx_boundary_test.sh"],
+    data = [
+        "//pjrtx:architecture_boundary_inputs",
+        "//pjrtx/backend:boundary_files",
+        "//pjrtx/compiler/facts:boundary_files",
+        "//pjrtx/compiler:boundary_files",
+        "//pjrtx/core:boundary_files",
+        "//pjrtx/plugin:boundary_files",
+        "//pjrtx/runtime:boundary_files",
+        "//pjrtx/target:boundary_files",
+        "//pjrtx/tests/vertical_slice:boundary_files",
+    ],
+)

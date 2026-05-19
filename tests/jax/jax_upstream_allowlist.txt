@@ -1,0 +1,5 @@
+# Curated upstream JAX pytest node ids, relative to a local JAX checkout.
+# Keep this tiny and deliberate. Expand only after the local PjRTx-owned suite
+# covers the same StableHLO/PJRT semantics.
+#
+tests/lax_test.py::LazyConstantTest::testBroadcastInDim

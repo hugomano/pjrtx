@@ -1,0 +1,37 @@
+load("@rules_zig//zig:defs.bzl", "zig_library", "zig_test")
+
+filegroup(
+    name = "boundary_files",
+    srcs = glob(["*.zig"]) + ["BUILD.bazel"],
+    visibility = ["//pjrtx/tests/architecture:__pkg__"],
+)
+
+zig_library(
+    name = "runtime",
+    import_name = "pjrtx/runtime",
+    main = "runtime.zig",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pjrtx/compiler/facts",
+        "//pjrtx/core",
+        "//pjrtx/target",
+    ],
+)
+
+zig_library(
+    name = "mlir_bridge",
+    import_name = "pjrtx/runtime/mlir_bridge",
+    main = "mlir_bridge.zig",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":runtime",
+        "//pjrtx/compiler/facts",
+        "//pjrtx/compiler/mlir_state",
+        "//pjrtx/core",
+    ],
+)
+
+zig_test(
+    name = "unit_tests",
+    deps = [":runtime"],
+)

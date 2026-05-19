@@ -10,6 +10,14 @@ pub const ElementwiseBinaryOp = core.ElementwiseBinaryOp;
 pub const ElementwiseUnaryOp = core.ElementwiseUnaryOp;
 pub const CompareOp = core.CompareOp;
 
+const MachTimebaseInfo = extern struct {
+    numer: u32,
+    denom: u32,
+};
+
+extern "c" fn mach_absolute_time() u64;
+extern "c" fn mach_timebase_info(info: *MachTimebaseInfo) c_int;
+
 pub const Device = struct {
     id: i32,
     local_hardware_id: i32,
@@ -32,6 +40,13 @@ pub const Memory = struct {
     addressable_device_ids: []const i32,
     addressable_devices: []*Device,
     stats: MemoryStats = .{},
+
+    pub fn isAddressableBy(self: Memory, device: *const Device) bool {
+        for (self.addressable_device_ids) |device_id| {
+            if (device_id == device.id) return true;
+        }
+        return false;
+    }
 };
 
 pub const Topology = struct {
@@ -48,19 +63,43 @@ pub const MemoryStats = struct {
     capacity_bytes: u64 = 0,
     bytes_in_use: u64 = 0,
     peak_bytes_in_use: u64 = 0,
+    live_allocs: u64 = 0,
+    total_allocs: u64 = 0,
+    largest_alloc_size: u64 = 0,
     host_to_device_bytes: u64 = 0,
     device_to_host_bytes: u64 = 0,
     executable_cache_hits: u64 = 0,
     executable_cache_misses: u64 = 0,
+    executable_cache_evictions: u64 = 0,
+    executable_cache_resident_entries: u64 = 0,
+    executable_cache_resident_bytes: u64 = 0,
+    executable_cache_peak_resident_bytes: u64 = 0,
+    executable_cache_largest_resident_bytes: u64 = 0,
+    executable_cache_pressure_trims: u64 = 0,
+    executable_cache_pressure_trimmed_bytes: u64 = 0,
+    executable_cache_pressure_trim_failures: u64 = 0,
 
     pub fn retain(self: *MemoryStats, bytes: usize) void {
-        self.bytes_in_use +|= @as(u64, @intCast(bytes));
+        const amount: u64 = @intCast(bytes);
+        self.bytes_in_use +|= amount;
         self.peak_bytes_in_use = @max(self.peak_bytes_in_use, self.bytes_in_use);
+        self.live_allocs += 1;
+        self.total_allocs += 1;
+        self.largest_alloc_size = @max(self.largest_alloc_size, amount);
     }
 
     pub fn release(self: *MemoryStats, bytes: usize) void {
         const amount: u64 = @intCast(bytes);
         self.bytes_in_use = if (amount > self.bytes_in_use) 0 else self.bytes_in_use - amount;
+        if (self.live_allocs != 0) self.live_allocs -= 1;
+    }
+
+    pub fn totalBytesInUse(self: MemoryStats) u64 {
+        return self.bytes_in_use +| self.executable_cache_resident_bytes;
+    }
+
+    pub fn peakTotalBytesInUse(self: MemoryStats) u64 {
+        return @max(self.totalBytesInUse(), self.peak_bytes_in_use +| self.executable_cache_peak_resident_bytes);
     }
 };
 
@@ -70,9 +109,23 @@ pub const EventState = enum {
     failed,
 };
 
+pub const MAX_EVENT_CALLBACKS = 256;
+pub const EventCallback = *const fn (message: ?[]const u8, user_arg: ?*anyopaque) void;
+
+pub const EventCallbackRegistration = struct {
+    callback: EventCallback,
+    user_arg: ?*anyopaque = null,
+};
+
 pub const Event = struct {
     state: EventState = .ready,
     message: []const u8 = "",
+    callbacks: [MAX_EVENT_CALLBACKS]EventCallbackRegistration = undefined,
+    callback_count: usize = 0,
+
+    pub fn pending() Event {
+        return .{ .state = .pending };
+    }
 
     pub fn ready() Event {
         return .{ .state = .ready };
@@ -85,6 +138,83 @@ pub const Event = struct {
     pub fn isReady(self: Event) bool {
         return self.state != .pending;
     }
+
+    pub fn onReady(self: *Event, callback: EventCallback, user_arg: ?*anyopaque) !void {
+        if (self.state != .pending) {
+            callback(self.errorMessage(), user_arg);
+            return;
+        }
+        if (self.callback_count >= MAX_EVENT_CALLBACKS) return error.TooManyEventCallbacks;
+        self.callbacks[self.callback_count] = .{
+            .callback = callback,
+            .user_arg = user_arg,
+        };
+        self.callback_count += 1;
+    }
+
+    pub fn chainTo(self: *Event, dependent: *Event) !void {
+        try self.onReady(resolveChainedEvent, dependent);
+    }
+
+    pub fn setReady(self: *Event) void {
+        if (self.state != .pending) return;
+        self.state = .ready;
+        self.message = "";
+        self.invokeCallbacks();
+    }
+
+    pub fn setFailed(self: *Event, message: []const u8) void {
+        if (self.state != .pending) {
+            self.state = .failed;
+            self.message = message;
+            return;
+        }
+        self.state = .failed;
+        self.message = message;
+        self.invokeCallbacks();
+    }
+
+    pub fn awaitReady(self: Event) !void {
+        return switch (self.state) {
+            .ready => {},
+            .failed => error.EventFailed,
+            .pending => error.EventPending,
+        };
+    }
+
+    pub fn deinit(self: *Event) void {
+        if (self.state == .pending) {
+            self.state = .failed;
+            self.message = "event destroyed before completion";
+            self.invokeCallbacks();
+        }
+        self.* = undefined;
+    }
+
+    fn errorMessage(self: Event) ?[]const u8 {
+        return switch (self.state) {
+            .failed => self.message,
+            .pending, .ready => null,
+        };
+    }
+
+    fn invokeCallbacks(self: *Event) void {
+        const callback_count = self.callback_count;
+        self.callback_count = 0;
+        const message = self.errorMessage();
+        for (self.callbacks[0..callback_count]) |registration| {
+            registration.callback(message, registration.user_arg);
+        }
+    }
+
+    fn resolveChainedEvent(message: ?[]const u8, user_arg: ?*anyopaque) void {
+        const dependent: *Event = @ptrCast(@alignCast(user_arg.?));
+        if (message) |msg| {
+            dependent.setFailed(msg);
+        } else {
+            dependent.setReady();
+        }
+    }
 };
 
 pub const BufferState = enum {
@@ -93,37 +223,218 @@ pub const BufferState = enum {
     donated,
 };
 
+pub const DonationAliasStats = struct {
+    output_count: usize = 0,
+    output_bytes: usize = 0,
+};
+
+fn nowNs() u64 {
+    var info: MachTimebaseInfo = undefined;
+    if (mach_timebase_info(&info) != 0 or info.denom == 0) return mach_absolute_time();
+    const ticks: u128 = mach_absolute_time();
+    return @intCast((ticks * info.numer) / info.denom);
+}
+
+fn elapsedMicrosSince(start_ns: u64) u64 {
+    return (nowNs() -| start_ns) / std.time.ns_per_us;
+}
+
 pub const ExecutableCacheStats = struct {
     hits: u64 = 0,
     misses: u64 = 0,
+    evictions: u64 = 0,
+    evicted_resident_bytes: u64 = 0,
+    resident_entries: u64 = 0,
+    resident_bytes: u64 = 0,
+    peak_resident_bytes: u64 = 0,
+    largest_resident_bytes: u64 = 0,
+    compile_latency_samples: u64 = 0,
+    compile_latency_us_total: u64 = 0,
+    compile_latency_us_peak: u64 = 0,
+    pressure_trim_requests: u64 = 0,
+    pressure_trimmed_bytes: u64 = 0,
+    pressure_trim_failures: u64 = 0,
+};
+
+pub const ExecutableCacheEntry = struct {
+    fingerprint: []u8,
+    backend_executable: ?backend_api.ExecutableHandle = null,
+    resident_bytes: u64 = 0,
+    compile_latency_us: u64 = 0,
+    compile_latency_samples: u64 = 0,
+    ref_count: usize = 0,
+    last_use: u64 = 0,
+};
+
+pub const CachedBackendExecutable = struct {
+    entry: *ExecutableCacheEntry,
+    handle: backend_api.ExecutableHandle,
+    reused: bool,
+    compile_trim: ExecutableCacheTrim = .{},
+};
+
+pub const ExecutableCacheTrim = struct {
+    requested_bytes: u64 = 0,
+    target_resident_bytes: u64 = 0,
+    freed_bytes: u64 = 0,
+    evicted_entries: u64 = 0,
+    remaining_resident_bytes: u64 = 0,
+    still_over_capacity: bool = false,
 };
 
 pub const ExecutableCache = struct {
     allocator: std.mem.Allocator,
-    fingerprints: std.StringHashMapUnmanaged(void) = .empty,
+    entries: std.StringHashMapUnmanaged(*ExecutableCacheEntry) = .empty,
     stats: ExecutableCacheStats = .{},
+    max_resident_bytes: u64 = std.math.maxInt(u64),
+    next_use: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) ExecutableCache {
         return .{ .allocator = allocator };
     }
 
-    pub fn deinit(self: *ExecutableCache) void {
-        var it = self.fingerprints.keyIterator();
-        while (it.next()) |key| self.allocator.free(key.*);
-        self.fingerprints.deinit(self.allocator);
+    pub fn deinit(self: *ExecutableCache, backend: backend_api.Backend) void {
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (entry.backend_executable) |handle| backend.destroyExecutable(handle);
+            self.allocator.free(entry.fingerprint);
+            self.allocator.destroy(entry);
+        }
+        self.entries.deinit(self.allocator);
         self.* = undefined;
     }
 
     pub fn recordCompile(self: *ExecutableCache, fingerprint: []const u8) !bool {
-        if (self.fingerprints.contains(fingerprint)) {
+        if (self.entries.contains(fingerprint)) {
             self.stats.hits += 1;
             return true;
         }
-        const owned = try self.allocator.dupe(u8, fingerprint);
-        errdefer self.allocator.free(owned);
-        try self.fingerprints.put(self.allocator, owned, {});
+        const entry = try self.allocator.create(ExecutableCacheEntry);
+        errdefer self.allocator.destroy(entry);
+        entry.* = .{
+            .fingerprint = try self.allocator.dupe(u8, fingerprint),
+        };
+        errdefer self.allocator.free(entry.fingerprint);
+        try self.entries.put(self.allocator, entry.fingerprint, entry);
         self.stats.misses += 1;
         return false;
+    }
+
+    pub fn recordCompileLatency(self: *ExecutableCache, fingerprint: []const u8, latency_us: u64) void {
+        const entry = self.get(fingerprint) orelse return;
+        entry.compile_latency_us = latency_us;
+        entry.compile_latency_samples += 1;
+        self.stats.compile_latency_samples += 1;
+        self.stats.compile_latency_us_total +|= latency_us;
+        self.stats.compile_latency_us_peak = @max(self.stats.compile_latency_us_peak, latency_us);
+    }
+
+    pub fn setMaxResidentBytes(self: *ExecutableCache, backend: backend_api.Backend, max_resident_bytes: u64) void {
+        self.max_resident_bytes = max_resident_bytes;
+        self.evictIdleUntilUnderLimit(backend);
+    }
+
+    pub fn trimIdleToResidentBytes(self: *ExecutableCache, backend: backend_api.Backend, target_resident_bytes: u64) ExecutableCacheTrim {
+        const before_bytes = self.stats.resident_bytes;
+        const before_evictions = self.stats.evictions;
+        while (self.stats.resident_bytes > target_resident_bytes) {
+            const victim = self.pressureEvictionVictim() orelse break;
+            self.evictIdleEntry(backend, victim);
+        }
+        return .{
+            .target_resident_bytes = target_resident_bytes,
+            .freed_bytes = before_bytes - self.stats.resident_bytes,
+            .evicted_entries = self.stats.evictions - before_evictions,
+            .remaining_resident_bytes = self.stats.resident_bytes,
+            .still_over_capacity = self.stats.resident_bytes > target_resident_bytes,
+        };
+    }
+
+    pub fn acquireResident(
+        self: *ExecutableCache,
+        backend: backend_api.Backend,
+        entry: *ExecutableCacheEntry,
+        handle: backend_api.ExecutableHandle,
+        resident_bytes: u64,
+    ) void {
+        entry.backend_executable = handle;
+        entry.resident_bytes = resident_bytes;
+        entry.ref_count = 1;
+        self.touch(entry);
+        self.stats.resident_entries += 1;
+        self.stats.resident_bytes +|= resident_bytes;
+        self.stats.peak_resident_bytes = @max(self.stats.peak_resident_bytes, self.stats.resident_bytes);
+        self.stats.largest_resident_bytes = @max(self.stats.largest_resident_bytes, resident_bytes);
+        self.evictIdleUntilUnderLimit(backend);
+    }
+
+    pub fn retain(self: *ExecutableCache, entry: *ExecutableCacheEntry) void {
+        entry.ref_count += 1;
+        self.touch(entry);
+    }
+
+    pub fn release(self: *ExecutableCache, backend: backend_api.Backend, entry: *ExecutableCacheEntry) void {
+        if (entry.ref_count != 0) entry.ref_count -= 1;
+        self.touch(entry);
+        self.evictIdleUntilUnderLimit(backend);
+    }
+
+    fn get(self: *ExecutableCache, fingerprint: []const u8) ?*ExecutableCacheEntry {
+        return self.entries.get(fingerprint);
+    }
+
+    fn touch(self: *ExecutableCache, entry: *ExecutableCacheEntry) void {
+        self.next_use +|= 1;
+        entry.last_use = self.next_use;
+    }
+
+    fn evictIdleUntilUnderLimit(self: *ExecutableCache, backend: backend_api.Backend) void {
+        while (self.stats.resident_bytes > self.max_resident_bytes) {
+            const victim = self.pressureEvictionVictim() orelse return;
+            self.evictIdleEntry(backend, victim);
+        }
+    }
+
+    fn pressureEvictionVictim(self: *ExecutableCache) ?*ExecutableCacheEntry {
+        var victim: ?*ExecutableCacheEntry = null;
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (entry.backend_executable == null or entry.ref_count != 0) continue;
+            const current_victim = victim orelse {
+                victim = entry;
+                continue;
+            };
+            if (entry.resident_bytes > current_victim.resident_bytes) {
+                victim = entry;
+                continue;
+            }
+            if (entry.resident_bytes == current_victim.resident_bytes and entry.compile_latency_us < current_victim.compile_latency_us) {
+                victim = entry;
+                continue;
+            }
+            if (entry.resident_bytes == current_victim.resident_bytes and entry.compile_latency_us == current_victim.compile_latency_us and entry.last_use < current_victim.last_use) {
+                victim = entry;
+                continue;
+            }
+            if (entry.resident_bytes == current_victim.resident_bytes and entry.compile_latency_us == current_victim.compile_latency_us and entry.last_use == current_victim.last_use and std.mem.lessThan(u8, entry.fingerprint, current_victim.fingerprint)) {
+                victim = entry;
+            }
+        }
+        return victim;
+    }
+
+    fn evictIdleEntry(self: *ExecutableCache, backend: backend_api.Backend, entry: *ExecutableCacheEntry) void {
+        const handle = entry.backend_executable orelse return;
+        if (entry.ref_count != 0) return;
+        backend.destroyExecutable(handle);
+        entry.backend_executable = null;
+        self.stats.evicted_resident_bytes +|= entry.resident_bytes;
+        self.stats.resident_bytes = if (entry.resident_bytes > self.stats.resident_bytes) 0 else self.stats.resident_bytes - entry.resident_bytes;
+        entry.resident_bytes = 0;
+        if (self.stats.resident_entries != 0) self.stats.resident_entries -= 1;
+        self.stats.evictions += 1;
     }
 };
 
@@ -137,6 +448,7 @@ pub const Client = struct {
     memory_handles: []*Memory,
     topology: Topology,
     executable_cache: ExecutableCache,
+    executable_cache_mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(allocator: std.mem.Allocator, backend_impl: backend_api.Backend, device_count: usize) !*Client {
         if (device_count == 0 or device_count > MAX_DEVICES) return error.InvalidDeviceCount;
@@ -232,7 +544,7 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
-        self.executable_cache.deinit();
+        self.executable_cache.deinit(self.backend);
         for (self.devices) |device| {
             self.allocator.free(device.addressable_memories);
             self.allocator.free(device.name);
@@ -266,11 +578,163 @@ pub const Client = struct {
     }
 
     pub fn recordExecutableCompile(self: *Client, fingerprint: []const u8) !bool {
+        lockExecutableCache(self);
+        defer self.executable_cache_mutex.unlock();
         const hit = try self.executable_cache.recordCompile(fingerprint);
-        for (self.memories) |*memory| {
-            if (hit) memory.stats.executable_cache_hits += 1 else memory.stats.executable_cache_misses += 1;
-        }
+        self.syncExecutableCacheMemoryStats();
         return hit;
+    }
+
+    pub fn setExecutableCacheMaxResidentBytes(self: *Client, max_resident_bytes: u64) void {
+        lockExecutableCache(self);
+        defer self.executable_cache_mutex.unlock();
+        self.executable_cache.setMaxResidentBytes(self.backend, max_resident_bytes);
+        self.syncExecutableCacheMemoryStats();
+    }
+
+    fn lockExecutableCache(self: *Client) void {
+        while (!self.executable_cache_mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn syncExecutableCacheMemoryStats(self: *Client) void {
+        for (self.memories) |*memory| {
+            memory.stats.executable_cache_hits = self.executable_cache.stats.hits;
+            memory.stats.executable_cache_misses = self.executable_cache.stats.misses;
+            memory.stats.executable_cache_evictions = self.executable_cache.stats.evictions;
+            memory.stats.executable_cache_resident_entries = self.executable_cache.stats.resident_entries;
+            memory.stats.executable_cache_resident_bytes = self.executable_cache.stats.resident_bytes;
+            memory.stats.executable_cache_peak_resident_bytes = self.executable_cache.stats.peak_resident_bytes;
+            memory.stats.executable_cache_largest_resident_bytes = self.executable_cache.stats.largest_resident_bytes;
+            memory.stats.executable_cache_pressure_trims = self.executable_cache.stats.pressure_trim_requests;
+            memory.stats.executable_cache_pressure_trimmed_bytes = self.executable_cache.stats.pressure_trimmed_bytes;
+            memory.stats.executable_cache_pressure_trim_failures = self.executable_cache.stats.pressure_trim_failures;
+        }
+    }
+
+    pub fn trimExecutableCacheForAllocation(self: *Client, memory: *Memory, allocation_bytes: usize) ExecutableCacheTrim {
+        lockExecutableCache(self);
+        defer self.executable_cache_mutex.unlock();
+        if (memory.stats.capacity_bytes == 0) return .{};
+
+        const allocation: u64 = @intCast(allocation_bytes);
+        const bytes_without_cache = memory.stats.bytes_in_use +| allocation;
+        const resident_bytes = self.executable_cache.stats.resident_bytes;
+        if (bytes_without_cache +| resident_bytes <= memory.stats.capacity_bytes) return .{
+            .requested_bytes = allocation,
+            .target_resident_bytes = resident_bytes,
+            .remaining_resident_bytes = resident_bytes,
+        };
+
+        const target_resident_bytes = if (bytes_without_cache >= memory.stats.capacity_bytes)
+            0
+        else
+            memory.stats.capacity_bytes - bytes_without_cache;
+        var trim = self.executable_cache.trimIdleToResidentBytes(self.backend, target_resident_bytes);
+        trim.requested_bytes = allocation;
+        trim.still_over_capacity = bytes_without_cache +| trim.remaining_resident_bytes > memory.stats.capacity_bytes;
+
+        self.executable_cache.stats.pressure_trim_requests += 1;
+        self.executable_cache.stats.pressure_trimmed_bytes +|= trim.freed_bytes;
+        if (trim.still_over_capacity) self.executable_cache.stats.pressure_trim_failures += 1;
+        self.syncExecutableCacheMemoryStats();
+        return trim;
+    }
+
+    fn executableResidencyMemory(self: *Client, device_local_hardware_ids: []const i32) ?*Memory {
+        if (device_local_hardware_ids.len != 0) {
+            const first_local_hardware_id = device_local_hardware_ids[0];
+            for (self.devices) |*device| {
+                if (device.local_hardware_id == first_local_hardware_id) return device.default_memory;
+            }
+        }
+        if (self.memories.len == 0) return null;
+        return &self.memories[0];
+    }
+
+    pub fn acquireCachedBackendExecutable(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        fingerprint: []const u8,
+        plan: *const core.ExecutablePlan,
+        device_local_hardware_ids: []const i32,
+    ) !?CachedBackendExecutable {
+        const entry = blk: {
+            lockExecutableCache(self);
+            defer self.executable_cache_mutex.unlock();
+            const entry = self.executable_cache.get(fingerprint) orelse return null;
+            if (entry.backend_executable) |handle| {
+                self.executable_cache.retain(entry);
+                self.syncExecutableCacheMemoryStats();
+                return .{
+                    .entry = entry,
+                    .handle = handle,
+                    .reused = true,
+                };
+            }
+            break :blk entry;
+        };
+
+        // Backend compilation can be expensive and may perform allocations that
+        // trim the executable cache, so it intentionally happens outside the
+        // cache mutex. The entry pointer remains stable until client teardown.
+        {
+            lockExecutableCache(self);
+            defer self.executable_cache_mutex.unlock();
+            if (entry.backend_executable) |handle| {
+                self.executable_cache.retain(entry);
+                self.syncExecutableCacheMemoryStats();
+                return .{
+                    .entry = entry,
+                    .handle = handle,
+                    .reused = true,
+                };
+            }
+        }
+
+        const compile_start_ns = nowNs();
+        const handle = self.backend.compileExecutable(allocator, plan, device_local_hardware_ids) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        const compile_latency_us = elapsedMicrosSince(compile_start_ns);
+        const owned_handle = handle orelse return null;
+        const stats = self.backend.executableStats(owned_handle);
+        const resident_constant_bytes: usize = @intCast(stats.resident_constant_bytes);
+        var compile_trim = ExecutableCacheTrim{};
+        if (resident_constant_bytes != 0) {
+            if (self.executableResidencyMemory(device_local_hardware_ids)) |memory| {
+                compile_trim = self.trimExecutableCacheForAllocation(memory, resident_constant_bytes);
+            }
+        }
+        lockExecutableCache(self);
+        defer self.executable_cache_mutex.unlock();
+        if (entry.backend_executable) |existing| {
+            self.backend.destroyExecutable(owned_handle);
+            self.executable_cache.retain(entry);
+            self.syncExecutableCacheMemoryStats();
+            return .{
+                .entry = entry,
+                .handle = existing,
+                .reused = true,
+                .compile_trim = compile_trim,
+            };
+        }
+        self.executable_cache.acquireResident(self.backend, entry, owned_handle, resident_constant_bytes);
+        self.executable_cache.recordCompileLatency(fingerprint, compile_latency_us);
+        self.syncExecutableCacheMemoryStats();
+        return .{
+            .entry = entry,
+            .handle = owned_handle,
+            .reused = false,
+            .compile_trim = compile_trim,
+        };
+    }
+
+    pub fn releaseCachedBackendExecutable(self: *Client, entry: *ExecutableCacheEntry) void {
+        lockExecutableCache(self);
+        defer self.executable_cache_mutex.unlock();
+        self.executable_cache.release(self.backend, entry);
+        self.syncExecutableCacheMemoryStats();
     }
 };
 
@@ -291,21 +755,20 @@ pub const GraphNode = struct {
     kind: GraphNodeKind,
 };
 
-pub const LoweringMode = enum {
-    allow_runtime_fallback,
-    require_backend_executable,
+pub const GraphExecuteResult = struct {
+    outputs: []*Buffer,
+    completion_event: Event = Event.ready(),
 };
 
 pub const LoweringOptions = struct {
-    mode: LoweringMode = .allow_runtime_fallback,
     diagnostic_writer: ?*std.Io.Writer = null,
+    cache_fingerprint: ?[]const u8 = null,
 };
 
 pub const LoweringPipeline = struct {
-    mode: LoweringMode,
     backend_executable_ready: bool,
+    backend_executable_cache_reused: bool = false,
     lowered_instruction_count: usize,
-    fallback_instruction_count: usize,
 };
 
 pub const ExecutableGraph = struct {
@@ -315,7 +778,13 @@ pub const ExecutableGraph = struct {
     device_local_hardware_ids: []i32,
     nodes: []GraphNode,
     backend_executable: ?backend_api.ExecutableHandle = null,
+    backend_executable_cache_entry: ?*ExecutableCacheEntry = null,
+    backend_executable_cache_owner: ?*Client = null,
     lowering: LoweringPipeline,
+    last_compile_cache_trim: ExecutableCacheTrim = .{},
+    last_execute_cache_trim: ExecutableCacheTrim = .{},
+    last_backend_completion: backend_api.ExecutionCompletion = .{},
+    donation_alias_stats: DonationAliasStats = .{},
 
     pub fn init(allocator: std.mem.Allocator, client: *const Client, plan: *const core.ExecutablePlan) !ExecutableGraph {
         return initWithOptions(allocator, client, plan, .{});
@@ -355,18 +824,34 @@ pub const ExecutableGraph = struct {
             }
         }
 
-        const backend_executable = client.backend.compileExecutable(allocator, plan, device_local_hardware_ids) catch |err| switch (err) {
+        var backend_executable_cache_entry: ?*ExecutableCacheEntry = null;
+        var backend_executable_cache_owner: ?*Client = null;
+        var backend_executable_cache_reused = false;
+        var last_compile_cache_trim = ExecutableCacheTrim{};
+        const backend_executable = if (options.cache_fingerprint) |fingerprint| blk: {
+            const mutable_client = @constCast(client);
+            const cached = try mutable_client.acquireCachedBackendExecutable(allocator, fingerprint, plan, device_local_hardware_ids);
+            if (cached) |entry| {
+                backend_executable_cache_entry = entry.entry;
+                backend_executable_cache_owner = mutable_client;
+                backend_executable_cache_reused = entry.reused;
+                last_compile_cache_trim = entry.compile_trim;
+                break :blk entry.handle;
+            }
+            break :blk null;
+        } else client.backend.compileExecutable(allocator, plan, device_local_hardware_ids) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => null,
         };
-        errdefer if (backend_executable) |handle| client.backend.destroyExecutable(handle);
-        if (backend_executable == null and options.mode == .require_backend_executable) {
+        errdefer if (backend_executable) |handle| {
+            if (backend_executable_cache_entry) |entry| @constCast(client).releaseCachedBackendExecutable(entry) else client.backend.destroyExecutable(handle);
+        };
+        if (backend_executable == null) {
             if (options.diagnostic_writer) |writer| {
                 client.backend.writeExecutableLoweringDiagnostic(plan, device_local_hardware_ids, writer) catch {};
             }
             return error.UnsupportedRuntimeFeature;
         }
-        const backend_ready = backend_executable != null;
 
         return .{
             .allocator = allocator,
@@ -375,114 +860,137 @@ pub const ExecutableGraph = struct {
             .device_local_hardware_ids = device_local_hardware_ids,
             .nodes = nodes,
             .backend_executable = backend_executable,
+            .backend_executable_cache_entry = backend_executable_cache_entry,
+            .backend_executable_cache_owner = backend_executable_cache_owner,
             .lowering = .{
-                .mode = options.mode,
-                .backend_executable_ready = backend_ready,
-                .lowered_instruction_count = if (backend_ready) plan.instructions.len else 0,
-                .fallback_instruction_count = if (backend_ready) 0 else plan.instructions.len,
+                .backend_executable_ready = true,
+                .backend_executable_cache_reused = backend_executable_cache_reused,
+                .lowered_instruction_count = plan.instructions.len,
             },
+            .last_compile_cache_trim = last_compile_cache_trim,
         };
     }
 
     pub fn deinit(self: *ExecutableGraph) void {
-        if (self.backend_executable) |handle| self.backend.destroyExecutable(handle);
+        if (self.backend_executable) |handle| {
+            if (self.backend_executable_cache_entry) |entry| {
+                if (self.backend_executable_cache_owner) |client| {
+                    client.releaseCachedBackendExecutable(entry);
+                } else if (entry.ref_count != 0) {
+                    entry.ref_count -= 1;
+                }
+            } else {
+                self.backend.destroyExecutable(handle);
+            }
+        }
         self.allocator.free(self.device_local_hardware_ids);
         self.allocator.free(self.nodes);
         self.allocator.free(self.device_ids);
         self.* = undefined;
     }
 
+    pub fn backendExecutableStats(self: *const ExecutableGraph) ?backend_api.ExecutableStats {
+        const handle = self.backend_executable orelse return null;
+        var stats = self.backend.executableStats(handle);
+        stats.donation_alias_output_count += self.donation_alias_stats.output_count;
+        stats.donation_alias_output_bytes += self.donation_alias_stats.output_bytes;
+        return stats;
+    }
+
     pub fn executeDevice(
-        self: *const ExecutableGraph,
+        self: *ExecutableGraph,
         allocator: std.mem.Allocator,
         client: *Client,
         plan: *const core.ExecutablePlan,
         device_index: usize,
         arguments: []const *Buffer,
-    ) GraphExecuteError![]*Buffer {
+    ) GraphExecuteError!GraphExecuteResult {
         if (device_index >= self.device_ids.len or device_index >= client.devices.len) return error.InvalidArgument;
-        if (plan.instructions.len == 0) return error.UnsupportedRuntimeFeature;
-        if (arguments.len < plan.parameter_shardings.len) return error.InvalidArgument;
-        for (arguments) |argument| argument.ensureUsable() catch |err| return mapBufferError(err);
-        if (self.tryExecuteBackendExecutable(allocator, client, device_index, arguments) catch |err| return err) |outputs| {
-            return outputs;
+        if (arguments.len != plan.parameter_shardings.len) return error.InvalidArgument;
+        for (arguments) |argument| {
+            argument.ensureUsable() catch |err| return mapBufferError(err);
+            argument.ensureReady() catch |err| return mapBufferError(err);
+            if (!self.argumentMatchesDevice(device_index, argument)) return error.InvalidArgument;
         }
-        if (self.lowering.mode == .require_backend_executable) return error.UnsupportedRuntimeFeature;
-
-        var value_buffers = try allocator.alloc(?*Buffer, plan.values.len);
-        defer allocator.free(value_buffers);
-        @memset(value_buffers, null);
-
-        var value_owned = try allocator.alloc(bool, plan.values.len);
-        defer allocator.free(value_owned);
-        @memset(value_owned, false);
-        defer destroyExecuteValues(value_buffers, value_owned);
-
-        var parameter_index: usize = 0;
-        for (plan.values) |value| {
-            if (value.role != .parameter) continue;
-            if (parameter_index >= arguments.len) return error.InvalidArgument;
-            if (value.id.index >= value_buffers.len) return error.InvalidArgument;
-            value_buffers[value.id.index] = arguments[parameter_index];
-            parameter_index += 1;
+        if (self.tryExecuteBackendExecutable(allocator, client, plan, device_index, arguments) catch |err| return err) |result| {
+            return result;
         }
+        return error.UnsupportedRuntimeFeature;
+    }
 
-        for (plan.instructions) |instruction| {
-            try self.executeInstruction(allocator, client, plan, instruction, value_buffers, value_owned, device_index);
-        }
-
-        const outputs = try allocator.alloc(*Buffer, plan.output_ids.len);
-        errdefer allocator.free(outputs);
-        var initialized_outputs: usize = 0;
-        errdefer {
-            for (outputs[0..initialized_outputs]) |buffer| buffer.deinit();
-        }
-
-        for (plan.output_ids, 0..) |output_id, output_index| {
-            if (output_id.index >= value_buffers.len) return error.Internal;
-            const output_buffer = value_buffers[output_id.index] orelse return error.Internal;
-            if (value_owned[output_id.index]) {
-                outputs[output_index] = output_buffer;
-                value_owned[output_id.index] = false;
-            } else {
-                outputs[output_index] = Buffer.initDeviceCopy(allocator, output_buffer, device_index) catch |err| return mapBufferError(err);
-            }
-            initialized_outputs += 1;
-        }
-
-        return outputs;
+    fn argumentMatchesDevice(self: *const ExecutableGraph, device_index: usize, argument: *const Buffer) bool {
+        if (device_index >= self.device_ids.len) return false;
+        if (argument.device_id != self.device_ids[device_index]) return false;
+        if (argument.shard_index != device_index) return false;
+        return true;
     }
 
     fn tryExecuteBackendExecutable(
-        self: *const ExecutableGraph,
+        self: *ExecutableGraph,
         allocator: std.mem.Allocator,
         client: *Client,
+        plan: *const core.ExecutablePlan,
         device_index: usize,
         arguments: []const *Buffer,
-    ) GraphExecuteError!?[]*Buffer {
+    ) GraphExecuteError!?GraphExecuteResult {
         const backend_executable = self.backend_executable orelse return null;
         var argument_handles = try allocator.alloc(backend_api.BufferHandle, arguments.len);
         defer allocator.free(argument_handles);
         for (arguments, 0..) |argument, i| {
             argument.ensureUsable() catch |err| return mapBufferError(err);
+            argument.ensureReady() catch |err| return mapBufferError(err);
             argument_handles[i] = argument.backend_buffer orelse return null;
         }
 
-        const backend_outputs = client.backend.executeExecutable(allocator, backend_executable, device_index, argument_handles) catch |err| return mapBufferError(err);
-        const owned_backend_outputs = backend_outputs orelse return null;
+        const device = &client.devices[device_index];
+        const memory = device.default_memory;
+        self.last_execute_cache_trim = client.trimExecutableCacheForAllocation(memory, planOutputBytes(plan) catch return error.Internal);
+
+        const backend_result = client.backend.executeExecutable(allocator, backend_executable, device_index, argument_handles) catch |err| return mapBufferError(err);
+        const owned_backend_result = backend_result orelse return null;
+        const owned_backend_outputs = owned_backend_result.outputs;
+        self.last_backend_completion = owned_backend_result.completion;
+        const completion_event = runtimeEventFromBackendCompletion(client.backend, owned_backend_result.completion);
         defer allocator.free(owned_backend_outputs);
+
+        var wrapped_backend_outputs: usize = 0;
+        errdefer {
+            for (owned_backend_outputs[wrapped_backend_outputs..]) |output| client.backend.destroyBuffer(output.handle);
+        }
+
+        if (owned_backend_outputs.len != plan.output_ids.len) return error.Internal;
+        for (owned_backend_outputs, 0..) |output, output_index| {
+            if (!backendOutputMatchesPlan(plan, output_index, output)) return error.Internal;
+        }
 
         const outputs = try allocator.alloc(*Buffer, owned_backend_outputs.len);
         errdefer allocator.free(outputs);
         var initialized: usize = 0;
         errdefer {
             for (outputs[0..initialized]) |buffer| buffer.deinit();
-            for (owned_backend_outputs[initialized..]) |output| client.backend.destroyBuffer(output.handle);
         }
 
-        const device = &client.devices[device_index];
-        const memory = device.default_memory;
+        var donation_alias_delta: DonationAliasStats = .{};
+        errdefer self.donation_alias_stats.output_count -|= donation_alias_delta.output_count;
+        errdefer self.donation_alias_stats.output_bytes -|= donation_alias_delta.output_bytes;
+
         for (owned_backend_outputs, 0..) |output, i| {
+            const alias = donatedParameterAliasForOutput(plan, i);
+            const backend_handle = if (alias) |alias_info| blk: {
+                if (alias_info.parameter_index >= arguments.len) return error.Internal;
+                const donated_argument = arguments[alias_info.parameter_index];
+                if (donated_argument.element_type != output.element_type or !std.mem.eql(i64, donated_argument.dims, output.dims)) return error.Internal;
+                const donated_handle = donated_argument.backend_buffer orelse return error.Internal;
+                if (alias_info.kind == .donation and output.handle != donated_handle) break :blk output.handle;
+                if (output.handle != donated_handle) client.backend.destroyBuffer(output.handle);
+                const transferred = donated_argument.takeBackendStorageForDonationAlias() catch |err| return mapBufferError(err);
+                donation_alias_delta.output_count += 1;
+                donation_alias_delta.output_bytes += output.byte_size;
+                self.donation_alias_stats.output_count += 1;
+                self.donation_alias_stats.output_bytes += output.byte_size;
+                break :blk transferred;
+            } else output.handle;
+
             outputs[i] = Buffer.initBackendHandle(
                 allocator,
                 client.backend,
@@ -492,258 +1000,88 @@ pub const ExecutableGraph = struct {
                 memory,
                 device_index,
                 output.byte_size,
-                output.handle,
+                backend_handle,
             ) catch |err| {
+                if (alias != null) client.backend.destroyBuffer(backend_handle);
                 return mapBufferError(err);
             };
             initialized += 1;
+            wrapped_backend_outputs = initialized;
         }
-        return outputs;
-    }
-
-    fn executeInstruction(
-        self: *const ExecutableGraph,
-        allocator: std.mem.Allocator,
-        client: *Client,
-        plan: *const core.ExecutablePlan,
-        instruction: core.PlanInstruction,
-        value_buffers: []?*Buffer,
-        value_owned: []bool,
-        device_index: usize,
-    ) GraphExecuteError!void {
-        _ = self;
-        if (instruction.kind == .rng_bit_generator) {
-            if (instruction.inputs.len < 1 or instruction.outputs.len != 2) return error.InvalidArgument;
-            const state_input = value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument;
-            const state_output = Buffer.initRngStateUpdate(allocator, state_input, device_index) catch |err| return mapBufferError(err);
-            errdefer state_output.deinit();
-            const bits_descriptor = plan.values[instruction.outputs[1].index].descriptor;
-            const bits_output = Buffer.initRngBits(
-                allocator,
-                state_input,
-                bits_descriptor.element_type,
-                instruction.dims orelse bits_descriptor.dims,
-                device_index,
-            ) catch |err| return mapBufferError(err);
-            value_buffers[instruction.outputs[0].index] = state_output;
-            value_owned[instruction.outputs[0].index] = true;
-            value_buffers[instruction.outputs[1].index] = bits_output;
-            value_owned[instruction.outputs[1].index] = true;
-            return;
-        }
-
-        if (instruction.outputs.len != 1) return error.InvalidArgument;
-        const output_id = instruction.outputs[0];
-        if (output_id.index >= value_buffers.len) return error.InvalidArgument;
-
-        const next = switch (instruction.kind) {
-            .constant => blk: {
-                const descriptor = plan.values[output_id.index].descriptor;
-                const device = &client.devices[device_index];
-                break :blk Buffer.initHostCopyForBackend(
-                    allocator,
-                    client.backend,
-                    descriptor.element_type,
-                    descriptor.dims,
-                    device,
-                    device.default_memory,
-                    device_index,
-                    instruction.literal orelse &.{},
-                ) catch |err| return mapBufferError(err);
-            },
-            .copy_arg0, .reduce_precision => Buffer.initDeviceCopy(allocator, value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument, device_index) catch |err| return mapBufferError(err),
-            .partition_id => blk: {
-                const descriptor = plan.values[output_id.index].descriptor;
-                const device = &client.devices[device_index];
-                break :blk Buffer.initPartitionId(
-                    allocator,
-                    client.backend,
-                    descriptor.element_type,
-                    descriptor.dims,
-                    device,
-                    device.default_memory,
-                    @intCast(device_index),
-                    device_index,
-                ) catch |err| return mapBufferError(err);
-            },
-            .cholesky => Buffer.initCholesky(
-                allocator,
-                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
-                instruction.lower orelse true,
-                instruction.dims orelse plan.values[output_id.index].descriptor.dims,
-                device_index,
-            ) catch |err| return mapBufferError(err),
-            .rng => Buffer.initRngUniform(
-                allocator,
-                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
-                value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
-                plan.values[output_id.index].descriptor.element_type,
-                instruction.dims orelse plan.values[output_id.index].descriptor.dims,
-                device_index,
-            ) catch |err| return mapBufferError(err),
-            .add, .subtract, .multiply, .divide, .maximum, .minimum, .power, .atan2, .remainder, .and_, .or_, .xor, .shift_left, .shift_right_arithmetic, .shift_right_logical => Buffer.initElementwiseBinary(
-                allocator,
-                runtimeBinaryOp(instruction.kind) orelse return error.UnsupportedRuntimeFeature,
-                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
-                value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
-                device_index,
-            ) catch |err| return mapBufferError(err),
-            .negate, .exp, .expm1, .tanh, .sqrt, .rsqrt, .abs, .cbrt, .ceil, .floor, .log, .log1p, .logistic, .sine, .cosine, .not_, .sign, .is_finite, .round_nearest_afz, .round_nearest_even, .popcnt, .count_leading_zeros => Buffer.initElementwiseUnaryTyped(
-                allocator,
-                runtimeUnaryOp(instruction.kind) orelse return error.UnsupportedRuntimeFeature,
-                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
-                plan.values[output_id.index].descriptor.element_type,
-                instruction.dims orelse plan.values[output_id.index].descriptor.dims,
-                device_index,
-            ) catch |err| return mapBufferError(err),
-            .convert => Buffer.initConvert(
-                allocator,
-                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
-                plan.values[output_id.index].descriptor.element_type,
-                instruction.dims orelse plan.values[output_id.index].descriptor.dims,
-                device_index,
-            ) catch |err| return mapBufferError(err),
-            .bitcast_convert => return error.UnsupportedRuntimeFeature,
-            .iota => blk: {
-                const descriptor = plan.values[output_id.index].descriptor;
-                const device = &client.devices[device_index];
-                break :blk Buffer.initIota(
-                    allocator,
-                    client.backend,
-                    descriptor.element_type,
-                    instruction.dims orelse descriptor.dims,
-                    device,
-                    device.default_memory,
-                    instruction.iota_dimension orelse 0,
-                    device_index,
-                ) catch |err| return mapBufferError(err);
-            },
-            .reshape => Buffer.initReshape(allocator, value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument, instruction.dims orelse &.{}, device_index) catch |err| return mapBufferError(err),
-            .transpose => Buffer.initTranspose(allocator, value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument, instruction.permutation orelse &.{}, instruction.dims orelse &.{}, device_index) catch |err| return mapBufferError(err),
-            .broadcast_in_dim => Buffer.initBroadcastInDim(allocator, value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument, instruction.broadcast_dimensions orelse &.{}, instruction.dims orelse &.{}, device_index) catch |err| return mapBufferError(err),
-            .slice => Buffer.initSlice(
-                allocator,
-                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
-                instruction.start_indices orelse &.{},
-                instruction.limit_indices orelse &.{},
-                instruction.strides orelse &.{},
-                instruction.dims orelse &.{},
-                device_index,
-            ) catch |err| return mapBufferError(err),
-            .dynamic_slice => blk: {
-                const starts = try allocator.alloc(*Buffer, instruction.inputs.len - 1);
-                defer allocator.free(starts);
-                for (instruction.inputs[1..], 0..) |input_id, i| starts[i] = value_buffers[input_id.index] orelse return error.InvalidArgument;
-                break :blk Buffer.initDynamicSlice(
-                    allocator,
-                    value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
-                    starts,
-                    instruction.slice_sizes orelse &.{},
-                    instruction.dims orelse &.{},
-                    device_index,
-                ) catch |err| return mapBufferError(err);
-            },
-            .dynamic_update_slice => blk: {
-                const starts = try allocator.alloc(*Buffer, instruction.inputs.len - 2);
-                defer allocator.free(starts);
-                for (instruction.inputs[2..], 0..) |input_id, i| starts[i] = value_buffers[input_id.index] orelse return error.InvalidArgument;
-                break :blk Buffer.initDynamicUpdateSlice(
-                    allocator,
-                    value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
-                    value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
-                    starts,
-                    instruction.dims orelse &.{},
-                    device_index,
-                ) catch |err| return mapBufferError(err);
-            },
-            .pad => Buffer.initPad(
-                allocator,
-                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
-                value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
-                instruction.edge_padding_low orelse &.{},
-                instruction.edge_padding_high orelse &.{},
-                instruction.interior_padding orelse &.{},
-                instruction.dims orelse &.{},
-                device_index,
-            ) catch |err| return mapBufferError(err),
-            .reverse => Buffer.initReverse(allocator, value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument, instruction.dimensions orelse &.{}, instruction.dims orelse &.{}, device_index) catch |err| return mapBufferError(err),
-            .concatenate => Buffer.initConcatenate(
-                allocator,
-                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
-                value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
-                instruction.dimension orelse 0,
-                instruction.dims orelse &.{},
-                device_index,
-            ) catch |err| return mapBufferError(err),
-            .dot_general => Buffer.initDotGeneral(
-                allocator,
-                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
-                value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
-                instruction.lhs_batch_dimensions orelse &.{},
-                instruction.rhs_batch_dimensions orelse &.{},
-                instruction.lhs_contracting_dimensions orelse &.{},
-                instruction.rhs_contracting_dimensions orelse &.{},
-                instruction.dims orelse &.{},
-                device_index,
-            ) catch |err| return mapBufferError(err),
-            .reduce_sum, .reduce_max, .reduce_and, .reduce_or => Buffer.initReduce(allocator, instruction.kind, value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument, instruction.reduce_dimensions orelse &.{}, instruction.dims orelse &.{}, device_index) catch |err| return mapBufferError(err),
-            .gather => Buffer.initGather(
-                allocator,
-                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
-                value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
-                instruction.offset_dims orelse &.{},
-                instruction.collapsed_slice_dims orelse &.{},
-                instruction.operand_batching_dims orelse &.{},
-                instruction.start_indices_batching_dims orelse &.{},
-                instruction.start_index_map orelse &.{},
-                instruction.index_vector_dim orelse 0,
-                instruction.slice_sizes orelse &.{},
-                instruction.dims orelse &.{},
-                device_index,
-            ) catch |err| return mapBufferError(err),
-            .sort => Buffer.initSort(
-                allocator,
-                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
-                instruction.dimension orelse return error.InvalidArgument,
-                instruction.dims orelse &.{},
-                instruction.compare_direction orelse .lt,
-                device_index,
-            ) catch |err| return mapBufferError(err),
-            .compare => Buffer.initCompare(
-                allocator,
-                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
-                value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
-                instruction.compare_direction orelse .eq,
-                instruction.dims orelse &.{},
-                device_index,
-            ) catch |err| return mapBufferError(err),
-            .select => Buffer.initSelect(
-                allocator,
-                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
-                value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
-                value_buffers[instruction.inputs[2].index] orelse return error.InvalidArgument,
-                instruction.dims orelse &.{},
-                device_index,
-            ) catch |err| return mapBufferError(err),
-            .clamp => Buffer.initClamp(
-                allocator,
-                value_buffers[instruction.inputs[0].index] orelse return error.InvalidArgument,
-                value_buffers[instruction.inputs[1].index] orelse return error.InvalidArgument,
-                value_buffers[instruction.inputs[2].index] orelse return error.InvalidArgument,
-                instruction.dims orelse &.{},
-                device_index,
-            ) catch |err| return mapBufferError(err),
-            .rng_bit_generator => unreachable,
-            .complex, .real, .imag, .fft, .convolution, .custom_call, .get_tuple_element, .scatter, .top_k, .triangular_solve, .tuple, .while_, .unsupported => return error.UnsupportedRuntimeFeature,
+        return .{
+            .outputs = outputs,
+            .completion_event = completion_event,
         };
-
-        if (value_owned[output_id.index]) {
-            if (value_buffers[output_id.index]) |old| old.deinit();
-        }
-        value_buffers[output_id.index] = next;
-        value_owned[output_id.index] = true;
     }
 };
+
+fn runtimeEventFromBackendCompletion(backend_impl: backend_api.Backend, completion: backend_api.ExecutionCompletion) Event {
+    return switch (completion.kind) {
+        .completed => Event.ready(),
+        .pending => blk: {
+            const backend_event = completion.backend_event orelse break :blk Event.failed("backend returned asynchronous completion without an event handle");
+            defer backend_impl.destroyExecutionEvent(backend_event);
+            const status = backend_impl.executionEventStatus(backend_event) catch break :blk Event.failed("backend execution event status query failed");
+            break :blk switch (status.state) {
+                .ready => Event.ready(),
+                .failed => Event.failed(if (status.message.len == 0) "backend execution event failed" else status.message),
+                .pending => Event.failed("backend execution event is pending without runtime scheduler integration"),
+            };
+        },
+    };
+}
+
+fn backendOutputMatchesPlan(plan: *const core.ExecutablePlan, output_index: usize, output: backend_api.ExecutableOutput) bool {
+    if (output_index >= plan.output_ids.len) return false;
+    const value_id = plan.output_ids[output_index];
+    if (value_id.index >= plan.values.len) return false;
+    const descriptor = plan.values[value_id.index].descriptor;
+    if (output.element_type != descriptor.element_type) return false;
+    if (!std.mem.eql(i64, output.dims, descriptor.dims)) return false;
+    if (output.byte_size != core.denseByteSize(descriptor.element_type, descriptor.dims)) return false;
+    return true;
+}
+
+const DonationAlias = struct {
+    parameter_index: usize,
+    kind: core.OutputAliasKind,
+};
+
+fn donatedParameterAliasForOutput(plan: *const core.ExecutablePlan, output_index: usize) ?DonationAlias {
+    for (plan.output_aliases) |alias| {
+        if (alias.output_index == output_index and planDonatesParameter(plan, alias.parameter_index)) {
+            return .{ .parameter_index = alias.parameter_index, .kind = alias.kind };
+        }
+    }
+    if (output_index >= plan.output_ids.len) return null;
+    const output_id = plan.output_ids[output_index];
+    var parameter_index: usize = 0;
+    for (plan.values) |value| {
+        if (value.role != .parameter) continue;
+        if (value.id.index == output_id.index) {
+            return if (planDonatesParameter(plan, parameter_index)) .{ .parameter_index = parameter_index, .kind = .identity } else null;
+        }
+        parameter_index += 1;
+    }
+    return null;
+}
+
+fn planDonatesParameter(plan: *const core.ExecutablePlan, parameter_index: usize) bool {
+    for (plan.donated_parameter_indices) |candidate| {
+        if (candidate == parameter_index) return true;
+    }
+    return false;
+}
+
+fn planOutputBytes(plan: *const core.ExecutablePlan) !usize {
+    var total: usize = 0;
+    for (plan.output_ids) |value_id| {
+        if (value_id.index >= plan.values.len) return error.InvalidGraph;
+        const descriptor = plan.values[value_id.index].descriptor;
+        total = try std.math.add(usize, total, core.denseByteSize(descriptor.element_type, descriptor.dims));
+    }
+    return total;
+}
 
 pub const GraphExecuteError = error{
     OutOfMemory,
@@ -753,6 +1091,8 @@ pub const GraphExecuteError = error{
     UnsupportedRuntimeFeature,
     BufferDeleted,
     BufferDonated,
+    BufferNotReady,
+    BufferReadinessFailed,
     Internal,
 };
 
@@ -761,17 +1101,9 @@ fn graphNodeKind(kind: core.PlanInstructionKind) GraphNodeKind {
         .constant => .constant,
         .custom_call => .custom_call,
         .while_ => .control_flow,
-        .tuple, .get_tuple_element => .structural,
+        .tuple, .get_tuple_element, .optimization_barrier => .structural,
         else => .compute,
     };
-}
-
-fn destroyOwnedBuffer(buffer: *Buffer, owned: bool) void {
-    if (owned) buffer.deinit();
-}
-
-fn destroyExecuteValues(value_buffers: []?*Buffer, value_owned: []const bool) void {
-    for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
 }
 
 fn mapBufferError(err: anyerror) GraphExecuteError {
@@ -783,56 +1115,9 @@ fn mapBufferError(err: anyerror) GraphExecuteError {
         error.UnsupportedRuntimeFeature => error.UnsupportedRuntimeFeature,
         error.BufferDeleted => error.BufferDeleted,
         error.BufferDonated => error.BufferDonated,
+        error.BufferNotReady => error.BufferNotReady,
+        error.BufferReadinessFailed => error.BufferReadinessFailed,
         else => error.Internal,
-    };
-}
-
-fn runtimeBinaryOp(kind: core.PlanInstructionKind) ?ElementwiseBinaryOp {
-    return switch (kind) {
-        .add => .add,
-        .subtract => .subtract,
-        .multiply => .multiply,
-        .divide => .divide,
-        .maximum => .maximum,
-        .minimum => .minimum,
-        .power => .power,
-        .atan2 => .atan2,
-        .remainder => .remainder,
-        .and_ => .and_,
-        .or_ => .or_,
-        .xor => .xor,
-        .shift_left => .shift_left,
-        .shift_right_arithmetic => .shift_right_arithmetic,
-        .shift_right_logical => .shift_right_logical,
-        else => null,
-    };
-}
-
-fn runtimeUnaryOp(kind: core.PlanInstructionKind) ?ElementwiseUnaryOp {
-    return switch (kind) {
-        .negate => .negate,
-        .exp => .exp,
-        .expm1 => .expm1,
-        .tanh => .tanh,
-        .sqrt => .sqrt,
-        .rsqrt => .rsqrt,
-        .abs => .abs,
-        .cbrt => .cbrt,
-        .ceil => .ceil,
-        .floor => .floor,
-        .log => .log,
-        .log1p => .log1p,
-        .logistic => .logistic,
-        .sine => .sine,
-        .cosine => .cosine,
-        .not_ => .not_,
-        .sign => .sign,
-        .is_finite => .is_finite,
-        .round_nearest_afz => .round_nearest_afz,
-        .round_nearest_even => .round_nearest_even,
-        .popcnt => .popcnt,
-        .count_leading_zeros => .count_leading_zeros,
-        else => null,
     };
 }
 
@@ -901,16 +1186,19 @@ pub const Buffer = struct {
         shard_index: usize,
         src: []const u8,
     ) !*Buffer {
+        if (!memory.isAddressableBy(device)) return error.InvalidArgument;
+
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
 
         const dims = try allocator.dupe(i64, dims_);
         errdefer allocator.free(dims);
 
-        const backend_buffer = try backend_impl.bufferFromHost(device.local_hardware_id, element_type, dims, src);
-        errdefer if (backend_buffer) |owned| backend_impl.destroyBuffer(owned);
+        const backend_buffer = try backend_impl.bufferFromHost(device.local_hardware_id, element_type, dims, src) orelse
+            return error.UnsupportedRuntimeFeature;
+        errdefer backend_impl.destroyBuffer(backend_buffer);
 
-        const bytes = if (backend_buffer != null) try allocator.alloc(u8, 0) else try allocator.dupe(u8, src);
+        const bytes = try allocator.alloc(u8, 0);
         errdefer allocator.free(bytes);
 
         buffer.* = .{
@@ -932,25 +1220,105 @@ pub const Buffer = struct {
         return buffer.accountDeviceBytes();
     }
 
+    pub fn initDeviceAllocationForBackend(
+        allocator: std.mem.Allocator,
+        backend_impl: backend_api.Backend,
+        element_type: BufferType,
+        dims_: []const i64,
+        device: *Device,
+        memory: *Memory,
+        shard_index: usize,
+    ) !*Buffer {
+        if (!memory.isAddressableBy(device)) return error.InvalidArgument;
+
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+
+        const dims = try allocator.dupe(i64, dims_);
+        errdefer allocator.free(dims);
+
+        const byte_size = core.denseByteSize(element_type, dims);
+        const backend_buffer = try backend_impl.allocateBuffer(device.local_hardware_id, element_type, dims) orelse
+            return error.UnsupportedRuntimeFeature;
+        errdefer backend_impl.destroyBuffer(backend_buffer);
+
+        const bytes = try allocator.alloc(u8, 0);
+        errdefer allocator.free(bytes);
+
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = backend_impl,
+            .backend_kind = backend_impl.kind(),
+            .element_type = element_type,
+            .dims = dims,
+            .device_id = device.id,
+            .memory_id = memory.id,
+            .device = device,
+            .memory = memory,
+            .shard_index = shard_index,
+            .byte_size = byte_size,
+            .bytes = bytes,
+            .backend_buffer = backend_buffer,
+        };
+        return buffer.accountDeviceBytes();
+    }
+
+    pub fn initPendingBackendTransfer(
+        allocator: std.mem.Allocator,
+        backend_impl: backend_api.Backend,
+        element_type: BufferType,
+        dims_: []const i64,
+        device: *Device,
+        memory: *Memory,
+        shard_index: usize,
+    ) !*Buffer {
+        if (!memory.isAddressableBy(device)) return error.InvalidArgument;
+
+        const buffer = try allocator.create(Buffer);
+        errdefer allocator.destroy(buffer);
+
+        const dims = try allocator.dupe(i64, dims_);
+        errdefer allocator.free(dims);
+
+        const bytes = try allocator.alloc(u8, 0);
+        errdefer allocator.free(bytes);
+
+        buffer.* = .{
+            .allocator = allocator,
+            .backend = backend_impl,
+            .backend_kind = backend_impl.kind(),
+            .element_type = element_type,
+            .dims = dims,
+            .device_id = device.id,
+            .memory_id = memory.id,
+            .device = device,
+            .memory = memory,
+            .shard_index = shard_index,
+            .byte_size = core.denseByteSize(element_type, dims),
+            .bytes = bytes,
+            .backend_buffer = null,
+            .ready_event = Event.pending(),
+        };
+        return buffer;
+    }
+
     pub fn initDeviceCopy(
         allocator: std.mem.Allocator,
         src: *Buffer,
         shard_index: usize,
     ) !*Buffer {
         try src.ensureUsable();
+        const src_backend = src.backend_buffer orelse return error.UnsupportedRuntimeFeature;
+        const backend_buffer = try src.backend.cloneBuffer(src_backend) orelse return error.UnsupportedRuntimeFeature;
+        errdefer src.backend.destroyBuffer(backend_buffer);
+
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
 
         const dims = try allocator.dupe(i64, src.dims);
         errdefer allocator.free(dims);
 
-        var backend_buffer: ?backend_api.BufferHandle = null;
-        if (src.backend_buffer) |src_backend| {
-            backend_buffer = try src.backend.cloneBuffer(src_backend);
-        }
-        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
-
-        const bytes = if (backend_buffer != null) try allocator.alloc(u8, 0) else try allocator.dupe(u8, src.bytes);
+        const bytes = try allocator.alloc(u8, 0);
         errdefer allocator.free(bytes);
 
         buffer.* = .{
@@ -983,6 +1351,7 @@ pub const Buffer = struct {
     ) !*Buffer {
         if (output_dims.len != 0) return error.ShapeMismatch;
         if (output_type != .u32 and output_type != .s32) return error.UnsupportedElementType;
+        if (!memory.isAddressableBy(device)) return error.InvalidArgument;
 
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
@@ -990,18 +1359,10 @@ pub const Buffer = struct {
         const dims = try allocator.dupe(i64, output_dims);
         errdefer allocator.free(dims);
 
-        const bytes = try allocator.alloc(u8, output_type.byteSize());
-        errdefer allocator.free(bytes);
-        switch (output_type) {
-            .u32 => writeU32LE(bytes, 0, partition_id),
-            .s32 => writeI32LE(bytes, 0, @intCast(partition_id)),
-            else => unreachable,
-        }
-
-        const backend_buffer = backend_impl.bufferFromHost(device.local_hardware_id, output_type, output_dims, bytes) catch null;
-        errdefer if (backend_buffer) |owned| backend_impl.destroyBuffer(owned);
-        const storage_bytes = if (backend_buffer != null) try allocator.alloc(u8, 0) else bytes;
-        errdefer if (backend_buffer != null) allocator.free(storage_bytes);
+        const backend_buffer = try backend_impl.partitionId(device.local_hardware_id, output_type, partition_id) orelse return error.UnsupportedRuntimeFeature;
+        errdefer backend_impl.destroyBuffer(backend_buffer);
+        const storage_bytes = try allocator.alloc(u8, 0);
+        errdefer allocator.free(storage_bytes);
 
         buffer.* = .{
             .allocator = allocator,
@@ -1014,11 +1375,10 @@ pub const Buffer = struct {
             .device = device,
             .memory = memory,
             .shard_index = shard_index,
-            .byte_size = bytes.len,
+            .byte_size = output_type.byteSize(),
             .bytes = storage_bytes,
             .backend_buffer = backend_buffer,
         };
-        if (backend_buffer != null) allocator.free(bytes);
         return buffer.accountDeviceBytes();
     }
 
@@ -1030,75 +1390,16 @@ pub const Buffer = struct {
         shard_index: usize,
     ) !*Buffer {
         if (src.element_type != .f32) return error.UnsupportedElementType;
-        if (src.bytes.len == 0) return error.UnsupportedRuntimeFeature;
         if (!std.mem.eql(i64, src.dims, output_dims) or output_dims.len < 2) return error.ShapeMismatch;
         const n_i64 = output_dims[output_dims.len - 1];
         const rows_i64 = output_dims[output_dims.len - 2];
         if (n_i64 <= 0 or rows_i64 != n_i64) return error.ShapeMismatch;
-        const n: usize = @intCast(n_i64);
-        const matrix_elems = n * n;
-        const element_count = src.bytes.len / 4;
-        if (element_count % matrix_elems != 0) return error.ShapeMismatch;
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-
-        const bytes = try allocator.alloc(u8, src.bytes.len);
-        errdefer allocator.free(bytes);
-        @memset(bytes, 0);
-
-        const batches = element_count / matrix_elems;
-        for (0..batches) |batch| {
-            const base = batch * matrix_elems;
-            for (0..n) |i| {
-                for (0..i + 1) |j| {
-                    var sum = readF32LE(src.bytes, base + i * n + j);
-                    for (0..j) |k| {
-                        sum -= readF32LE(bytes, base + i * n + k) * readF32LE(bytes, base + j * n + k);
-                    }
-                    if (i == j) {
-                        if (sum < 0.0) return error.ShapeMismatch;
-                        writeF32LE(bytes, base + i * n + j, std.math.sqrt(sum));
-                    } else {
-                        const diag = readF32LE(bytes, base + j * n + j);
-                        if (diag == 0.0) return error.ShapeMismatch;
-                        writeF32LE(bytes, base + i * n + j, sum / diag);
-                    }
-                }
-            }
-            if (!lower) {
-                for (0..n) |row| {
-                    for (0..row) |col| {
-                        const value = readF32LE(bytes, base + row * n + col);
-                        writeF32LE(bytes, base + col * n + row, value);
-                        writeF32LE(bytes, base + row * n + col, 0.0);
-                    }
-                }
-            }
+        const backend_src = src.backend_buffer orelse return error.UnsupportedRuntimeFeature;
+        const output_byte_size = denseByteSize(.f32, output_dims);
+        if (src.backend.cholesky(backend_src, lower, output_dims) catch null) |backend_buffer| {
+            return initBackendOnly(allocator, src, .f32, output_dims, output_byte_size, backend_buffer, shard_index);
         }
-
-        const backend_buffer = src.backend.bufferFromHost(src.device.local_hardware_id, .f32, output_dims, bytes) catch null;
-        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
-
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = src.backend,
-            .backend_kind = src.backend_kind,
-            .element_type = .f32,
-            .dims = dims,
-            .device_id = src.device_id,
-            .memory_id = src.memory_id,
-            .device = src.device,
-            .memory = src.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = backend_buffer,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initRngUniform(
@@ -1109,65 +1410,12 @@ pub const Buffer = struct {
         output_dims: []const i64,
         shard_index: usize,
     ) !*Buffer {
+        _ = allocator;
+        _ = output_dims;
+        _ = shard_index;
         if (output_type != .f32 and output_type != .u32 and output_type != .s32) return error.UnsupportedElementType;
         if (min.element_type != max.element_type or min.element_type != output_type) return error.UnsupportedElementType;
-        if (min.bytes.len == 0 or max.bytes.len == 0) return error.UnsupportedRuntimeFeature;
-        if (min.bytes.len != output_type.byteSize() or max.bytes.len != output_type.byteSize()) return error.ShapeMismatch;
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-
-        const bytes = try allocator.alloc(u8, denseByteSize(output_type, output_dims));
-        errdefer allocator.free(bytes);
-        var state = seedFromBytes(min.bytes) ^ rotl64(seedFromBytes(max.bytes), 17) ^ @as(u64, @intCast(shard_index + 1));
-        const count = if (output_type.byteSize() == 0) 0 else bytes.len / output_type.byteSize();
-        for (0..count) |i| {
-            const rnd = nextRandomU32(&state);
-            switch (output_type) {
-                .f32 => {
-                    const lo = readF32LE(min.bytes, 0);
-                    const hi = readF32LE(max.bytes, 0);
-                    const unit = @as(f32, @floatFromInt(rnd)) / @as(f32, @floatFromInt(std.math.maxInt(u32)));
-                    writeF32LE(bytes, i, lo + (hi - lo) * unit);
-                },
-                .u32 => {
-                    const lo = readU32LE(min.bytes, 0);
-                    const hi = readU32LE(max.bytes, 0);
-                    const span = if (hi > lo) hi - lo else 1;
-                    writeU32LE(bytes, i, lo + rnd % span);
-                },
-                .s32 => {
-                    const lo = readI32LE(min.bytes, 0);
-                    const hi = readI32LE(max.bytes, 0);
-                    const span: u32 = if (hi > lo) @intCast(hi - lo) else 1;
-                    writeI32LE(bytes, i, lo + @as(i32, @intCast(rnd % span)));
-                },
-                else => unreachable,
-            }
-        }
-
-        const backend_buffer = min.backend.bufferFromHost(min.device.local_hardware_id, output_type, output_dims, bytes) catch null;
-        errdefer if (backend_buffer) |owned| min.backend.destroyBuffer(owned);
-
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = min.backend,
-            .backend_kind = min.backend_kind,
-            .element_type = output_type,
-            .dims = dims,
-            .device_id = min.device_id,
-            .memory_id = min.memory_id,
-            .device = min.device,
-            .memory = min.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = backend_buffer,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initRngBits(
@@ -1177,46 +1425,12 @@ pub const Buffer = struct {
         output_dims: []const i64,
         shard_index: usize,
     ) !*Buffer {
+        _ = allocator;
+        _ = state;
+        _ = output_dims;
+        _ = shard_index;
         if (output_type != .u32 and output_type != .s32) return error.UnsupportedElementType;
-        if (state.bytes.len == 0) return error.UnsupportedRuntimeFeature;
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-
-        const bytes = try allocator.alloc(u8, denseByteSize(output_type, output_dims));
-        errdefer allocator.free(bytes);
-        var rng_state = seedFromBytes(state.bytes) ^ @as(u64, @intCast(shard_index + 1));
-        const count = bytes.len / output_type.byteSize();
-        for (0..count) |i| {
-            const value = nextRandomU32(&rng_state);
-            switch (output_type) {
-                .u32 => writeU32LE(bytes, i, value),
-                .s32 => writeI32LE(bytes, i, @bitCast(value)),
-                else => unreachable,
-            }
-        }
-
-        const backend_buffer = state.backend.bufferFromHost(state.device.local_hardware_id, output_type, output_dims, bytes) catch null;
-        errdefer if (backend_buffer) |owned| state.backend.destroyBuffer(owned);
-
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = state.backend,
-            .backend_kind = state.backend_kind,
-            .element_type = output_type,
-            .dims = dims,
-            .device_id = state.device_id,
-            .memory_id = state.memory_id,
-            .device = state.device,
-            .memory = state.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = backend_buffer,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initRngStateUpdate(
@@ -1224,46 +1438,10 @@ pub const Buffer = struct {
         state: *Buffer,
         shard_index: usize,
     ) !*Buffer {
+        _ = allocator;
+        _ = shard_index;
         if (state.element_type.byteSize() == 0) return error.UnsupportedElementType;
-        if (state.bytes.len == 0) return error.UnsupportedRuntimeFeature;
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-
-        const dims = try allocator.dupe(i64, state.dims);
-        errdefer allocator.free(dims);
-
-        const bytes = try allocator.alloc(u8, state.bytes.len);
-        errdefer allocator.free(bytes);
-        var rng_state = seedFromBytes(state.bytes) ^ rotl64(@as(u64, @intCast(shard_index + 1)), 17);
-        var offset: usize = 0;
-        while (offset < bytes.len) {
-            const value = nextRandomU32(&rng_state);
-            var word: [4]u8 = undefined;
-            std.mem.writeInt(u32, &word, value, .little);
-            const n = @min(bytes.len - offset, word.len);
-            @memcpy(bytes[offset..][0..n], word[0..n]);
-            offset += n;
-        }
-
-        const backend_buffer = state.backend.bufferFromHost(state.device.local_hardware_id, state.element_type, state.dims, bytes) catch null;
-        errdefer if (backend_buffer) |owned| state.backend.destroyBuffer(owned);
-
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = state.backend,
-            .backend_kind = state.backend_kind,
-            .element_type = state.element_type,
-            .dims = dims,
-            .device_id = state.device_id,
-            .memory_id = state.memory_id,
-            .device = state.device,
-            .memory = state.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = backend_buffer,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initElementwiseBinary(
@@ -1281,134 +1459,7 @@ pub const Buffer = struct {
                 return initBackendOnly(allocator, lhs, lhs.element_type, lhs.dims, lhs.byte_size, backend_buffer, shard_index);
             }
         }
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-
-        const dims = try allocator.dupe(i64, lhs.dims);
-        errdefer allocator.free(dims);
-
-        const bytes = try allocator.alloc(u8, lhs.bytes.len);
-        errdefer allocator.free(bytes);
-        switch (lhs.element_type) {
-            .pred => {
-                for (lhs.bytes, rhs.bytes, 0..) |a, b, i| {
-                    bytes[i] = switch (op) {
-                        .and_ => if (a != 0 and b != 0) 1 else 0,
-                        .or_ => if (a != 0 or b != 0) 1 else 0,
-                        .xor => if ((a != 0) != (b != 0)) 1 else 0,
-                        else => return error.UnsupportedElementType,
-                    };
-                }
-            },
-            .u8 => {
-                for (lhs.bytes, rhs.bytes, 0..) |a, b, i| {
-                    bytes[i] = switch (op) {
-                        .add => a +% b,
-                        .subtract => a -% b,
-                        .multiply => a *% b,
-                        .divide => if (b == 0) 0 else a / b,
-                        .maximum => @max(a, b),
-                        .minimum => @min(a, b),
-                        .remainder => if (b == 0) 0 else a % b,
-                        .and_ => a & b,
-                        .or_ => a | b,
-                        .xor => a ^ b,
-                        .shift_left => a << @intCast(@min(b, 7)),
-                        .shift_right_logical, .shift_right_arithmetic => a >> @intCast(@min(b, 7)),
-                        else => return error.UnsupportedElementType,
-                    };
-                }
-            },
-            .s32 => {
-                const element_count = lhs.bytes.len / 4;
-                for (0..element_count) |i| {
-                    const a = readI32LE(lhs.bytes, i);
-                    const b = readI32LE(rhs.bytes, i);
-                    const value: i32 = switch (op) {
-                        .add => a +% b,
-                        .subtract => a -% b,
-                        .multiply => a *% b,
-                        .divide => if (b == 0) 0 else @divTrunc(a, b),
-                        .maximum => @max(a, b),
-                        .minimum => @min(a, b),
-                        .remainder => if (b == 0) 0 else @rem(a, b),
-                        .and_ => a & b,
-                        .or_ => a | b,
-                        .xor => a ^ b,
-                        .shift_left => a << @intCast(@min(@as(u5, @intCast(@max(b, 0))), 31)),
-                        .shift_right_arithmetic => a >> @intCast(@min(@as(u5, @intCast(@max(b, 0))), 31)),
-                        .shift_right_logical => @bitCast(@as(u32, @bitCast(a)) >> @intCast(@min(@as(u5, @intCast(@max(b, 0))), 31))),
-                        else => return error.UnsupportedElementType,
-                    };
-                    writeI32LE(bytes, i, value);
-                }
-            },
-            .u32 => {
-                const element_count = lhs.bytes.len / 4;
-                for (0..element_count) |i| {
-                    const a = readU32LE(lhs.bytes, i);
-                    const b = readU32LE(rhs.bytes, i);
-                    const shift: u5 = @intCast(@min(b, 31));
-                    const value: u32 = switch (op) {
-                        .add => a +% b,
-                        .subtract => a -% b,
-                        .multiply => a *% b,
-                        .divide => if (b == 0) 0 else a / b,
-                        .maximum => @max(a, b),
-                        .minimum => @min(a, b),
-                        .remainder => if (b == 0) 0 else a % b,
-                        .and_ => a & b,
-                        .or_ => a | b,
-                        .xor => a ^ b,
-                        .shift_left => a << shift,
-                        .shift_right_logical, .shift_right_arithmetic => a >> shift,
-                        else => return error.UnsupportedElementType,
-                    };
-                    writeU32LE(bytes, i, value);
-                }
-            },
-            .f32 => {
-                var offset: usize = 0;
-                while (offset < lhs.bytes.len) : (offset += 4) {
-                    const a_bits = std.mem.readInt(u32, lhs.bytes[offset..][0..4], .little);
-                    const b_bits = std.mem.readInt(u32, rhs.bytes[offset..][0..4], .little);
-                    const a: f32 = @bitCast(a_bits);
-                    const b: f32 = @bitCast(b_bits);
-                    const value: f32 = switch (op) {
-                        .add => a + b,
-                        .subtract => a - b,
-                        .multiply => a * b,
-                        .divide => a / b,
-                        .maximum => @max(a, b),
-                        .minimum => @min(a, b),
-                        .power => std.math.pow(f32, a, b),
-                        .atan2 => std.math.atan2(a, b),
-                        .remainder => @mod(a, b),
-                        else => return error.UnsupportedElementType,
-                    };
-                    std.mem.writeInt(u32, bytes[offset..][0..4], @bitCast(value), .little);
-                }
-            },
-            else => return error.UnsupportedElementType,
-        }
-
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = lhs.backend,
-            .backend_kind = lhs.backend_kind,
-            .element_type = lhs.element_type,
-            .dims = dims,
-            .device_id = lhs.device_id,
-            .memory_id = lhs.memory_id,
-            .device = lhs.device,
-            .memory = lhs.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = null,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initU8Add(
@@ -1455,122 +1506,8 @@ pub const Buffer = struct {
             if (src.backend.unary(src_backend, op) catch null) |backend_buffer| {
                 return initBackendOnly(allocator, src, output_type, output_dims, output_byte_size, backend_buffer, shard_index);
             }
-            if (src.bytes.len == 0) return error.UnsupportedRuntimeFeature;
         }
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-
-        const bytes = try allocator.alloc(u8, output_byte_size);
-        errdefer allocator.free(bytes);
-        switch (src.element_type) {
-            .pred => {
-                if (output_type != .pred or op != .not_) return error.UnsupportedElementType;
-                for (src.bytes, 0..) |value, i| bytes[i] = if (value == 0) 1 else 0;
-            },
-            .u8 => {
-                if (output_type != .u8 and output_type != .s8 and output_type != .pred) return error.UnsupportedElementType;
-                for (src.bytes, 0..) |value, i| {
-                    _ = switch (op) {
-                        .negate => bytes[i] = 0 -% value,
-                        .not_ => bytes[i] = ~value,
-                        .popcnt => bytes[i] = @popCount(value),
-                        .count_leading_zeros => bytes[i] = @clz(value),
-                        .sign => bytes[i] = if (value == 0) 0 else 1,
-                        .is_finite => bytes[i] = 1,
-                        else => return error.UnsupportedElementType,
-                    };
-                }
-            },
-            .s32 => {
-                if (output_type != .s32 and output_type != .pred) return error.UnsupportedElementType;
-                const element_count = src.bytes.len / 4;
-                for (0..element_count) |i| {
-                    const value = readI32LE(src.bytes, i);
-                    _ = switch (op) {
-                        .negate => writeI32LE(bytes, i, -%value),
-                        .not_ => writeI32LE(bytes, i, ~value),
-                        .popcnt => writeI32LE(bytes, i, @intCast(@popCount(value))),
-                        .count_leading_zeros => writeI32LE(bytes, i, @intCast(@clz(value))),
-                        .sign => writeI32LE(bytes, i, if (value < 0) -1 else if (value > 0) 1 else 0),
-                        .is_finite => bytes[i] = 1,
-                        else => return error.UnsupportedElementType,
-                    };
-                }
-            },
-            .u32 => {
-                if (output_type != .u32 and output_type != .pred) return error.UnsupportedElementType;
-                const element_count = src.bytes.len / 4;
-                for (0..element_count) |i| {
-                    const value = readU32LE(src.bytes, i);
-                    _ = switch (op) {
-                        .not_ => writeU32LE(bytes, i, ~value),
-                        .popcnt => writeU32LE(bytes, i, @intCast(@popCount(value))),
-                        .count_leading_zeros => writeU32LE(bytes, i, @intCast(@clz(value))),
-                        .sign => writeU32LE(bytes, i, if (value == 0) 0 else 1),
-                        .is_finite => bytes[i] = 1,
-                        else => return error.UnsupportedElementType,
-                    };
-                }
-            },
-            .f32 => {
-                if (output_type != .f32 and output_type != .pred) return error.UnsupportedElementType;
-                var offset: usize = 0;
-                var index: usize = 0;
-                while (offset < src.bytes.len) : (offset += 4) {
-                    const bits = std.mem.readInt(u32, src.bytes[offset..][0..4], .little);
-                    const value: f32 = @bitCast(bits);
-                    if (op == .is_finite) {
-                        bytes[index] = if (std.math.isFinite(value)) 1 else 0;
-                        index += 1;
-                    } else {
-                        const out: f32 = switch (op) {
-                            .negate => -value,
-                            .exp => std.math.exp(value),
-                            .expm1 => std.math.exp(value) - 1.0,
-                            .tanh => std.math.tanh(value),
-                            .sqrt => std.math.sqrt(value),
-                            .rsqrt => 1.0 / std.math.sqrt(value),
-                            .abs => @abs(value),
-                            .cbrt => std.math.cbrt(value),
-                            .ceil => @ceil(value),
-                            .floor => @floor(value),
-                            .log => @log(value),
-                            .log1p => @log(value + 1.0),
-                            .logistic => 1.0 / (1.0 + std.math.exp(-value)),
-                            .sine => @sin(value),
-                            .cosine => @cos(value),
-                            .sign => if (value < 0.0) -1.0 else if (value > 0.0) 1.0 else 0.0,
-                            .round_nearest_afz => @round(value),
-                            .round_nearest_even => @round(value),
-                            else => return error.UnsupportedElementType,
-                        };
-                        std.mem.writeInt(u32, bytes[offset..][0..4], @bitCast(out), .little);
-                    }
-                }
-            },
-            else => return error.UnsupportedElementType,
-        }
-
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = src.backend,
-            .backend_kind = src.backend_kind,
-            .element_type = output_type,
-            .dims = dims,
-            .device_id = src.device_id,
-            .memory_id = src.memory_id,
-            .device = src.device,
-            .memory = src.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = null,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initReshape(
@@ -1586,32 +1523,7 @@ pub const Buffer = struct {
                 return initBackendOnly(allocator, src, src.element_type, new_dims, src.byte_size, backend_buffer, shard_index);
             }
         }
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-
-        const dims = try allocator.dupe(i64, new_dims);
-        errdefer allocator.free(dims);
-
-        const bytes = try allocator.dupe(u8, src.bytes);
-        errdefer allocator.free(bytes);
-
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = src.backend,
-            .backend_kind = src.backend_kind,
-            .element_type = src.element_type,
-            .dims = dims,
-            .device_id = src.device_id,
-            .memory_id = src.memory_id,
-            .device = src.device,
-            .memory = src.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = null,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initTranspose(
@@ -1631,52 +1543,7 @@ pub const Buffer = struct {
                 return initBackendOnly(allocator, src, src.element_type, new_dims, src.byte_size, backend_buffer, shard_index);
             }
         }
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-
-        const dims = try allocator.dupe(i64, new_dims);
-        errdefer allocator.free(dims);
-
-        const bytes = try allocator.alloc(u8, src.bytes.len);
-        errdefer allocator.free(bytes);
-
-        const src_strides = try rowMajorStrides(allocator, src.dims);
-        defer allocator.free(src_strides);
-        const dst_strides = try rowMajorStrides(allocator, new_dims);
-        defer allocator.free(dst_strides);
-        const coords = try allocator.alloc(usize, new_dims.len);
-        defer allocator.free(coords);
-
-        const element_count = if (element_size == 0) 0 else src.bytes.len / element_size;
-        for (0..element_count) |dst_index| {
-            unravelIndex(dst_index, new_dims, dst_strides, coords);
-            var src_index: usize = 0;
-            for (permutation, 0..) |src_axis_i64, dst_axis| {
-                src_index += coords[dst_axis] * src_strides[@intCast(src_axis_i64)];
-            }
-            @memcpy(
-                bytes[dst_index * element_size ..][0..element_size],
-                src.bytes[src_index * element_size ..][0..element_size],
-            );
-        }
-
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = src.backend,
-            .backend_kind = src.backend_kind,
-            .element_type = src.element_type,
-            .dims = dims,
-            .device_id = src.device_id,
-            .memory_id = src.memory_id,
-            .device = src.device,
-            .memory = src.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = null,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initBroadcastInDim(
@@ -1695,54 +1562,7 @@ pub const Buffer = struct {
                 return initBackendOnly(allocator, src, src.element_type, output_dims, output_byte_size, backend_buffer, shard_index);
             }
         }
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-
-        const bytes = try allocator.alloc(u8, output_byte_size);
-        errdefer allocator.free(bytes);
-
-        const src_strides = try rowMajorStrides(allocator, src.dims);
-        defer allocator.free(src_strides);
-        const dst_strides = try rowMajorStrides(allocator, output_dims);
-        defer allocator.free(dst_strides);
-        const coords = try allocator.alloc(usize, output_dims.len);
-        defer allocator.free(coords);
-
-        const element_count = if (element_size == 0) 0 else output_byte_size / element_size;
-        for (0..element_count) |dst_index| {
-            unravelIndex(dst_index, output_dims, dst_strides, coords);
-            var src_index: usize = 0;
-            for (broadcast_dimensions, 0..) |output_axis_i64, src_axis| {
-                const output_axis: usize = @intCast(output_axis_i64);
-                const src_coord = if (src.dims[src_axis] == 1) 0 else coords[output_axis];
-                src_index += src_coord * src_strides[src_axis];
-            }
-            @memcpy(
-                bytes[dst_index * element_size ..][0..element_size],
-                src.bytes[src_index * element_size ..][0..element_size],
-            );
-        }
-
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = src.backend,
-            .backend_kind = src.backend_kind,
-            .element_type = src.element_type,
-            .dims = dims,
-            .device_id = src.device_id,
-            .memory_id = src.memory_id,
-            .device = src.device,
-            .memory = src.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = null,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initSlice(
@@ -1763,53 +1583,7 @@ pub const Buffer = struct {
                 return initBackendOnly(allocator, src, src.element_type, output_dims, output_byte_size, backend_buffer, shard_index);
             }
         }
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-
-        const bytes = try allocator.alloc(u8, output_byte_size);
-        errdefer allocator.free(bytes);
-
-        const src_strides = try rowMajorStrides(allocator, src.dims);
-        defer allocator.free(src_strides);
-        const dst_strides = try rowMajorStrides(allocator, output_dims);
-        defer allocator.free(dst_strides);
-        const coords = try allocator.alloc(usize, output_dims.len);
-        defer allocator.free(coords);
-
-        const element_count = if (element_size == 0) 0 else output_byte_size / element_size;
-        for (0..element_count) |dst_index| {
-            unravelIndex(dst_index, output_dims, dst_strides, coords);
-            var src_index: usize = 0;
-            for (coords, 0..) |coord, axis| {
-                const src_coord = @as(usize, @intCast(start_indices[axis])) + coord * @as(usize, @intCast(strides_[axis]));
-                src_index += src_coord * src_strides[axis];
-            }
-            @memcpy(
-                bytes[dst_index * element_size ..][0..element_size],
-                src.bytes[src_index * element_size ..][0..element_size],
-            );
-        }
-
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = src.backend,
-            .backend_kind = src.backend_kind,
-            .element_type = src.element_type,
-            .dims = dims,
-            .device_id = src.device_id,
-            .memory_id = src.memory_id,
-            .device = src.device,
-            .memory = src.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = null,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initConcatenate(
@@ -1830,68 +1604,7 @@ pub const Buffer = struct {
                 return initBackendOnly(allocator, lhs, lhs.element_type, output_dims, output_byte_size, backend_buffer, shard_index);
             }
         }
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-
-        const bytes = try allocator.alloc(u8, output_byte_size);
-        errdefer allocator.free(bytes);
-
-        const lhs_strides = try rowMajorStrides(allocator, lhs.dims);
-        defer allocator.free(lhs_strides);
-        const rhs_strides = try rowMajorStrides(allocator, rhs.dims);
-        defer allocator.free(rhs_strides);
-        const dst_strides = try rowMajorStrides(allocator, output_dims);
-        defer allocator.free(dst_strides);
-        const coords = try allocator.alloc(usize, output_dims.len);
-        defer allocator.free(coords);
-
-        const concat_axis: usize = @intCast(dimension);
-        const lhs_axis_len: usize = @intCast(lhs.dims[concat_axis]);
-        const element_count = if (element_size == 0) 0 else output_byte_size / element_size;
-        for (0..element_count) |dst_index| {
-            unravelIndex(dst_index, output_dims, dst_strides, coords);
-            const use_lhs = coords[concat_axis] < lhs_axis_len;
-            var src_index: usize = 0;
-            if (use_lhs) {
-                for (coords, 0..) |coord, axis| {
-                    src_index += coord * lhs_strides[axis];
-                }
-                @memcpy(
-                    bytes[dst_index * element_size ..][0..element_size],
-                    lhs.bytes[src_index * element_size ..][0..element_size],
-                );
-            } else {
-                for (coords, 0..) |coord, axis| {
-                    const src_coord = if (axis == concat_axis) coord - lhs_axis_len else coord;
-                    src_index += src_coord * rhs_strides[axis];
-                }
-                @memcpy(
-                    bytes[dst_index * element_size ..][0..element_size],
-                    rhs.bytes[src_index * element_size ..][0..element_size],
-                );
-            }
-        }
-
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = lhs.backend,
-            .backend_kind = lhs.backend_kind,
-            .element_type = lhs.element_type,
-            .dims = dims,
-            .device_id = lhs.device_id,
-            .memory_id = lhs.memory_id,
-            .device = lhs.device,
-            .memory = lhs.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = null,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initDotGeneral(
@@ -1905,42 +1618,19 @@ pub const Buffer = struct {
         output_dims: []const i64,
         shard_index: usize,
     ) !*Buffer {
-        if (lhs.element_type != .f32 or rhs.element_type != .f32) return error.UnsupportedElementType;
+        if (lhs.element_type != rhs.element_type) return error.UnsupportedElementType;
+        switch (lhs.element_type) {
+            .f16, .bf16, .f32 => {},
+            else => return error.UnsupportedElementType,
+        }
         if (!validDotGeneral(lhs.dims, rhs.dims, lhs_batch_dimensions, rhs_batch_dimensions, lhs_contracting_dimensions, rhs_contracting_dimensions, output_dims)) return error.ShapeMismatch;
-        const output_byte_size = denseByteSize(.f32, output_dims);
+        const output_byte_size = denseByteSize(lhs.element_type, output_dims);
         if (lhs.backend_buffer != null and rhs.backend_buffer != null) {
             if (lhs.backend.dotGeneral(lhs.backend_buffer.?, rhs.backend_buffer.?, lhs_batch_dimensions, rhs_batch_dimensions, lhs_contracting_dimensions, rhs_contracting_dimensions, output_dims) catch null) |backend_buffer| {
-                return initBackendOnly(allocator, lhs, .f32, output_dims, output_byte_size, backend_buffer, shard_index);
+                return initBackendOnly(allocator, lhs, lhs.element_type, output_dims, output_byte_size, backend_buffer, shard_index);
             }
         }
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-
-        const bytes = try allocator.alloc(u8, output_byte_size);
-        errdefer allocator.free(bytes);
-
-        try evalDotGeneralF32(allocator, lhs.bytes, lhs.dims, rhs.bytes, rhs.dims, lhs_batch_dimensions, rhs_batch_dimensions, lhs_contracting_dimensions, rhs_contracting_dimensions, output_dims, bytes);
-
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = lhs.backend,
-            .backend_kind = lhs.backend_kind,
-            .element_type = .f32,
-            .dims = dims,
-            .device_id = lhs.device_id,
-            .memory_id = lhs.memory_id,
-            .device = lhs.device,
-            .memory = lhs.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = null,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initReduce(
@@ -1952,7 +1642,10 @@ pub const Buffer = struct {
         shard_index: usize,
     ) !*Buffer {
         const output_type: BufferType = switch (kind) {
-            .reduce_sum, .reduce_max => if (src.element_type == .f32) .f32 else return error.UnsupportedElementType,
+            .reduce_sum, .reduce_max, .reduce_min => switch (src.element_type) {
+                .s8, .s32, .u8, .u16, .u32, .u64, .f16, .f32, .bf16 => src.element_type,
+                else => return error.UnsupportedElementType,
+            },
             .reduce_and, .reduce_or => if (src.element_type == .pred) .pred else return error.UnsupportedElementType,
             else => return error.UnsupportedElementType,
         };
@@ -1963,38 +1656,7 @@ pub const Buffer = struct {
                 return initBackendOnly(allocator, src, output_type, output_dims, output_byte_size, backend_buffer, shard_index);
             }
         }
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-
-        const bytes = try allocator.alloc(u8, output_byte_size);
-        errdefer allocator.free(bytes);
-
-        switch (output_type) {
-            .f32 => try evalReduceF32(allocator, kind, src.bytes, src.dims, dimensions, output_dims, bytes),
-            .pred => try evalReducePred(allocator, kind, src.bytes, src.dims, dimensions, output_dims, bytes),
-            else => unreachable,
-        }
-
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = src.backend,
-            .backend_kind = src.backend_kind,
-            .element_type = output_type,
-            .dims = dims,
-            .device_id = src.device_id,
-            .memory_id = src.memory_id,
-            .device = src.device,
-            .memory = src.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = null,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initCompare(
@@ -2013,38 +1675,7 @@ pub const Buffer = struct {
                 return initBackendOnly(allocator, lhs, .pred, output_dims, output_byte_size, backend_buffer, shard_index);
             }
         }
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-
-        const element_size = lhs.element_type.byteSize();
-        if (element_size == 0) return error.UnsupportedElementType;
-        const element_count = lhs.bytes.len / element_size;
-        const bytes = try allocator.alloc(u8, element_count);
-        errdefer allocator.free(bytes);
-        for (0..element_count) |i| {
-            bytes[i] = if (compareElement(lhs.element_type, lhs.bytes, rhs.bytes, i, direction)) 1 else 0;
-        }
-
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = lhs.backend,
-            .backend_kind = lhs.backend_kind,
-            .element_type = .pred,
-            .dims = dims,
-            .device_id = lhs.device_id,
-            .memory_id = lhs.memory_id,
-            .device = lhs.device,
-            .memory = lhs.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = null,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initSelect(
@@ -2065,37 +1696,7 @@ pub const Buffer = struct {
                 return initBackendOnly(allocator, on_true, on_true.element_type, output_dims, denseByteSize(on_true.element_type, output_dims), backend_buffer, shard_index);
             }
         }
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-
-        const bytes = try allocator.alloc(u8, on_true.bytes.len);
-        errdefer allocator.free(bytes);
-        const element_count = on_true.bytes.len / element_size;
-        for (0..element_count) |i| {
-            const src = if (pred.bytes[i] != 0) on_true.bytes else on_false.bytes;
-            @memcpy(bytes[i * element_size ..][0..element_size], src[i * element_size ..][0..element_size]);
-        }
-
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = on_true.backend,
-            .backend_kind = on_true.backend_kind,
-            .element_type = on_true.element_type,
-            .dims = dims,
-            .device_id = on_true.device_id,
-            .memory_id = on_true.memory_id,
-            .device = on_true.device,
-            .memory = on_true.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = null,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initConvert(
@@ -2112,43 +1713,8 @@ pub const Buffer = struct {
             if (src.backend.convert(src_backend, output_type) catch null) |backend_buffer| {
                 return initBackendOnly(allocator, src, output_type, output_dims, output_size, backend_buffer, shard_index);
             }
-            if (src.bytes.len == 0) return error.UnsupportedRuntimeFeature;
         }
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-
-        const bytes = try allocator.alloc(u8, output_size);
-        errdefer allocator.free(bytes);
-
-        const element_count = if (output_type.byteSize() == 0) 0 else output_size / output_type.byteSize();
-        for (0..element_count) |i| {
-            const value = readScalarAsF64(src.element_type, src.bytes, i);
-            writeScalarFromF64(output_type, bytes, i, value);
-        }
-
-        const backend_buffer = src.backend.bufferFromHost(src.device.local_hardware_id, output_type, output_dims, bytes) catch null;
-        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
-
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = src.backend,
-            .backend_kind = src.backend_kind,
-            .element_type = output_type,
-            .dims = dims,
-            .device_id = src.device_id,
-            .memory_id = src.memory_id,
-            .device = src.device,
-            .memory = src.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = backend_buffer,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initIota(
@@ -2179,45 +1745,7 @@ pub const Buffer = struct {
                 return err;
             };
         }
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-
-        const bytes = try allocator.alloc(u8, denseByteSize(element_type, output_dims));
-        errdefer allocator.free(bytes);
-        const strides = try rowMajorStrides(allocator, output_dims);
-        defer allocator.free(strides);
-        const coords = try allocator.alloc(usize, output_dims.len);
-        defer allocator.free(coords);
-        const element_count = if (element_type.byteSize() == 0) 0 else bytes.len / element_type.byteSize();
-        const axis: usize = @intCast(iota_dimension);
-        for (0..element_count) |i| {
-            unravelIndex(i, output_dims, strides, coords);
-            writeScalarFromF64(element_type, bytes, i, @floatFromInt(coords[axis]));
-        }
-
-        const backend_buffer = backend_impl.bufferFromHost(device.local_hardware_id, element_type, output_dims, bytes) catch null;
-        errdefer if (backend_buffer) |owned| backend_impl.destroyBuffer(owned);
-
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = backend_impl,
-            .backend_kind = backend_impl.kind(),
-            .element_type = element_type,
-            .dims = dims,
-            .device_id = device.id,
-            .memory_id = memory.id,
-            .device = device,
-            .memory = memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = backend_buffer,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initReverse(
@@ -2234,48 +1762,8 @@ pub const Buffer = struct {
             if (src.backend.reverse(src_backend, dimensions, output_dims) catch null) |backend_buffer| {
                 return initBackendOnly(allocator, src, src.element_type, output_dims, src.byte_size, backend_buffer, shard_index);
             }
-            if (src.bytes.len == 0) return error.UnsupportedRuntimeFeature;
         }
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-        const bytes = try allocator.alloc(u8, src.bytes.len);
-        errdefer allocator.free(bytes);
-        const strides = try rowMajorStrides(allocator, src.dims);
-        defer allocator.free(strides);
-        const coords = try allocator.alloc(usize, src.dims.len);
-        defer allocator.free(coords);
-        const element_count = src.bytes.len / element_size;
-        for (0..element_count) |dst_index| {
-            unravelIndex(dst_index, output_dims, strides, coords);
-            var src_index: usize = 0;
-            for (coords, 0..) |coord, axis| {
-                const reverse_axis = axisInList(axis, dimensions);
-                const src_coord = if (reverse_axis) @as(usize, @intCast(src.dims[axis])) - 1 - coord else coord;
-                src_index += src_coord * strides[axis];
-            }
-            @memcpy(bytes[dst_index * element_size ..][0..element_size], src.bytes[src_index * element_size ..][0..element_size]);
-        }
-        const backend_buffer = src.backend.bufferFromHost(src.device.local_hardware_id, src.element_type, output_dims, bytes) catch null;
-        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = src.backend,
-            .backend_kind = src.backend_kind,
-            .element_type = src.element_type,
-            .dims = dims,
-            .device_id = src.device_id,
-            .memory_id = src.memory_id,
-            .device = src.device,
-            .memory = src.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = backend_buffer,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initClamp(
@@ -2302,40 +1790,8 @@ pub const Buffer = struct {
                     }
                 }
             }
-            if (value_buffer.bytes.len == 0) return error.UnsupportedRuntimeFeature;
         }
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-        const bytes = try allocator.alloc(u8, value_buffer.bytes.len);
-        errdefer allocator.free(bytes);
-        const element_count = value_buffer.bytes.len / element_size;
-        for (0..element_count) |i| {
-            const min_value = readScalarAsF64(value_buffer.element_type, min_buffer.bytes, if (min_scalar) 0 else i);
-            const value = readScalarAsF64(value_buffer.element_type, value_buffer.bytes, i);
-            const max_value = readScalarAsF64(value_buffer.element_type, max_buffer.bytes, if (max_scalar) 0 else i);
-            writeScalarFromF64(value_buffer.element_type, bytes, i, @min(@max(value, min_value), max_value));
-        }
-        const backend_buffer = value_buffer.backend.bufferFromHost(value_buffer.device.local_hardware_id, value_buffer.element_type, output_dims, bytes) catch null;
-        errdefer if (backend_buffer) |owned| value_buffer.backend.destroyBuffer(owned);
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = value_buffer.backend,
-            .backend_kind = value_buffer.backend_kind,
-            .element_type = value_buffer.element_type,
-            .dims = dims,
-            .device_id = value_buffer.device_id,
-            .memory_id = value_buffer.memory_id,
-            .device = value_buffer.device,
-            .memory = value_buffer.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = backend_buffer,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initDynamicSlice(
@@ -2355,23 +1811,8 @@ pub const Buffer = struct {
                     return initBackendOnly(allocator, src, src.element_type, output_dims, denseByteSize(src.element_type, output_dims), backend_buffer, shard_index);
                 }
             }
-            if (src.bytes.len == 0) return error.UnsupportedRuntimeFeature;
         }
-        var starts = try allocator.alloc(i64, start_buffers.len);
-        defer allocator.free(starts);
-        var limits = try allocator.alloc(i64, start_buffers.len);
-        defer allocator.free(limits);
-        var strides = try allocator.alloc(i64, start_buffers.len);
-        defer allocator.free(strides);
-        for (start_buffers, 0..) |start_buffer, i| {
-            if (start_buffer.dims.len != 0) return error.ShapeMismatch;
-            starts[i] = scalarIndex(start_buffer);
-            if (starts[i] < 0) starts[i] = 0;
-            if (starts[i] + slice_sizes[i] > src.dims[i]) starts[i] = src.dims[i] - slice_sizes[i];
-            limits[i] = starts[i] + slice_sizes[i];
-            strides[i] = 1;
-        }
-        return initSlice(allocator, src, starts, limits, strides, output_dims, shard_index);
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initDynamicUpdateSlice(
@@ -2394,58 +1835,8 @@ pub const Buffer = struct {
                     return initBackendOnly(allocator, src, src.element_type, output_dims, denseByteSize(src.element_type, output_dims), backend_buffer, shard_index);
                 }
             }
-            if (src.bytes.len == 0 or update.bytes.len == 0) return error.UnsupportedRuntimeFeature;
         }
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-        const bytes = try allocator.dupe(u8, src.bytes);
-        errdefer allocator.free(bytes);
-
-        var starts = try allocator.alloc(i64, start_buffers.len);
-        defer allocator.free(starts);
-        for (start_buffers, 0..) |start_buffer, i| {
-            if (start_buffer.dims.len != 0) return error.ShapeMismatch;
-            starts[i] = scalarIndex(start_buffer);
-            if (starts[i] < 0) starts[i] = 0;
-            if (starts[i] + update.dims[i] > src.dims[i]) starts[i] = src.dims[i] - update.dims[i];
-        }
-
-        const src_strides = try rowMajorStrides(allocator, src.dims);
-        defer allocator.free(src_strides);
-        const update_strides = try rowMajorStrides(allocator, update.dims);
-        defer allocator.free(update_strides);
-        const coords = try allocator.alloc(usize, update.dims.len);
-        defer allocator.free(coords);
-        const update_count = update.bytes.len / element_size;
-        for (0..update_count) |update_index| {
-            unravelIndex(update_index, update.dims, update_strides, coords);
-            var dst_index: usize = 0;
-            for (coords, 0..) |coord, axis| {
-                dst_index += (@as(usize, @intCast(starts[axis])) + coord) * src_strides[axis];
-            }
-            @memcpy(bytes[dst_index * element_size ..][0..element_size], update.bytes[update_index * element_size ..][0..element_size]);
-        }
-        const backend_buffer = src.backend.bufferFromHost(src.device.local_hardware_id, src.element_type, output_dims, bytes) catch null;
-        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = src.backend,
-            .backend_kind = src.backend_kind,
-            .element_type = src.element_type,
-            .dims = dims,
-            .device_id = src.device_id,
-            .memory_id = src.memory_id,
-            .device = src.device,
-            .memory = src.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = backend_buffer,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initPad(
@@ -2467,53 +1858,8 @@ pub const Buffer = struct {
             if (src.backend.pad(src.backend_buffer.?, padding_value.backend_buffer.?, edge_padding_low, edge_padding_high, interior_padding, output_dims) catch null) |backend_buffer| {
                 return initBackendOnly(allocator, src, src.element_type, output_dims, denseByteSize(src.element_type, output_dims), backend_buffer, shard_index);
             }
-            if (src.bytes.len == 0 or padding_value.bytes.len == 0) return error.UnsupportedRuntimeFeature;
         }
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-        const bytes = try allocator.alloc(u8, denseByteSize(src.element_type, output_dims));
-        errdefer allocator.free(bytes);
-        const out_count = bytes.len / element_size;
-        for (0..out_count) |i| @memcpy(bytes[i * element_size ..][0..element_size], padding_value.bytes[0..element_size]);
-
-        const src_strides = try rowMajorStrides(allocator, src.dims);
-        defer allocator.free(src_strides);
-        const dst_strides = try rowMajorStrides(allocator, output_dims);
-        defer allocator.free(dst_strides);
-        const coords = try allocator.alloc(usize, src.dims.len);
-        defer allocator.free(coords);
-        const src_count = src.bytes.len / element_size;
-        for (0..src_count) |src_index| {
-            unravelIndex(src_index, src.dims, src_strides, coords);
-            var dst_index: usize = 0;
-            for (coords, 0..) |coord, axis| {
-                const interior = @as(usize, @intCast(interior_padding[axis]));
-                const low = @as(usize, @intCast(edge_padding_low[axis]));
-                dst_index += (low + coord * (interior + 1)) * dst_strides[axis];
-            }
-            @memcpy(bytes[dst_index * element_size ..][0..element_size], src.bytes[src_index * element_size ..][0..element_size]);
-        }
-        const backend_buffer = src.backend.bufferFromHost(src.device.local_hardware_id, src.element_type, output_dims, bytes) catch null;
-        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = src.backend,
-            .backend_kind = src.backend_kind,
-            .element_type = src.element_type,
-            .dims = dims,
-            .device_id = src.device_id,
-            .memory_id = src.memory_id,
-            .device = src.device,
-            .memory = src.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = backend_buffer,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initGather(
@@ -2534,7 +1880,6 @@ pub const Buffer = struct {
         if (start_index_map.len == 0 or slice_sizes.len != operand.dims.len) return error.ShapeMismatch;
         if (index_vector_dim < 0) return error.ShapeMismatch;
 
-        const element_size = operand.element_type.byteSize();
         if (operand.backend_buffer != null and indices.backend_buffer != null) {
             if (supportedGatherAxisForRuntime(collapsed_slice_dims, start_index_map, slice_sizes)) |gather_axis| {
                 if (operand.backend.gatherAxis(operand.backend_buffer.?, indices.backend_buffer.?, gather_axis, index_vector_dim, output_dims) catch null) |backend_buffer| {
@@ -2555,78 +1900,8 @@ pub const Buffer = struct {
             ) catch null) |backend_buffer| {
                 return initBackendOnly(allocator, operand, operand.element_type, output_dims, denseByteSize(operand.element_type, output_dims), backend_buffer, shard_index);
             }
-            if (operand.bytes.len == 0 or indices.bytes.len == 0) return error.UnsupportedRuntimeFeature;
         }
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-        const bytes = try allocator.alloc(u8, denseByteSize(operand.element_type, output_dims));
-        errdefer allocator.free(bytes);
-
-        const operand_strides = try rowMajorStrides(allocator, operand.dims);
-        defer allocator.free(operand_strides);
-        const output_strides = try rowMajorStrides(allocator, output_dims);
-        defer allocator.free(output_strides);
-        const out_coords = try allocator.alloc(usize, output_dims.len);
-        defer allocator.free(out_coords);
-        const out_count = bytes.len / element_size;
-
-        if (collapsed_slice_dims.len == 1 and start_index_map.len == 1 and slice_sizes[@intCast(start_index_map[0])] == 1) {
-            const gather_axis: usize = @intCast(start_index_map[0]);
-            const index_rank = indices.dims.len;
-            const index_vector_axis: usize = @intCast(index_vector_dim);
-            const index_prefix_rank = if (index_rank > 0 and index_vector_axis < index_rank and indices.dims[index_vector_axis] == @as(i64, @intCast(start_index_map.len))) index_rank - 1 else index_rank;
-            if (output_dims.len < index_prefix_rank + operand.dims.len - 1) return error.ShapeMismatch;
-            const index_strides = try rowMajorStrides(allocator, indices.dims);
-            defer allocator.free(index_strides);
-            for (0..out_count) |out_index| {
-                unravelIndex(out_index, output_dims, output_strides, out_coords);
-                var index_flat: usize = 0;
-                var prefix_axis: usize = 0;
-                for (0..index_rank) |axis| {
-                    const coord = if (axis == index_vector_axis and index_rank != index_prefix_rank) 0 else blk: {
-                        const c = out_coords[prefix_axis];
-                        prefix_axis += 1;
-                        break :blk c;
-                    };
-                    index_flat += coord * index_strides[axis];
-                }
-                const gathered = scalarIndexAt(indices, index_flat);
-                var operand_index: usize = 0;
-                var offset_axis: usize = 0;
-                for (0..operand.dims.len) |axis| {
-                    const coord = if (axis == gather_axis) @as(usize, @intCast(@max(@as(i64, 0), @min(gathered, operand.dims[axis] - 1)))) else blk: {
-                        const c = out_coords[index_prefix_rank + offset_axis];
-                        offset_axis += 1;
-                        break :blk c;
-                    };
-                    operand_index += coord * operand_strides[axis];
-                }
-                @memcpy(bytes[out_index * element_size ..][0..element_size], operand.bytes[operand_index * element_size ..][0..element_size]);
-            }
-        } else {
-            return error.UnsupportedElementType;
-        }
-
-        const backend_buffer = operand.backend.bufferFromHost(operand.device.local_hardware_id, operand.element_type, output_dims, bytes) catch null;
-        errdefer if (backend_buffer) |owned| operand.backend.destroyBuffer(owned);
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = operand.backend,
-            .backend_kind = operand.backend_kind,
-            .element_type = operand.element_type,
-            .dims = dims,
-            .device_id = operand.device_id,
-            .memory_id = operand.memory_id,
-            .device = operand.device,
-            .memory = operand.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = backend_buffer,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initSort(
@@ -2658,34 +1933,8 @@ pub const Buffer = struct {
                 }
                 src.backend.destroyBuffer(sorted_backend);
             }
-            if (src.bytes.len == 0) return error.UnsupportedRuntimeFeature;
         }
-
-        const buffer = try allocator.create(Buffer);
-        errdefer allocator.destroy(buffer);
-        const dims = try allocator.dupe(i64, output_dims);
-        errdefer allocator.free(dims);
-        const bytes = try allocator.dupe(u8, src.bytes);
-        errdefer allocator.free(bytes);
-        try sortDenseBytes(allocator, src.element_type, bytes, output_dims, @intCast(dimension), ascending);
-        const backend_buffer = if (ascending) src.backend.bufferFromHost(src.device.local_hardware_id, src.element_type, output_dims, bytes) catch null else null;
-        errdefer if (backend_buffer) |owned| src.backend.destroyBuffer(owned);
-        buffer.* = .{
-            .allocator = allocator,
-            .backend = src.backend,
-            .backend_kind = src.backend_kind,
-            .element_type = src.element_type,
-            .dims = dims,
-            .device_id = src.device_id,
-            .memory_id = src.memory_id,
-            .device = src.device,
-            .memory = src.memory,
-            .shard_index = shard_index,
-            .byte_size = bytes.len,
-            .bytes = bytes,
-            .backend_buffer = backend_buffer,
-        };
-        return buffer.accountDeviceBytes();
+        return error.UnsupportedRuntimeFeature;
     }
 
     pub fn initU8Unary(
@@ -2699,8 +1948,7 @@ pub const Buffer = struct {
     }
 
     pub fn deinit(self: *Buffer) void {
-        if (self.accounted_bytes != 0) self.memory.stats.release(self.accounted_bytes);
-        if (self.backend_buffer) |backend_buffer| self.backend.destroyBuffer(backend_buffer);
+        self.releaseStorage();
         self.allocator.free(self.bytes);
         self.allocator.free(self.dims);
         self.allocator.destroy(self);
@@ -2708,13 +1956,10 @@ pub const Buffer = struct {
 
     pub fn copyToHost(self: *Buffer, dst: []u8) !void {
         try self.ensureUsable();
+        try self.ensureReady();
         if (dst.len < self.byte_size) return error.DestinationTooSmall;
-        if (self.backend_buffer) |backend_buffer| {
-            self.backend.copyToHost(backend_buffer, dst) catch return error.BackendBufferCopyFailed;
-            self.memory.stats.device_to_host_bytes += @intCast(self.byte_size);
-            return;
-        }
-        @memcpy(dst[0..self.byte_size], self.bytes[0..self.byte_size]);
+        const backend_buffer = self.backend_buffer orelse return error.UnsupportedRuntimeFeature;
+        self.backend.copyToHost(backend_buffer, dst) catch return error.BackendBufferCopyFailed;
         self.memory.stats.device_to_host_bytes += @intCast(self.byte_size);
     }
 
@@ -2723,15 +1968,45 @@ pub const Buffer = struct {
     }
 
     pub fn markDeleted(self: *Buffer) void {
+        self.releaseStorage();
         self.state = .deleted;
         self.deleted = true;
-        self.ready_event = Event.failed("buffer has been deleted");
+        self.ready_event.setFailed("buffer has been deleted");
     }
 
     pub fn markDonated(self: *Buffer) void {
+        self.releaseStorage();
         self.state = .donated;
         self.deleted = true;
-        self.ready_event = Event.failed("buffer has been donated");
+        self.ready_event.setFailed("buffer has been donated");
+    }
+
+    pub fn takeBackendStorageForDonationAlias(self: *Buffer) !backend_api.BufferHandle {
+        try self.ensureUsable();
+        const backend_buffer = self.backend_buffer orelse return error.UnsupportedRuntimeFeature;
+        self.backend_buffer = null;
+        if (self.accounted_bytes != 0) {
+            self.memory.stats.release(self.accounted_bytes);
+            self.accounted_bytes = 0;
+        }
+        return backend_buffer;
+    }
+
+    pub fn replaceBackendStorageFromHost(self: *Buffer, src: []const u8) !void {
+        try self.ensureUsable();
+        if (src.len != self.byte_size) return error.ShapeMismatch;
+        const backend_buffer = try self.backend.bufferFromHost(self.device.local_hardware_id, self.element_type, self.dims, src) orelse
+            return error.UnsupportedRuntimeFeature;
+        errdefer self.backend.destroyBuffer(backend_buffer);
+        try self.replaceBackendStorage(backend_buffer);
+        self.memory.stats.host_to_device_bytes += @intCast(src.len);
+    }
+
+    pub fn replaceBackendStorage(self: *Buffer, backend_buffer: backend_api.BufferHandle) !void {
+        try self.ensureUsable();
+        self.releaseStorage();
+        self.backend_buffer = backend_buffer;
+        _ = self.accountDeviceBytes();
     }
 
     pub fn ensureUsable(self: *const Buffer) !void {
@@ -2742,10 +2017,34 @@ pub const Buffer = struct {
         };
     }
 
+    pub fn ensureReady(self: *const Buffer) !void {
+        self.ready_event.awaitReady() catch |err| return switch (err) {
+            error.EventPending => error.BufferNotReady,
+            error.EventFailed => error.BufferReadinessFailed,
+        };
+    }
+
+    pub fn chainReadyAfter(self: *Buffer, dependency: *Event) !void {
+        try self.ensureUsable();
+        self.ready_event = Event.pending();
+        try dependency.chainTo(&self.ready_event);
+    }
+
     fn accountDeviceBytes(self: *Buffer) *Buffer {
         self.accounted_bytes = self.byte_size;
         self.memory.stats.retain(self.accounted_bytes);
         return self;
+    }
+
+    fn releaseStorage(self: *Buffer) void {
+        if (self.accounted_bytes != 0) {
+            self.memory.stats.release(self.accounted_bytes);
+            self.accounted_bytes = 0;
+        }
+        if (self.backend_buffer) |backend_buffer| {
+            self.backend.destroyBuffer(backend_buffer);
+            self.backend_buffer = null;
+        }
     }
 
     pub fn initBackendHandle(
@@ -2759,6 +2058,8 @@ pub const Buffer = struct {
         byte_size: usize,
         backend_buffer: backend_api.BufferHandle,
     ) !*Buffer {
+        if (!memory.isAddressableBy(device)) return error.InvalidArgument;
+
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
 
@@ -2900,134 +2201,8 @@ fn validReduce(input_dims: []const i64, dimensions: []const i64, output_dims: []
     return true;
 }
 
-fn rowMajorStrides(allocator: std.mem.Allocator, dims: []const i64) ![]usize {
-    const strides = try allocator.alloc(usize, dims.len);
-    var stride: usize = 1;
-    var reverse_index = dims.len;
-    while (reverse_index > 0) {
-        reverse_index -= 1;
-        strides[reverse_index] = stride;
-        if (dims[reverse_index] < 0) return error.ShapeMismatch;
-        stride = std.math.mul(usize, stride, @intCast(dims[reverse_index])) catch return error.ShapeMismatch;
-    }
-    return strides;
-}
-
-fn unravelIndex(index: usize, dims: []const i64, strides: []const usize, out: []usize) void {
-    for (0..dims.len) |axis| {
-        _ = dims[axis];
-        out[axis] = index / strides[axis] % @as(usize, @intCast(dims[axis]));
-    }
-}
-
-fn readF32LE(bytes: []const u8, index: usize) f32 {
-    return @bitCast(std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little));
-}
-
-fn writeF32LE(bytes: []u8, index: usize, value: f32) void {
-    std.mem.writeInt(u32, bytes[index * 4 ..][0..4], @bitCast(value), .little);
-}
-
-fn readI32LE(bytes: []const u8, index: usize) i32 {
-    return @bitCast(std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little));
-}
-
-fn writeI32LE(bytes: []u8, index: usize, value: i32) void {
-    std.mem.writeInt(u32, bytes[index * 4 ..][0..4], @bitCast(value), .little);
-}
-
 fn readU32LE(bytes: []const u8, index: usize) u32 {
     return std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little);
-}
-
-fn writeU32LE(bytes: []u8, index: usize, value: u32) void {
-    std.mem.writeInt(u32, bytes[index * 4 ..][0..4], value, .little);
-}
-
-fn seedFromBytes(bytes: []const u8) u64 {
-    var hash: u64 = 0xcbf29ce484222325;
-    for (bytes) |byte| {
-        hash ^= byte;
-        hash *%= 0x100000001b3;
-    }
-    return if (hash == 0) 0x9e3779b97f4a7c15 else hash;
-}
-
-fn rotl64(value: u64, amount: u6) u64 {
-    return std.math.rotl(u64, value, amount);
-}
-
-fn nextRandomU32(state: *u64) u32 {
-    var x = state.*;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    state.* = if (x == 0) 0x9e3779b97f4a7c15 else x;
-    return @truncate(x >> 32);
-}
-
-fn compareF32(lhs: f32, rhs: f32, direction: CompareOp) bool {
-    return switch (direction) {
-        .eq => lhs == rhs,
-        .ne => lhs != rhs,
-        .ge => lhs >= rhs,
-        .gt => lhs > rhs,
-        .le => lhs <= rhs,
-        .lt => lhs < rhs,
-    };
-}
-
-fn compareScalar(lhs: f64, rhs: f64, direction: CompareOp) bool {
-    return switch (direction) {
-        .eq => lhs == rhs,
-        .ne => lhs != rhs,
-        .ge => lhs >= rhs,
-        .gt => lhs > rhs,
-        .le => lhs <= rhs,
-        .lt => lhs < rhs,
-    };
-}
-
-fn compareElement(element_type: BufferType, lhs: []const u8, rhs: []const u8, index: usize, direction: CompareOp) bool {
-    return compareScalar(readScalarAsF64(element_type, lhs, index), readScalarAsF64(element_type, rhs, index), direction);
-}
-
-fn readScalarAsF64(element_type: BufferType, bytes: []const u8, index: usize) f64 {
-    return switch (element_type) {
-        .pred, .u8 => @floatFromInt(bytes[index]),
-        .s8 => @floatFromInt(@as(i8, @bitCast(bytes[index]))),
-        .s32 => @floatFromInt(readI32LE(bytes, index)),
-        .u32 => @floatFromInt(readU32LE(bytes, index)),
-        .f32 => readF32LE(bytes, index),
-        else => 0.0,
-    };
-}
-
-fn writeScalarFromF64(element_type: BufferType, bytes: []u8, index: usize, value: f64) void {
-    switch (element_type) {
-        .pred => bytes[index] = if (value != 0.0) 1 else 0,
-        .u8 => bytes[index] = @intFromFloat(@min(@max(value, 0.0), 255.0)),
-        .s8 => bytes[index] = @bitCast(@as(i8, @intFromFloat(@min(@max(value, -128.0), 127.0)))),
-        .s32 => writeI32LE(bytes, index, @intFromFloat(@min(@max(value, -2147483648.0), 2147483647.0))),
-        .u32 => writeU32LE(bytes, index, @intFromFloat(@min(@max(value, 0.0), 4294967295.0))),
-        .f32 => writeF32LE(bytes, index, @floatCast(value)),
-        else => {},
-    }
-}
-
-fn scalarIndex(buffer: *const Buffer) i64 {
-    return scalarIndexAt(buffer, 0);
-}
-
-fn scalarIndexAt(buffer: *const Buffer, index: usize) i64 {
-    return switch (buffer.element_type) {
-        .pred, .u8 => buffer.bytes[index],
-        .s8 => @as(i8, @bitCast(buffer.bytes[index])),
-        .s32 => readI32LE(buffer.bytes, index),
-        .u32 => @intCast(readU32LE(buffer.bytes, index)),
-        .f32 => @intFromFloat(readF32LE(buffer.bytes, index)),
-        else => 0,
-    };
 }
 
 fn backendStartHandles(allocator: std.mem.Allocator, start_buffers: []const *Buffer) ![]backend_api.BufferHandle {
@@ -3048,200 +2223,6 @@ fn supportedGatherAxisForRuntime(collapsed_slice_dims: []const i64, start_index_
     if (axis < 0 or collapsed_slice_dims[0] != axis) return null;
     if (slice_sizes.len == 0 or axis >= @as(i64, @intCast(slice_sizes.len)) or slice_sizes[@intCast(axis)] != 1) return null;
     return axis;
-}
-
-fn sortDenseBytes(allocator: std.mem.Allocator, element_type: BufferType, bytes: []u8, dims: []const i64, axis: usize, ascending: bool) !void {
-    if (axis >= dims.len or dims[axis] < 0) return error.ShapeMismatch;
-    const element_size = element_type.byteSize();
-    if (element_size == 0) return error.UnsupportedElementType;
-    const axis_len: usize = @intCast(dims[axis]);
-    if (axis_len <= 1) return;
-
-    const strides = try rowMajorStrides(allocator, dims);
-    defer allocator.free(strides);
-    const element_count = bytes.len / element_size;
-    const coords = try allocator.alloc(usize, dims.len);
-    defer allocator.free(coords);
-    const line = try allocator.alloc(usize, axis_len);
-    defer allocator.free(line);
-    const scratch = try allocator.alloc(u8, axis_len * element_size);
-    defer allocator.free(scratch);
-
-    for (0..element_count) |base_index| {
-        unravelIndex(base_index, dims, strides, coords);
-        if (coords[axis] != 0) continue;
-        for (0..axis_len) |i| {
-            line[i] = base_index + i * strides[axis];
-        }
-        std.mem.sort(usize, line, SortContext{ .bytes = bytes, .element_type = element_type, .ascending = ascending }, lessSortIndex);
-        for (line, 0..) |src_index, i| {
-            @memcpy(scratch[i * element_size ..][0..element_size], bytes[src_index * element_size ..][0..element_size]);
-        }
-        for (0..axis_len) |i| {
-            const dst_index = base_index + i * strides[axis];
-            @memcpy(bytes[dst_index * element_size ..][0..element_size], scratch[i * element_size ..][0..element_size]);
-        }
-    }
-}
-
-const SortContext = struct {
-    bytes: []const u8,
-    element_type: BufferType,
-    ascending: bool,
-};
-
-fn lessSortIndex(context: SortContext, lhs: usize, rhs: usize) bool {
-    const lhs_value = readScalarAsF64(context.element_type, context.bytes, lhs);
-    const rhs_value = readScalarAsF64(context.element_type, context.bytes, rhs);
-    return if (context.ascending) lhs_value < rhs_value else lhs_value > rhs_value;
-}
-
-fn axisInList(axis: usize, axes: []const i64) bool {
-    for (axes) |candidate| {
-        if (candidate >= 0 and @as(usize, @intCast(candidate)) == axis) return true;
-    }
-    return false;
-}
-
-fn outputAxesWithout(input_rank: usize, removed_axes: []const i64, allocator: std.mem.Allocator) ![]usize {
-    var axes = try allocator.alloc(usize, input_rank - removed_axes.len);
-    var out: usize = 0;
-    for (0..input_rank) |axis| {
-        if (!axisInList(axis, removed_axes)) {
-            axes[out] = axis;
-            out += 1;
-        }
-    }
-    return axes;
-}
-
-fn evalReduceF32(
-    allocator: std.mem.Allocator,
-    kind: core.PlanInstructionKind,
-    src_bytes: []const u8,
-    input_dims: []const i64,
-    dimensions: []const i64,
-    output_dims: []const i64,
-    out_bytes: []u8,
-) !void {
-    const input_strides = try rowMajorStrides(allocator, input_dims);
-    defer allocator.free(input_strides);
-    const output_strides = try rowMajorStrides(allocator, output_dims);
-    defer allocator.free(output_strides);
-    const coords = try allocator.alloc(usize, input_dims.len);
-    defer allocator.free(coords);
-    const output_axes = try outputAxesWithout(input_dims.len, dimensions, allocator);
-    defer allocator.free(output_axes);
-
-    const output_count = if (output_dims.len == 0) 1 else denseByteSize(.f32, output_dims) / 4;
-    for (0..output_count) |i| {
-        writeF32LE(out_bytes, i, if (kind == .reduce_sum) 0.0 else -std.math.inf(f32));
-    }
-    const input_count = src_bytes.len / 4;
-    for (0..input_count) |input_index| {
-        unravelIndex(input_index, input_dims, input_strides, coords);
-        var output_index: usize = 0;
-        for (output_axes, 0..) |input_axis, output_axis| {
-            output_index += coords[input_axis] * output_strides[output_axis];
-        }
-        const current = readF32LE(out_bytes, output_index);
-        const value = readF32LE(src_bytes, input_index);
-        writeF32LE(out_bytes, output_index, if (kind == .reduce_sum) current + value else @max(current, value));
-    }
-}
-
-fn evalReducePred(
-    allocator: std.mem.Allocator,
-    kind: core.PlanInstructionKind,
-    src_bytes: []const u8,
-    input_dims: []const i64,
-    dimensions: []const i64,
-    output_dims: []const i64,
-    out_bytes: []u8,
-) !void {
-    const input_strides = try rowMajorStrides(allocator, input_dims);
-    defer allocator.free(input_strides);
-    const output_strides = try rowMajorStrides(allocator, output_dims);
-    defer allocator.free(output_strides);
-    const coords = try allocator.alloc(usize, input_dims.len);
-    defer allocator.free(coords);
-    const output_axes = try outputAxesWithout(input_dims.len, dimensions, allocator);
-    defer allocator.free(output_axes);
-
-    const output_count = if (output_dims.len == 0) 1 else denseByteSize(.pred, output_dims);
-    @memset(out_bytes[0..output_count], if (kind == .reduce_and) 1 else 0);
-    for (src_bytes, 0..) |value, input_index| {
-        unravelIndex(input_index, input_dims, input_strides, coords);
-        var output_index: usize = 0;
-        for (output_axes, 0..) |input_axis, output_axis| {
-            output_index += coords[input_axis] * output_strides[output_axis];
-        }
-        out_bytes[output_index] = if (kind == .reduce_and)
-            @intFromBool(out_bytes[output_index] != 0 and value != 0)
-        else
-            @intFromBool(out_bytes[output_index] != 0 or value != 0);
-    }
-}
-
-fn evalDotGeneralF32(
-    allocator: std.mem.Allocator,
-    lhs_bytes: []const u8,
-    lhs_dims: []const i64,
-    rhs_bytes: []const u8,
-    rhs_dims: []const i64,
-    lhs_batch_dimensions: []const i64,
-    rhs_batch_dimensions: []const i64,
-    lhs_contracting_dimensions: []const i64,
-    rhs_contracting_dimensions: []const i64,
-    output_dims: []const i64,
-    out_bytes: []u8,
-) !void {
-    const lhs_contract: usize = @intCast(lhs_contracting_dimensions[0]);
-    const rhs_contract: usize = @intCast(rhs_contracting_dimensions[0]);
-    const lhs_strides = try rowMajorStrides(allocator, lhs_dims);
-    defer allocator.free(lhs_strides);
-    const rhs_strides = try rowMajorStrides(allocator, rhs_dims);
-    defer allocator.free(rhs_strides);
-    const out_strides = try rowMajorStrides(allocator, output_dims);
-    defer allocator.free(out_strides);
-    const out_coords = try allocator.alloc(usize, output_dims.len);
-    defer allocator.free(out_coords);
-
-    const lhs_free_axes = try outputAxesWithout(lhs_dims.len, lhs_contracting_dimensions, allocator);
-    defer allocator.free(lhs_free_axes);
-    const rhs_free_axes = try outputAxesWithout(rhs_dims.len, rhs_contracting_dimensions, allocator);
-    defer allocator.free(rhs_free_axes);
-    const batch_count = lhs_batch_dimensions.len;
-    const lhs_non_batch_count = lhs_free_axes.len - batch_count;
-    const rhs_non_batch_count = rhs_free_axes.len - batch_count;
-    const contract_size: usize = @intCast(lhs_dims[lhs_contract]);
-    const output_count = out_bytes.len / 4;
-
-    for (0..output_count) |out_index| {
-        unravelIndex(out_index, output_dims, out_strides, out_coords);
-        var lhs_base: usize = 0;
-        var rhs_base: usize = 0;
-        var out_axis: usize = 0;
-        for (0..batch_count) |i| {
-            const coord = out_coords[out_axis];
-            lhs_base += coord * lhs_strides[@intCast(lhs_batch_dimensions[i])];
-            rhs_base += coord * rhs_strides[@intCast(rhs_batch_dimensions[i])];
-            out_axis += 1;
-        }
-        for (lhs_free_axes[batch_count..], 0..) |lhs_axis, i| {
-            lhs_base += out_coords[out_axis + i] * lhs_strides[lhs_axis];
-        }
-        out_axis += lhs_non_batch_count;
-        for (rhs_free_axes[batch_count..], 0..) |rhs_axis, i| {
-            rhs_base += out_coords[out_axis + i] * rhs_strides[rhs_axis];
-        }
-        _ = rhs_non_batch_count;
-        var acc: f32 = 0.0;
-        for (0..contract_size) |k| {
-            acc += readF32LE(lhs_bytes, lhs_base + k * lhs_strides[lhs_contract]) * readF32LE(rhs_bytes, rhs_base + k * rhs_strides[rhs_contract]);
-        }
-        writeF32LE(out_bytes, out_index, acc);
-    }
 }
 
 fn mlxMetalBackendForTest() backend_api.Backend {
@@ -3288,27 +2269,249 @@ fn testShardingPlan(allocator: std.mem.Allocator, assignment: []const i32) !core
     };
 }
 
-test "executable graph materializes per-device scheduled nodes" {
-    const client = try initMlxMetalClientForTest();
-    defer client.deinit();
+fn constantU8ExecutablePlanForTest(allocator: std.mem.Allocator, assignment: []const i32, literal: []const u8) !core.ExecutablePlan {
+    var values = try allocator.alloc(core.Value, 1);
+    errdefer allocator.free(values);
+
+    const dims = [_]i64{@intCast(literal.len)};
+    const owned_dims = try allocator.dupe(i64, &dims);
+    errdefer allocator.free(owned_dims);
+    values[0] = .{
+        .id = .{ .index = 0 },
+        .role = .instruction_result,
+        .descriptor = .{
+            .element_type = .u8,
+            .dims = owned_dims,
+            .device_id = assignment[0],
+            .memory_id = assignment[0],
+            .shard_index = 0,
+        },
+    };
+
+    var output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    errdefer allocator.free(output_shardings);
+    output_shardings[0] = try testShardingPlan(allocator, assignment);
+    errdefer {
+        allocator.free(output_shardings[0].mesh_name);
+        allocator.free(output_shardings[0].device_assignment);
+    }
+
+    const output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }});
+    errdefer allocator.free(output_ids);
+
+    const literal_copy = try allocator.dupe(u8, literal);
+    errdefer allocator.free(literal_copy);
+
+    const instruction_outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }});
+    errdefer allocator.free(instruction_outputs);
+
+    const instructions = try allocator.dupe(core.PlanInstruction, &.{.{
+        .kind = .constant,
+        .outputs = instruction_outputs,
+        .literal = literal_copy,
+    }});
+    errdefer allocator.free(instructions);
+
+    return .{
+        .allocator = allocator,
+        .options = .{
+            .num_replicas = 1,
+            .num_partitions = 1,
+            .device_assignment = try allocator.dupe(i32, assignment),
+        },
+        .values = values,
+        .parameter_shardings = try allocator.alloc(core.ShardingPlan, 0),
+        .output_shardings = output_shardings,
+        .output_ids = output_ids,
+        .instructions = instructions,
+    };
+}
+
+fn addU8ExecutablePlanForTest(allocator: std.mem.Allocator, assignment: []const i32, dims: []const i64) !core.ExecutablePlan {
+    const values = try allocator.alloc(core.Value, 3);
+    errdefer allocator.free(values);
+
+    for (values, 0..) |*value, i| {
+        value.* = .{
+            .id = .{ .index = @intCast(i) },
+            .role = if (i < 2) .parameter else .instruction_result,
+            .descriptor = .{
+                .element_type = .u8,
+                .dims = try allocator.dupe(i64, dims),
+                .device_id = assignment[0],
+                .memory_id = assignment[0],
+                .shard_index = 0,
+            },
+        };
+    }
+
+    var parameter_shardings = try allocator.alloc(core.ShardingPlan, 2);
+    errdefer allocator.free(parameter_shardings);
+    parameter_shardings[0] = try testShardingPlan(allocator, assignment);
+    errdefer {
+        allocator.free(parameter_shardings[0].mesh_name);
+        allocator.free(parameter_shardings[0].device_assignment);
+    }
+    parameter_shardings[1] = try testShardingPlan(allocator, assignment);
+    errdefer {
+        allocator.free(parameter_shardings[1].mesh_name);
+        allocator.free(parameter_shardings[1].device_assignment);
+    }
+
+    var output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    errdefer allocator.free(output_shardings);
+    output_shardings[0] = try testShardingPlan(allocator, assignment);
+    errdefer {
+        allocator.free(output_shardings[0].mesh_name);
+        allocator.free(output_shardings[0].device_assignment);
+    }
+
+    const output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }});
+    errdefer allocator.free(output_ids);
+
+    const inputs = try allocator.dupe(core.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } });
+    errdefer allocator.free(inputs);
+
+    const outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }});
+    errdefer allocator.free(outputs);
+
+    const instructions = try allocator.dupe(core.PlanInstruction, &.{.{
+        .kind = .add,
+        .inputs = inputs,
+        .outputs = outputs,
+    }});
+    errdefer allocator.free(instructions);
+
+    return .{
+        .allocator = allocator,
+        .options = .{
+            .num_replicas = 1,
+            .num_partitions = 1,
+            .device_assignment = try allocator.dupe(i32, assignment),
+        },
+        .values = values,
+        .parameter_shardings = parameter_shardings,
+        .output_shardings = output_shardings,
+        .output_ids = output_ids,
+        .instructions = instructions,
+    };
+}
+
+test "backend output descriptor validation matches executable plan outputs" {
     const allocator = std.testing.allocator;
+    const assignment = [_]i32{0};
+    const dims = [_]i64{ 2, 2 };
+
+    const values = try allocator.alloc(core.Value, 1);
+    errdefer allocator.free(values);
+    values[0] = .{
+        .id = .{ .index = 0 },
+        .role = .instruction_result,
+        .descriptor = .{
+            .element_type = .f32,
+            .dims = try allocator.dupe(i64, &dims),
+            .device_id = 0,
+            .memory_id = 0,
+            .shard_index = 0,
+        },
+    };
+
+    var output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    output_shardings[0] = try testShardingPlan(allocator, &assignment);
 
     var plan = core.ExecutablePlan{
         .allocator = allocator,
         .options = .{
             .num_replicas = 1,
             .num_partitions = 1,
-            .device_assignment = try allocator.dupe(i32, &.{0}),
+            .device_assignment = try allocator.dupe(i32, &assignment),
         },
-        .values = &.{},
+        .values = values,
         .parameter_shardings = try allocator.alloc(core.ShardingPlan, 0),
-        .output_shardings = try allocator.alloc(core.ShardingPlan, 0),
-        .output_ids = try allocator.alloc(core.ValueId, 0),
-        .instructions = try allocator.dupe(core.PlanInstruction, &.{
-            .{ .kind = .constant },
-            .{ .kind = .custom_call },
-            .{ .kind = .while_ },
-        }),
+        .output_shardings = output_shardings,
+        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }}),
+        .instructions = try allocator.alloc(core.PlanInstruction, 0),
+    };
+    defer plan.deinit();
+
+    const handle: backend_api.BufferHandle = @ptrFromInt(0x1000);
+    try std.testing.expect(backendOutputMatchesPlan(&plan, 0, .{
+        .handle = handle,
+        .element_type = .f32,
+        .dims = &dims,
+        .byte_size = 16,
+    }));
+    try std.testing.expect(!backendOutputMatchesPlan(&plan, 0, .{
+        .handle = handle,
+        .element_type = .u32,
+        .dims = &dims,
+        .byte_size = 16,
+    }));
+    try std.testing.expect(!backendOutputMatchesPlan(&plan, 0, .{
+        .handle = handle,
+        .element_type = .f32,
+        .dims = &.{4},
+        .byte_size = 16,
+    }));
+    try std.testing.expect(!backendOutputMatchesPlan(&plan, 0, .{
+        .handle = handle,
+        .element_type = .f32,
+        .dims = &dims,
+        .byte_size = 12,
+    }));
+    try std.testing.expect(!backendOutputMatchesPlan(&plan, 1, .{
+        .handle = handle,
+        .element_type = .f32,
+        .dims = &dims,
+        .byte_size = 16,
+    }));
+}
+
+test "executable graph materializes per-device scheduled nodes" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+    const allocator = std.testing.allocator;
+    const assignment = [_]i32{0};
+    const dims = [_]i64{4};
+
+    const values = try allocator.alloc(core.Value, 3);
+    errdefer allocator.free(values);
+    for (values, 0..) |*value, i| {
+        value.* = .{
+            .id = .{ .index = @intCast(i) },
+            .role = if (i < 2) .parameter else .instruction_result,
+            .descriptor = .{
+                .element_type = .u8,
+                .dims = try allocator.dupe(i64, &dims),
+                .device_id = 0,
+                .memory_id = 0,
+                .shard_index = 0,
+            },
+        };
+    }
+
+    var parameter_shardings = try allocator.alloc(core.ShardingPlan, 2);
+    parameter_shardings[0] = try testShardingPlan(allocator, &assignment);
+    parameter_shardings[1] = try testShardingPlan(allocator, &assignment);
+    var output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    output_shardings[0] = try testShardingPlan(allocator, &assignment);
+
+    var plan = core.ExecutablePlan{
+        .allocator = allocator,
+        .options = .{
+            .num_replicas = 1,
+            .num_partitions = 1,
+            .device_assignment = try allocator.dupe(i32, &assignment),
+        },
+        .values = values,
+        .parameter_shardings = parameter_shardings,
+        .output_shardings = output_shardings,
+        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
+        .instructions = try allocator.dupe(core.PlanInstruction, &.{.{
+            .kind = .add,
+            .inputs = try allocator.dupe(core.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+            .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
+        }}),
     };
     defer plan.deinit();
 
@@ -3316,15 +2519,16 @@ test "executable graph materializes per-device scheduled nodes" {
     defer graph.deinit();
 
     try std.testing.expectEqualSlices(i32, &.{0}, graph.device_ids);
-    try std.testing.expectEqual(@as(usize, 3), graph.nodes.len);
-    try std.testing.expectEqual(GraphNodeKind.constant, graph.nodes[0].kind);
-    try std.testing.expectEqual(GraphNodeKind.custom_call, graph.nodes[1].kind);
-    try std.testing.expectEqual(GraphNodeKind.control_flow, graph.nodes[2].kind);
+    try std.testing.expectEqual(@as(usize, 1), graph.nodes.len);
+    try std.testing.expectEqual(GraphNodeKind.compute, graph.nodes[0].kind);
     try std.testing.expectEqual(@as(usize, 0), graph.nodes[0].device_index);
     try std.testing.expectEqual(@as(i32, 0), graph.nodes[0].device_id);
-    try std.testing.expectEqual(LoweringMode.allow_runtime_fallback, graph.lowering.mode);
-    try std.testing.expectEqual(false, graph.lowering.backend_executable_ready);
-    try std.testing.expectEqual(@as(usize, 3), graph.lowering.fallback_instruction_count);
+    try std.testing.expectEqual(true, graph.lowering.backend_executable_ready);
+    try std.testing.expectEqual(@as(usize, 1), graph.lowering.lowered_instruction_count);
+    try std.testing.expectEqual(GraphNodeKind.constant, graphNodeKind(.constant));
+    try std.testing.expectEqual(GraphNodeKind.custom_call, graphNodeKind(.custom_call));
+    try std.testing.expectEqual(GraphNodeKind.structural, graphNodeKind(.optimization_barrier));
+    try std.testing.expectEqual(GraphNodeKind.control_flow, graphNodeKind(.while_));
 }
 
 test "executable graph device-only lowering rejects unsupported backend executable" {
@@ -3351,7 +2555,7 @@ test "executable graph device-only lowering rejects unsupported backend executab
 
     try std.testing.expectError(
         error.UnsupportedRuntimeFeature,
-        ExecutableGraph.initWithOptions(allocator, client, &plan, .{ .mode = .require_backend_executable }),
+        ExecutableGraph.initWithOptions(allocator, client, &plan, .{}),
     );
 }
 
@@ -3406,10 +2610,8 @@ test "executable graph executes through runtime buffers" {
     var graph = try ExecutableGraph.init(allocator, client, &plan);
     defer graph.deinit();
     try std.testing.expect(graph.backend_executable != null);
-    try std.testing.expectEqual(LoweringMode.allow_runtime_fallback, graph.lowering.mode);
     try std.testing.expectEqual(true, graph.lowering.backend_executable_ready);
     try std.testing.expectEqual(@as(usize, 1), graph.lowering.lowered_instruction_count);
-    try std.testing.expectEqual(@as(usize, 0), graph.lowering.fallback_instruction_count);
 
     const lhs_data = [_]u8{ 1, 2, 3, 4 };
     const rhs_data = [_]u8{ 10, 20, 30, 40 };
@@ -3418,9 +2620,11 @@ test "executable graph executes through runtime buffers" {
     const rhs = try Buffer.initHostCopyForBackend(allocator, client.backend, .u8, &dims, &client.devices[0], &client.memories[0], 0, &rhs_data);
     defer rhs.deinit();
 
+    client.memories[0].stats.capacity_bytes = client.memories[0].stats.bytes_in_use + 4;
     const h2d_before_execute = client.memories[0].stats.host_to_device_bytes;
     const d2h_before_execute = client.memories[0].stats.device_to_host_bytes;
-    const outputs = try graph.executeDevice(allocator, client, &plan, 0, &.{ lhs, rhs });
+    const result = try graph.executeDevice(allocator, client, &plan, 0, &.{ lhs, rhs });
+    const outputs = result.outputs;
     defer allocator.free(outputs);
     defer {
         for (outputs) |output| output.deinit();
@@ -3430,10 +2634,497 @@ test "executable graph executes through runtime buffers" {
     try std.testing.expectEqual(@as(usize, 0), outputs[0].shard_index);
     try std.testing.expect(outputs[0].backend_buffer != null);
     try std.testing.expectEqual(@as(usize, 0), outputs[0].bytes.len);
+    try std.testing.expectEqual(@as(u64, 4), graph.last_execute_cache_trim.requested_bytes);
+    try std.testing.expectEqual(@as(u64, 0), graph.last_execute_cache_trim.freed_bytes);
+    try std.testing.expect(!graph.last_execute_cache_trim.still_over_capacity);
+    try std.testing.expectEqual(backend_api.ExecutionCompletionKind.completed, graph.last_backend_completion.kind);
+    try std.testing.expect(result.completion_event.isReady());
     try std.testing.expectEqual(h2d_before_execute, client.memories[0].stats.host_to_device_bytes);
     try std.testing.expectEqual(d2h_before_execute, client.memories[0].stats.device_to_host_bytes);
     try expectBufferBytes(outputs[0], &.{ 11, 22, 33, 44 });
     try std.testing.expectEqual(d2h_before_execute + outputs[0].byte_size, client.memories[0].stats.device_to_host_bytes);
+
+    const wrong_shard = try Buffer.initHostCopyForBackend(allocator, client.backend, .u8, &dims, &client.devices[0], &client.memories[0], 7, &lhs_data);
+    defer wrong_shard.deinit();
+    try std.testing.expectError(error.InvalidArgument, graph.executeDevice(allocator, client, &plan, 0, &.{ wrong_shard, rhs }));
+
+    lhs.ready_event = Event.pending();
+    try std.testing.expectError(error.BufferNotReady, graph.executeDevice(allocator, client, &plan, 0, &.{ lhs, rhs }));
+    lhs.ready_event.setReady();
+    rhs.ready_event = Event.failed("argument upload failed");
+    try std.testing.expectError(error.BufferReadinessFailed, graph.executeDevice(allocator, client, &plan, 0, &.{ lhs, rhs }));
+    rhs.ready_event = Event.ready();
+
+    lhs.device_id = 1234;
+    try std.testing.expectError(error.InvalidArgument, graph.executeDevice(allocator, client, &plan, 0, &.{ lhs, rhs }));
+}
+
+test "executable graph transfers donated parameter alias outputs without copying" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+    const allocator = std.testing.allocator;
+    const assignment = [_]i32{0};
+    const dims = [_]i64{4};
+
+    const values = try allocator.alloc(core.Value, 1);
+    errdefer allocator.free(values);
+    values[0] = .{
+        .id = .{ .index = 0 },
+        .role = .parameter,
+        .descriptor = .{
+            .element_type = .u8,
+            .dims = try allocator.dupe(i64, &dims),
+            .device_id = 0,
+            .memory_id = 0,
+            .shard_index = 0,
+        },
+    };
+
+    var parameter_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    parameter_shardings[0] = try testShardingPlan(allocator, &assignment);
+    var output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    output_shardings[0] = try testShardingPlan(allocator, &assignment);
+
+    var plan = core.ExecutablePlan{
+        .allocator = allocator,
+        .options = .{
+            .num_replicas = 1,
+            .num_partitions = 1,
+            .device_assignment = try allocator.dupe(i32, &assignment),
+        },
+        .values = values,
+        .parameter_shardings = parameter_shardings,
+        .output_shardings = output_shardings,
+        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }}),
+        .donated_parameter_indices = try allocator.dupe(u32, &.{0}),
+        .instructions = try allocator.alloc(core.PlanInstruction, 0),
+    };
+    defer plan.deinit();
+
+    var graph = try ExecutableGraph.init(allocator, client, &plan);
+    defer graph.deinit();
+
+    const data = [_]u8{ 9, 8, 7, 6 };
+    const input = try Buffer.initHostCopyForBackend(allocator, client.backend, .u8, &dims, &client.devices[0], &client.memories[0], 0, &data);
+    defer input.deinit();
+    const before_execute_bytes = client.memories[0].stats.bytes_in_use;
+    const before_execute_handle = input.backend_buffer;
+
+    const result = try graph.executeDevice(allocator, client, &plan, 0, &.{input});
+    defer allocator.free(result.outputs);
+    defer {
+        for (result.outputs) |output| output.deinit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), result.outputs.len);
+    try std.testing.expectEqual(before_execute_handle, result.outputs[0].backend_buffer);
+    try std.testing.expectEqual(@as(?backend_api.BufferHandle, null), input.backend_buffer);
+    input.markDonated();
+    try std.testing.expectEqual(BufferState.donated, input.state);
+    try std.testing.expect(result.outputs[0].hasBackendStorage());
+    try expectBufferBytes(result.outputs[0], &data);
+    try std.testing.expectEqual(before_execute_bytes, client.memories[0].stats.bytes_in_use);
+
+    const stats = graph.backendExecutableStats().?;
+    try std.testing.expectEqual(@as(usize, 1), stats.donation_alias_output_count);
+    try std.testing.expectEqual(@as(usize, data.len), stats.donation_alias_output_bytes);
+}
+
+test "executable graph reuses cached backend executable handles" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+    const allocator = std.testing.allocator;
+    const assignment = [_]i32{0};
+    const dims = [_]i64{4};
+
+    const values = try allocator.alloc(core.Value, 3);
+    errdefer allocator.free(values);
+    for (values, 0..) |*value, i| {
+        value.* = .{
+            .id = .{ .index = @intCast(i) },
+            .role = if (i < 2) .parameter else .instruction_result,
+            .descriptor = .{
+                .element_type = .u8,
+                .dims = try allocator.dupe(i64, &dims),
+                .device_id = 0,
+                .memory_id = 0,
+                .shard_index = 0,
+            },
+        };
+    }
+
+    var parameter_shardings = try allocator.alloc(core.ShardingPlan, 2);
+    parameter_shardings[0] = try testShardingPlan(allocator, &assignment);
+    parameter_shardings[1] = try testShardingPlan(allocator, &assignment);
+    var output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    output_shardings[0] = try testShardingPlan(allocator, &assignment);
+
+    var plan = core.ExecutablePlan{
+        .allocator = allocator,
+        .options = .{
+            .num_replicas = 1,
+            .num_partitions = 1,
+            .device_assignment = try allocator.dupe(i32, &assignment),
+        },
+        .values = values,
+        .parameter_shardings = parameter_shardings,
+        .output_shardings = output_shardings,
+        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
+        .instructions = try allocator.dupe(core.PlanInstruction, &.{.{
+            .kind = .add,
+            .inputs = try allocator.dupe(core.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+            .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
+        }}),
+    };
+    defer plan.deinit();
+
+    const fingerprint = "cached-add";
+    try std.testing.expect(!try client.recordExecutableCompile(fingerprint));
+    var first = try ExecutableGraph.initWithOptions(allocator, client, &plan, .{
+        .cache_fingerprint = fingerprint,
+    });
+    try std.testing.expect(first.backend_executable != null);
+    try std.testing.expect(!first.lowering.backend_executable_cache_reused);
+
+    const entry = client.executable_cache.get(fingerprint) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(entry.backend_executable != null);
+    try std.testing.expectEqual(@as(usize, 1), entry.ref_count);
+
+    try std.testing.expect(try client.recordExecutableCompile(fingerprint));
+    var second = try ExecutableGraph.initWithOptions(allocator, client, &plan, .{
+        .cache_fingerprint = fingerprint,
+    });
+    try std.testing.expect(second.backend_executable != null);
+    try std.testing.expect(second.lowering.backend_executable_cache_reused);
+    try std.testing.expectEqual(first.backend_executable.?, second.backend_executable.?);
+    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.misses);
+    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.hits);
+    try std.testing.expectEqual(@as(usize, 2), entry.ref_count);
+
+    second.deinit();
+    try std.testing.expectEqual(@as(usize, 1), entry.ref_count);
+    first.deinit();
+    try std.testing.expectEqual(@as(usize, 0), entry.ref_count);
+    try std.testing.expect(entry.backend_executable != null);
+}
+
+test "executable cache evicts idle resident backend executables under byte limit" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+    const allocator = std.testing.allocator;
+    const assignment = [_]i32{0};
+    const dims = [_]i64{4};
+    const literal = [_]u8{ 1, 2, 3, 4 };
+
+    const values = try allocator.alloc(core.Value, 1);
+    errdefer allocator.free(values);
+    values[0] = .{
+        .id = .{ .index = 0 },
+        .role = .instruction_result,
+        .descriptor = .{
+            .element_type = .u8,
+            .dims = try allocator.dupe(i64, &dims),
+            .device_id = 0,
+            .memory_id = 0,
+            .shard_index = 0,
+        },
+    };
+
+    var output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    output_shardings[0] = try testShardingPlan(allocator, &assignment);
+
+    var plan = core.ExecutablePlan{
+        .allocator = allocator,
+        .options = .{
+            .num_replicas = 1,
+            .num_partitions = 1,
+            .device_assignment = try allocator.dupe(i32, &assignment),
+        },
+        .values = values,
+        .parameter_shardings = try allocator.alloc(core.ShardingPlan, 0),
+        .output_shardings = output_shardings,
+        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }}),
+        .instructions = try allocator.dupe(core.PlanInstruction, &.{.{
+            .kind = .constant,
+            .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }}),
+            .literal = try allocator.dupe(u8, &literal),
+        }}),
+    };
+    defer plan.deinit();
+
+    client.setExecutableCacheMaxResidentBytes(0);
+
+    const fingerprint = "evict-idle-constant";
+    try std.testing.expect(!try client.recordExecutableCompile(fingerprint));
+    var first = try ExecutableGraph.initWithOptions(allocator, client, &plan, .{
+        .cache_fingerprint = fingerprint,
+    });
+    const entry = client.executable_cache.get(fingerprint) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(first.backend_executable != null);
+    try std.testing.expect(entry.backend_executable != null);
+    try std.testing.expect(entry.resident_bytes >= literal.len);
+    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.resident_entries);
+    try std.testing.expect(client.executable_cache.stats.resident_bytes >= literal.len);
+    try std.testing.expect(client.memories[0].stats.totalBytesInUse() >= literal.len);
+    try std.testing.expect(client.memories[0].stats.peakTotalBytesInUse() >= client.memories[0].stats.totalBytesInUse());
+    try std.testing.expectEqual(@as(usize, 1), entry.ref_count);
+
+    first.deinit();
+    try std.testing.expectEqual(@as(usize, 0), entry.ref_count);
+    try std.testing.expect(entry.backend_executable == null);
+    try std.testing.expectEqual(@as(u64, 0), client.executable_cache.stats.resident_entries);
+    try std.testing.expectEqual(@as(u64, 0), client.executable_cache.stats.resident_bytes);
+    try std.testing.expectEqual(@as(u64, 0), client.memories[0].stats.totalBytesInUse());
+    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.evictions);
+    try std.testing.expectEqual(@as(u64, 1), client.memories[0].stats.executable_cache_evictions);
+
+    try std.testing.expect(try client.recordExecutableCompile(fingerprint));
+    var second = try ExecutableGraph.initWithOptions(allocator, client, &plan, .{
+        .cache_fingerprint = fingerprint,
+    });
+    defer second.deinit();
+    try std.testing.expect(second.backend_executable != null);
+    try std.testing.expect(!second.lowering.backend_executable_cache_reused);
+    try std.testing.expectEqual(@as(usize, 1), entry.ref_count);
+    try std.testing.expect(entry.backend_executable != null);
+    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.hits);
+}
+
+test "executable cache evicts largest idle resident executable before older smaller entries" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+    const allocator = std.testing.allocator;
+    const assignment = [_]i32{0};
+
+    var small_plan = try constantU8ExecutablePlanForTest(allocator, &assignment, &.{ 1, 2, 3, 4 });
+    defer small_plan.deinit();
+    var large_plan = try constantU8ExecutablePlanForTest(allocator, &assignment, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    defer large_plan.deinit();
+
+    try std.testing.expect(!try client.recordExecutableCompile("small-constant"));
+    var small_graph = try ExecutableGraph.initWithOptions(allocator, client, &small_plan, .{
+        .cache_fingerprint = "small-constant",
+    });
+    const small_entry = client.executable_cache.get("small-constant") orelse return error.TestUnexpectedResult;
+    const small_resident_bytes = small_entry.resident_bytes;
+    try std.testing.expect(small_resident_bytes >= 4);
+    small_graph.deinit();
+    try std.testing.expectEqual(@as(usize, 0), small_entry.ref_count);
+    try std.testing.expect(small_entry.backend_executable != null);
+
+    try std.testing.expect(!try client.recordExecutableCompile("large-constant"));
+    var large_graph = try ExecutableGraph.initWithOptions(allocator, client, &large_plan, .{
+        .cache_fingerprint = "large-constant",
+    });
+    const large_entry = client.executable_cache.get("large-constant") orelse return error.TestUnexpectedResult;
+    const large_resident_bytes = large_entry.resident_bytes;
+    try std.testing.expect(large_resident_bytes > small_resident_bytes);
+    large_graph.deinit();
+    try std.testing.expectEqual(@as(usize, 0), large_entry.ref_count);
+    try std.testing.expect(large_entry.backend_executable != null);
+
+    client.setExecutableCacheMaxResidentBytes(small_resident_bytes);
+    try std.testing.expect(small_entry.backend_executable != null);
+    try std.testing.expect(large_entry.backend_executable == null);
+    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.resident_entries);
+    try std.testing.expectEqual(small_resident_bytes, client.executable_cache.stats.resident_bytes);
+    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.evictions);
+    try std.testing.expectEqual(large_resident_bytes, client.executable_cache.stats.evicted_resident_bytes);
+}
+
+test "client trims idle executable cache for tracked memory pressure" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+    const allocator = std.testing.allocator;
+    const assignment = [_]i32{0};
+
+    var small_plan = try constantU8ExecutablePlanForTest(allocator, &assignment, &.{ 1, 2, 3, 4 });
+    defer small_plan.deinit();
+    var large_plan = try constantU8ExecutablePlanForTest(allocator, &assignment, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    defer large_plan.deinit();
+
+    try std.testing.expect(!try client.recordExecutableCompile("pressure-small-constant"));
+    var small_graph = try ExecutableGraph.initWithOptions(allocator, client, &small_plan, .{
+        .cache_fingerprint = "pressure-small-constant",
+    });
+    const small_entry = client.executable_cache.get("pressure-small-constant") orelse return error.TestUnexpectedResult;
+    const small_resident_bytes = small_entry.resident_bytes;
+    small_graph.deinit();
+
+    try std.testing.expect(!try client.recordExecutableCompile("pressure-large-constant"));
+    var large_graph = try ExecutableGraph.initWithOptions(allocator, client, &large_plan, .{
+        .cache_fingerprint = "pressure-large-constant",
+    });
+    const large_entry = client.executable_cache.get("pressure-large-constant") orelse return error.TestUnexpectedResult;
+    const large_resident_bytes = large_entry.resident_bytes;
+    try std.testing.expect(large_resident_bytes > small_resident_bytes);
+    large_graph.deinit();
+
+    client.memories[0].stats.capacity_bytes = small_resident_bytes;
+    const trim = client.trimExecutableCacheForAllocation(&client.memories[0], 0);
+    try std.testing.expectEqual(@as(u64, 0), trim.requested_bytes);
+    try std.testing.expectEqual(small_resident_bytes, trim.target_resident_bytes);
+    try std.testing.expectEqual(large_resident_bytes, trim.freed_bytes);
+    try std.testing.expectEqual(@as(u64, 1), trim.evicted_entries);
+    try std.testing.expect(!trim.still_over_capacity);
+    try std.testing.expect(small_entry.backend_executable != null);
+    try std.testing.expect(large_entry.backend_executable == null);
+    try std.testing.expectEqual(small_resident_bytes, client.executable_cache.stats.resident_bytes);
+    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.pressure_trim_requests);
+    try std.testing.expectEqual(large_resident_bytes, client.executable_cache.stats.pressure_trimmed_bytes);
+    try std.testing.expectEqual(@as(u64, 0), client.executable_cache.stats.pressure_trim_failures);
+    try std.testing.expectEqual(@as(u64, 1), client.memories[0].stats.executable_cache_pressure_trims);
+    try std.testing.expectEqual(large_resident_bytes, client.memories[0].stats.executable_cache_pressure_trimmed_bytes);
+    try std.testing.expectEqual(@as(u64, 0), client.memories[0].stats.executable_cache_pressure_trim_failures);
+}
+
+test "compiling resident executable trims idle cache under memory pressure" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+    const allocator = std.testing.allocator;
+    const assignment = [_]i32{0};
+
+    var idle_plan = try constantU8ExecutablePlanForTest(allocator, &assignment, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    defer idle_plan.deinit();
+    var new_plan = try constantU8ExecutablePlanForTest(allocator, &assignment, &.{ 9, 10, 11, 12 });
+    defer new_plan.deinit();
+
+    try std.testing.expect(!try client.recordExecutableCompile("compile-pressure-idle-constant"));
+    var idle_graph = try ExecutableGraph.initWithOptions(allocator, client, &idle_plan, .{
+        .cache_fingerprint = "compile-pressure-idle-constant",
+    });
+    const idle_entry = client.executable_cache.get("compile-pressure-idle-constant") orelse return error.TestUnexpectedResult;
+    const idle_resident_bytes = idle_entry.resident_bytes;
+    try std.testing.expect(idle_resident_bytes >= 8);
+    idle_graph.deinit();
+    try std.testing.expectEqual(@as(usize, 0), idle_entry.ref_count);
+    try std.testing.expect(idle_entry.backend_executable != null);
+
+    client.memories[0].stats.capacity_bytes = idle_resident_bytes;
+
+    try std.testing.expect(!try client.recordExecutableCompile("compile-pressure-new-constant"));
+    var new_graph = try ExecutableGraph.initWithOptions(allocator, client, &new_plan, .{
+        .cache_fingerprint = "compile-pressure-new-constant",
+    });
+    defer new_graph.deinit();
+    const new_entry = client.executable_cache.get("compile-pressure-new-constant") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(new_graph.backend_executable != null);
+    try std.testing.expect(new_entry.backend_executable != null);
+    try std.testing.expect(new_entry.resident_bytes >= 4);
+    try std.testing.expect(new_entry.resident_bytes <= idle_resident_bytes);
+    try std.testing.expect(idle_entry.backend_executable == null);
+    try std.testing.expectEqual(new_entry.resident_bytes, new_graph.last_compile_cache_trim.requested_bytes);
+    try std.testing.expectEqual(idle_resident_bytes - new_entry.resident_bytes, new_graph.last_compile_cache_trim.target_resident_bytes);
+    try std.testing.expectEqual(idle_resident_bytes, new_graph.last_compile_cache_trim.freed_bytes);
+    try std.testing.expectEqual(@as(u64, 1), new_graph.last_compile_cache_trim.evicted_entries);
+    try std.testing.expectEqual(@as(u64, 0), new_graph.last_compile_cache_trim.remaining_resident_bytes);
+    try std.testing.expect(!new_graph.last_compile_cache_trim.still_over_capacity);
+    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.pressure_trim_requests);
+    try std.testing.expectEqual(idle_resident_bytes, client.executable_cache.stats.pressure_trimmed_bytes);
+    try std.testing.expectEqual(@as(u64, 0), client.executable_cache.stats.pressure_trim_failures);
+    try std.testing.expectEqual(new_entry.resident_bytes, client.executable_cache.stats.resident_bytes);
+    try std.testing.expectEqual(@as(u64, 1), client.memories[0].stats.executable_cache_pressure_trims);
+    try std.testing.expectEqual(idle_resident_bytes, client.memories[0].stats.executable_cache_pressure_trimmed_bytes);
+}
+
+test "executable graph evicts idle executable cache before output allocation" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+    const allocator = std.testing.allocator;
+    const assignment = [_]i32{0};
+    const dims = [_]i64{4};
+
+    var idle_plan = try constantU8ExecutablePlanForTest(allocator, &assignment, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    defer idle_plan.deinit();
+
+    try std.testing.expect(!try client.recordExecutableCompile("execute-pressure-idle-constant"));
+    var idle_graph = try ExecutableGraph.initWithOptions(allocator, client, &idle_plan, .{
+        .cache_fingerprint = "execute-pressure-idle-constant",
+    });
+    const idle_entry = client.executable_cache.get("execute-pressure-idle-constant") orelse return error.TestUnexpectedResult;
+    const idle_resident_bytes = idle_entry.resident_bytes;
+    try std.testing.expect(idle_resident_bytes >= 8);
+    idle_graph.deinit();
+    try std.testing.expectEqual(@as(usize, 0), idle_entry.ref_count);
+    try std.testing.expect(idle_entry.backend_executable != null);
+
+    var add_plan = try addU8ExecutablePlanForTest(allocator, &assignment, &dims);
+    defer add_plan.deinit();
+    var add_graph = try ExecutableGraph.init(allocator, client, &add_plan);
+    defer add_graph.deinit();
+
+    const lhs_data = [_]u8{ 1, 2, 3, 4 };
+    const rhs_data = [_]u8{ 10, 20, 30, 40 };
+    const lhs = try Buffer.initHostCopyForBackend(allocator, client.backend, .u8, &dims, &client.devices[0], &client.memories[0], 0, &lhs_data);
+    defer lhs.deinit();
+    const rhs = try Buffer.initHostCopyForBackend(allocator, client.backend, .u8, &dims, &client.devices[0], &client.memories[0], 0, &rhs_data);
+    defer rhs.deinit();
+
+    const output_bytes = try planOutputBytes(&add_plan);
+    client.memories[0].stats.capacity_bytes = client.memories[0].stats.bytes_in_use + output_bytes;
+
+    const result = try add_graph.executeDevice(allocator, client, &add_plan, 0, &.{ lhs, rhs });
+    const outputs = result.outputs;
+    defer allocator.free(outputs);
+    defer {
+        for (outputs) |output| output.deinit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), outputs.len);
+    try std.testing.expect(result.completion_event.isReady());
+    try expectBufferBytes(outputs[0], &.{ 11, 22, 33, 44 });
+    try std.testing.expectEqual(@as(u64, @intCast(output_bytes)), add_graph.last_execute_cache_trim.requested_bytes);
+    try std.testing.expectEqual(@as(u64, 0), add_graph.last_execute_cache_trim.target_resident_bytes);
+    try std.testing.expectEqual(idle_resident_bytes, add_graph.last_execute_cache_trim.freed_bytes);
+    try std.testing.expectEqual(@as(u64, 1), add_graph.last_execute_cache_trim.evicted_entries);
+    try std.testing.expectEqual(@as(u64, 0), add_graph.last_execute_cache_trim.remaining_resident_bytes);
+    try std.testing.expect(!add_graph.last_execute_cache_trim.still_over_capacity);
+    try std.testing.expect(idle_entry.backend_executable == null);
+    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.pressure_trim_requests);
+    try std.testing.expectEqual(idle_resident_bytes, client.executable_cache.stats.pressure_trimmed_bytes);
+    try std.testing.expectEqual(@as(u64, 0), client.executable_cache.stats.pressure_trim_failures);
+}
+
+test "executable cache preserves more expensive equal-size resident executable" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+    const allocator = std.testing.allocator;
+    const assignment = [_]i32{0};
+
+    var cheap_plan = try constantU8ExecutablePlanForTest(allocator, &assignment, &.{ 1, 2, 3, 4 });
+    defer cheap_plan.deinit();
+    var expensive_plan = try constantU8ExecutablePlanForTest(allocator, &assignment, &.{ 5, 6, 7, 8 });
+    defer expensive_plan.deinit();
+
+    try std.testing.expect(!try client.recordExecutableCompile("cheap-constant"));
+    var cheap_graph = try ExecutableGraph.initWithOptions(allocator, client, &cheap_plan, .{
+        .cache_fingerprint = "cheap-constant",
+    });
+    const cheap_entry = client.executable_cache.get("cheap-constant") orelse return error.TestUnexpectedResult;
+    const resident_bytes = cheap_entry.resident_bytes;
+    cheap_graph.deinit();
+    cheap_entry.compile_latency_us = 10;
+
+    try std.testing.expect(!try client.recordExecutableCompile("expensive-constant"));
+    var expensive_graph = try ExecutableGraph.initWithOptions(allocator, client, &expensive_plan, .{
+        .cache_fingerprint = "expensive-constant",
+    });
+    const expensive_entry = client.executable_cache.get("expensive-constant") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(resident_bytes, expensive_entry.resident_bytes);
+    expensive_graph.deinit();
+    expensive_entry.compile_latency_us = 1000;
+
+    try std.testing.expectEqual(@as(u64, 2), client.executable_cache.stats.compile_latency_samples);
+    try std.testing.expect(client.executable_cache.stats.compile_latency_us_total > 0);
+    try std.testing.expect(client.executable_cache.stats.compile_latency_us_peak > 0);
+
+    client.setExecutableCacheMaxResidentBytes(resident_bytes);
+    try std.testing.expect(cheap_entry.backend_executable == null);
+    try std.testing.expect(expensive_entry.backend_executable != null);
+    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.resident_entries);
+    try std.testing.expectEqual(resident_bytes, client.executable_cache.stats.resident_bytes);
+    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.evictions);
+    try std.testing.expectEqual(resident_bytes, client.executable_cache.stats.evicted_resident_bytes);
 }
 
 test "buffer keeps shard/device/memory ownership metadata" {
@@ -3476,25 +3167,186 @@ test "buffer keeps shard/device/memory ownership metadata" {
     try expectBufferBytes(negated, &.{ 255, 254, 253, 252 });
 }
 
+test "buffer constructors reject memory not addressable by device" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+
+    var invalid_device_ids = [_]i32{1234};
+    var no_devices = [_]*Device{};
+    var invalid_memory = Memory{
+        .id = 99,
+        .kind = .device,
+        .debug_string = "unreachable test memory",
+        .addressable_device_ids = invalid_device_ids[0..],
+        .addressable_devices = no_devices[0..],
+    };
+
+    const dims = [_]i64{4};
+    const data = [_]u8{ 1, 2, 3, 4 };
+    try std.testing.expect(!invalid_memory.isAddressableBy(&client.devices[0]));
+    try std.testing.expectError(
+        error.InvalidArgument,
+        Buffer.initHostCopyForBackend(std.testing.allocator, client.backend, .u8, &dims, &client.devices[0], &invalid_memory, 0, &data),
+    );
+    try std.testing.expectError(
+        error.InvalidArgument,
+        Buffer.initPartitionId(std.testing.allocator, client.backend, .u32, &.{}, &client.devices[0], &invalid_memory, 0, 0),
+    );
+
+    if (try client.backend.bufferFromHost(client.devices[0].local_hardware_id, .u8, &dims, &data)) |backend_buffer| {
+        try std.testing.expectError(
+            error.InvalidArgument,
+            Buffer.initBackendHandle(std.testing.allocator, client.backend, .u8, &dims, &client.devices[0], &invalid_memory, 0, data.len, backend_buffer),
+        );
+        client.backend.destroyBuffer(backend_buffer);
+    }
+}
+
 test "buffer lifecycle rejects deleted and donated buffers" {
     const client = try initMlxMetalClientForTest();
     defer client.deinit();
 
     const dims = [_]i64{4};
     const data = [_]u8{ 1, 2, 3, 4 };
+    const before_deleted = client.memories[0].stats.bytes_in_use;
     const deleted = try initHostCopyForTest(.u8, &dims, &client.devices[0], &client.memories[0], 0, &data);
     defer deleted.deinit();
+    try std.testing.expectEqual(before_deleted + data.len, client.memories[0].stats.bytes_in_use);
+    try std.testing.expect(deleted.hasBackendStorage());
     deleted.markDeleted();
     try std.testing.expectEqual(BufferState.deleted, deleted.state);
     try std.testing.expect(deleted.deleted);
+    try std.testing.expect(!deleted.hasBackendStorage());
+    try std.testing.expectEqual(before_deleted, client.memories[0].stats.bytes_in_use);
     try std.testing.expectError(error.BufferDeleted, deleted.ensureUsable());
 
+    const before_donated = client.memories[0].stats.bytes_in_use;
     const donated = try initHostCopyForTest(.u8, &dims, &client.devices[0], &client.memories[0], 0, &data);
     defer donated.deinit();
+    try std.testing.expectEqual(before_donated + data.len, client.memories[0].stats.bytes_in_use);
+    try std.testing.expect(donated.hasBackendStorage());
     donated.markDonated();
     try std.testing.expectEqual(BufferState.donated, donated.state);
     try std.testing.expect(donated.deleted);
+    try std.testing.expect(!donated.hasBackendStorage());
+    try std.testing.expectEqual(before_donated, client.memories[0].stats.bytes_in_use);
     try std.testing.expectError(error.BufferDonated, donated.ensureUsable());
+}
+
+test "buffer copies respect readiness events" {
+    const client = try initMlxMetalClientForTest();
+    defer client.deinit();
+
+    const dims = [_]i64{4};
+    const data = [_]u8{ 1, 2, 3, 4 };
+    const buffer = try initHostCopyForTest(.u8, &dims, &client.devices[0], &client.memories[0], 0, &data);
+    defer buffer.deinit();
+
+    var out: [4]u8 = undefined;
+    buffer.ready_event = Event.pending();
+    try std.testing.expectError(error.BufferNotReady, buffer.ensureReady());
+    try std.testing.expectError(error.BufferNotReady, buffer.copyToHost(&out));
+
+    buffer.ready_event.setReady();
+    try buffer.ensureReady();
+    try buffer.copyToHost(&out);
+    try std.testing.expectEqualSlices(u8, &data, &out);
+
+    buffer.ready_event = Event.failed("producer failed");
+    try std.testing.expectError(error.BufferReadinessFailed, buffer.ensureReady());
+    try std.testing.expectError(error.BufferReadinessFailed, buffer.copyToHost(&out));
+}
+
+const EventCallbackTestState = struct {
+    count: usize = 0,
+    ready_count: usize = 0,
+    failed_count: usize = 0,
+    saw_expected_message: bool = false,
+};
+
+fn recordEventCallback(message: ?[]const u8, user_arg: ?*anyopaque) void {
+    const state: *EventCallbackTestState = @ptrCast(@alignCast(user_arg.?));
+    state.count += 1;
+    if (message) |msg| {
+        state.failed_count += 1;
+        if (std.mem.eql(u8, msg, "boom") or std.mem.eql(u8, msg, "event destroyed before completion")) {
+            state.saw_expected_message = true;
+        }
+    } else {
+        state.ready_count += 1;
+    }
+}
+
+test "event callbacks run on ready and failed transitions" {
+    var ready_event = Event.pending();
+    var ready_state = EventCallbackTestState{};
+    try ready_event.onReady(recordEventCallback, &ready_state);
+    try std.testing.expect(!ready_event.isReady());
+    ready_event.setReady();
+    try std.testing.expect(ready_event.isReady());
+    try ready_event.awaitReady();
+    try std.testing.expectEqual(@as(usize, 1), ready_state.count);
+    try std.testing.expectEqual(@as(usize, 1), ready_state.ready_count);
+
+    var failed_event = Event.pending();
+    var failed_state = EventCallbackTestState{};
+    try failed_event.onReady(recordEventCallback, &failed_state);
+    failed_event.setFailed("boom");
+    try std.testing.expect(failed_event.isReady());
+    try std.testing.expectError(error.EventFailed, failed_event.awaitReady());
+    try std.testing.expectEqual(@as(usize, 1), failed_state.count);
+    try std.testing.expectEqual(@as(usize, 1), failed_state.failed_count);
+    try std.testing.expect(failed_state.saw_expected_message);
+}
+
+test "event dependency chains readiness and failures" {
+    var source_ready = Event.pending();
+    var dependent_ready = Event.pending();
+    try source_ready.chainTo(&dependent_ready);
+    try std.testing.expect(!dependent_ready.isReady());
+    source_ready.setReady();
+    try std.testing.expect(dependent_ready.isReady());
+    try dependent_ready.awaitReady();
+
+    var source_failed = Event.pending();
+    var dependent_failed = Event.pending();
+    try source_failed.chainTo(&dependent_failed);
+    source_failed.setFailed("boom");
+    try std.testing.expect(dependent_failed.isReady());
+    try std.testing.expectError(error.EventFailed, dependent_failed.awaitReady());
+    try std.testing.expectEqualStrings("boom", dependent_failed.message);
+}
+
+test "backend pending completion without event handle fails closed" {
+    const event = runtimeEventFromBackendCompletion(mlxMetalBackendForTest(), .{ .kind = .pending });
+    try std.testing.expect(event.isReady());
+    try std.testing.expectError(error.EventFailed, event.awaitReady());
+}
+
+test "event callbacks run immediately for completed events and reject overflow" {
+    var ready_event = Event.ready();
+    var ready_state = EventCallbackTestState{};
+    try ready_event.onReady(recordEventCallback, &ready_state);
+    try std.testing.expectEqual(@as(usize, 1), ready_state.count);
+    try std.testing.expectEqual(@as(usize, 1), ready_state.ready_count);
+
+    var failed_event = Event.failed("boom");
+    var failed_state = EventCallbackTestState{};
+    try failed_event.onReady(recordEventCallback, &failed_state);
+    try std.testing.expectEqual(@as(usize, 1), failed_state.count);
+    try std.testing.expectEqual(@as(usize, 1), failed_state.failed_count);
+    try std.testing.expect(failed_state.saw_expected_message);
+
+    var pending_event = Event.pending();
+    var pending_state = EventCallbackTestState{};
+    for (0..MAX_EVENT_CALLBACKS) |_| {
+        try pending_event.onReady(recordEventCallback, &pending_state);
+    }
+    try std.testing.expectError(error.TooManyEventCallbacks, pending_event.onReady(recordEventCallback, &pending_state));
+    pending_event.deinit();
+    try std.testing.expectEqual(@as(usize, MAX_EVENT_CALLBACKS), pending_state.count);
+    try std.testing.expectEqual(@as(usize, MAX_EVENT_CALLBACKS), pending_state.failed_count);
+    try std.testing.expect(pending_state.saw_expected_message);
 }
 
 test "client records executable cache hits and memory byte accounting" {
@@ -3820,7 +3672,7 @@ test "buffer partition_id materializes scalar device partition" {
     try std.testing.expectEqual(@as(u32, 0), readU32LE(&bytes, 0));
 }
 
-test "buffer cholesky requires backend-native lowering on MLX buffers" {
+test "buffer cholesky lowers through backend-native MLX buffers" {
     const client = try initMlxMetalClientForTest();
     defer client.deinit();
 
@@ -3829,7 +3681,10 @@ test "buffer cholesky requires backend-native lowering on MLX buffers" {
     const input = try initHostCopyForTest(.f32, &dims, &client.devices[0], &client.memories[0], 0, std.mem.asBytes(&values));
     defer input.deinit();
 
-    try std.testing.expectError(error.UnsupportedRuntimeFeature, Buffer.initCholesky(std.testing.allocator, input, true, &dims, 0));
+    const factor = try Buffer.initCholesky(std.testing.allocator, input, true, &dims, 0);
+    defer factor.deinit();
+
+    try expectBufferF32(factor, &.{ 2.0, 0.0, 1.0, 1.4142135 });
 }
 
 test "buffer rng requires backend-native lowering on MLX buffers" {

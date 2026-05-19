@@ -3,13 +3,14 @@ const std = @import("std");
 const backend_api = @import("src/backend");
 const backend_registry = @import("src/backend/registry");
 const compiler = @import("src/compiler");
+const core = @import("src/core");
 const runtime = @import("src/runtime");
 const c = @import("c");
 
 const allocator = std.heap.c_allocator;
 
-const platform_name = "pjrtx_metal";
-const platform_version = "PjRTx bootstrap Metal/MLX skeleton";
+const platform_name = "pjrtx";
+const platform_version = "PjRTx Metal/MLX";
 const device_kind = "Metal";
 const plugin_name = "PjRTx";
 const stablehlo_version = [_]i64{ 1, 0, 0 };
@@ -38,6 +39,22 @@ const SerializedTopology = struct {
     bytes: []u8,
 };
 
+const PJRT_Gpu_Register_Custom_Call_Args = extern struct {
+    struct_size: usize,
+    function_name: [*c]const u8,
+    function_name_size: usize,
+    api_version: c_int,
+    handler_instantiate: ?*anyopaque,
+    handler_prepare: ?*anyopaque,
+    handler_initialize: ?*anyopaque,
+    handler_execute: ?*anyopaque,
+};
+
+const PJRT_Gpu_Custom_Call = extern struct {
+    base: c.PJRT_Extension_Base,
+    custom_call: *const fn (args: [*c]PJRT_Gpu_Register_Custom_Call_Args) callconv(.c) ?*c.PJRT_Error,
+};
+
 const Executable = struct {
     client: *runtime.Client,
     plan: *compiler.ExecutablePlan,
@@ -51,9 +68,10 @@ const Executable = struct {
     fingerprint: []u8,
     name: []const u8 = "pjrtx_executable",
     deleted: bool = false,
+    graph_released: bool = false,
 
     fn deinit(self: *Executable) void {
-        self.graph.deinit();
+        self.releaseGraph();
         allocator.free(self.fingerprint);
         allocator.free(self.output_memory_kind_sizes);
         allocator.free(self.output_memory_kinds);
@@ -65,7 +83,162 @@ const Executable = struct {
         allocator.destroy(self.plan);
         allocator.destroy(self);
     }
+
+    fn releaseGraph(self: *Executable) void {
+        if (self.graph_released) return;
+        self.graph.deinit();
+        self.graph_released = true;
+    }
 };
+
+const AsyncHostToDeviceTransferManager = struct {
+    allocator: std.mem.Allocator,
+    client: *runtime.Client,
+    device: *runtime.Device,
+    memory: *runtime.Memory,
+    buffers: []*runtime.Buffer,
+    staging: [][]u8,
+    backend_transfers: []?backend_api.AsyncHostToDeviceTransferHandle,
+    written: []usize,
+    retrieved: []bool,
+    completed: []bool,
+
+    fn create(client: *runtime.Client, memory: *runtime.Memory, shape_specs: []const c.PJRT_ShapeSpec) !*AsyncHostToDeviceTransferManager {
+        if (memory.addressable_devices.len == 0) return error.InvalidArgument;
+        const device = memory.addressable_devices[0];
+        const shard_index = deviceIndex(client, device) orelse return error.InvalidArgument;
+
+        const manager = try allocator.create(AsyncHostToDeviceTransferManager);
+        errdefer allocator.destroy(manager);
+
+        const buffers = try allocator.alloc(*runtime.Buffer, shape_specs.len);
+        errdefer allocator.free(buffers);
+        const staging = try allocator.alloc([]u8, shape_specs.len);
+        errdefer allocator.free(staging);
+        const backend_transfers = try allocator.alloc(?backend_api.AsyncHostToDeviceTransferHandle, shape_specs.len);
+        errdefer allocator.free(backend_transfers);
+        const written = try allocator.alloc(usize, shape_specs.len);
+        errdefer allocator.free(written);
+        const retrieved = try allocator.alloc(bool, shape_specs.len);
+        errdefer allocator.free(retrieved);
+        const completed = try allocator.alloc(bool, shape_specs.len);
+        errdefer allocator.free(completed);
+
+        @memset(written, 0);
+        @memset(retrieved, false);
+        @memset(completed, false);
+        @memset(backend_transfers, null);
+
+        var initialized: usize = 0;
+        errdefer {
+            for (staging[0..initialized]) |bytes| if (bytes.len != 0) allocator.free(bytes);
+            for (backend_transfers[0..initialized]) |maybe_transfer| {
+                if (maybe_transfer) |transfer| client.backend.destroyAsyncHostToDeviceTransfer(transfer);
+            }
+            for (buffers[0..initialized]) |buffer| buffer.deinit();
+        }
+
+        for (shape_specs, 0..) |shape_spec, i| {
+            const dims = shape_spec.dims[0..shape_spec.num_dims];
+            const byte_size = denseByteSize(shape_spec.element_type, dims);
+            const element_type = runtimeTypeFromPjrt(shape_spec.element_type);
+            backend_transfers[i] = client.backend.beginAsyncHostToDeviceTransfer(device.local_hardware_id, element_type, dims, byte_size) catch null;
+            if (backend_transfers[i] != null) {
+                staging[i] = &.{};
+                buffers[i] = try runtime.Buffer.initPendingBackendTransfer(
+                    allocator,
+                    client.backend,
+                    element_type,
+                    dims,
+                    device,
+                    memory,
+                    shard_index,
+                );
+            } else {
+                staging[i] = try allocator.alloc(u8, byte_size);
+                @memset(staging[i], 0);
+                buffers[i] = try runtime.Buffer.initDeviceAllocationForBackend(
+                    allocator,
+                    client.backend,
+                    element_type,
+                    dims,
+                    device,
+                    memory,
+                    shard_index,
+                );
+                buffers[i].ready_event = runtime.Event.pending();
+            }
+            initialized += 1;
+        }
+
+        manager.* = .{
+            .allocator = allocator,
+            .client = client,
+            .device = device,
+            .memory = memory,
+            .buffers = buffers,
+            .staging = staging,
+            .backend_transfers = backend_transfers,
+            .written = written,
+            .retrieved = retrieved,
+            .completed = completed,
+        };
+        return manager;
+    }
+
+    fn deinit(self: *AsyncHostToDeviceTransferManager) void {
+        for (self.staging) |bytes| if (bytes.len != 0) self.allocator.free(bytes);
+        for (self.backend_transfers) |maybe_transfer| {
+            if (maybe_transfer) |transfer| self.client.backend.destroyAsyncHostToDeviceTransfer(transfer);
+        }
+        for (self.buffers, self.retrieved) |buffer, was_retrieved| {
+            if (!was_retrieved) buffer.deinit();
+        }
+        self.allocator.free(self.completed);
+        self.allocator.free(self.retrieved);
+        self.allocator.free(self.written);
+        self.allocator.free(self.backend_transfers);
+        self.allocator.free(self.staging);
+        self.allocator.free(self.buffers);
+        self.allocator.destroy(self);
+    }
+
+    fn index(self: *AsyncHostToDeviceTransferManager, buffer_index: c_int) !usize {
+        if (buffer_index < 0) return error.InvalidArgument;
+        const i: usize = @intCast(buffer_index);
+        if (i >= self.buffers.len) return error.InvalidArgument;
+        return i;
+    }
+
+    fn bufferByteSize(self: *const AsyncHostToDeviceTransferManager, i: usize) usize {
+        return self.buffers[i].byte_size;
+    }
+
+    fn finishBuffer(self: *AsyncHostToDeviceTransferManager, i: usize) !void {
+        if (self.completed[i]) return error.InvalidArgument;
+        const buffer = self.buffers[i];
+        _ = self.client.trimExecutableCacheForAllocation(self.memory, buffer.byte_size);
+        if (self.backend_transfers[i]) |transfer| {
+            const backend_buffer = try self.client.backend.finishAsyncHostToDeviceTransfer(transfer) orelse return error.UnsupportedRuntimeFeature;
+            self.backend_transfers[i] = null;
+            errdefer self.client.backend.destroyBuffer(backend_buffer);
+            try buffer.replaceBackendStorage(backend_buffer);
+            buffer.memory.stats.host_to_device_bytes += @intCast(buffer.byte_size);
+        } else {
+            try buffer.replaceBackendStorageFromHost(self.staging[i]);
+        }
+        buffer.ready_event.setReady();
+        self.completed[i] = true;
+    }
+};
+
+fn copyBytesWithIo(dst: []u8, src: []const u8) !void {
+    if (dst.len != src.len) return error.InvalidArgument;
+    var reader: std.Io.Reader = .fixed(src);
+    var writer = std.Io.Writer.fixed(dst);
+    const copied = try reader.streamRemaining(&writer);
+    if (copied != src.len) return error.InvalidArgument;
+}
 
 fn fillMemoryKindArrays(kinds: [][*c]const u8, sizes: []usize) void {
     for (kinds, sizes) |*kind, *size| {
@@ -74,7 +247,306 @@ fn fillMemoryKindArrays(kinds: [][*c]const u8, sizes: []usize) void {
     }
 }
 
+fn updateOptionalI64Slice(hasher: *std.hash.Wyhash, values: ?[]const i64) void {
+    const present = values != null;
+    hasher.update(std.mem.asBytes(&present));
+    if (values) |slice| hasher.update(std.mem.sliceAsBytes(slice));
+}
+
+fn updateOptionalBytes(hasher: *std.hash.Wyhash, bytes: ?[]const u8) void {
+    const present = bytes != null;
+    hasher.update(std.mem.asBytes(&present));
+    if (bytes) |slice| hasher.update(slice);
+}
+
+fn updateShardingFingerprint(hasher: *std.hash.Wyhash, shardings: []const compiler.ShardingPlan) void {
+    hasher.update(std.mem.asBytes(&shardings.len));
+    for (shardings) |sharding| {
+        hasher.update(std.mem.asBytes(&sharding.kind));
+        hasher.update(sharding.mesh_name);
+        hasher.update(std.mem.sliceAsBytes(sharding.device_assignment));
+    }
+}
+
+fn updateInstructionFingerprint(hasher: *std.hash.Wyhash, instruction: compiler.PlanInstruction) void {
+    hasher.update(std.mem.asBytes(&instruction.kind));
+    hasher.update(std.mem.sliceAsBytes(instruction.inputs));
+    hasher.update(std.mem.sliceAsBytes(instruction.outputs));
+    hasher.update(std.mem.sliceAsBytes(instruction.region_ids));
+    updateOptionalI64Slice(hasher, instruction.dims);
+    updateOptionalI64Slice(hasher, instruction.permutation);
+    updateOptionalI64Slice(hasher, instruction.broadcast_dimensions);
+    updateOptionalI64Slice(hasher, instruction.start_indices);
+    updateOptionalI64Slice(hasher, instruction.limit_indices);
+    updateOptionalI64Slice(hasher, instruction.strides);
+    updateOptionalI64Slice(hasher, instruction.slice_sizes);
+    updateOptionalI64Slice(hasher, instruction.edge_padding_low);
+    updateOptionalI64Slice(hasher, instruction.edge_padding_high);
+    updateOptionalI64Slice(hasher, instruction.interior_padding);
+    updateOptionalI64Slice(hasher, instruction.offset_dims);
+    updateOptionalI64Slice(hasher, instruction.collapsed_slice_dims);
+    updateOptionalI64Slice(hasher, instruction.operand_batching_dims);
+    updateOptionalI64Slice(hasher, instruction.start_indices_batching_dims);
+    updateOptionalI64Slice(hasher, instruction.start_index_map);
+    updateOptionalI64Slice(hasher, instruction.update_window_dims);
+    updateOptionalI64Slice(hasher, instruction.inserted_window_dims);
+    updateOptionalI64Slice(hasher, instruction.input_batching_dims);
+    updateOptionalI64Slice(hasher, instruction.scatter_indices_batching_dims);
+    updateOptionalI64Slice(hasher, instruction.scatter_dims_to_operand_dims);
+    hasher.update(std.mem.asBytes(&instruction.index_vector_dim));
+    hasher.update(std.mem.asBytes(&instruction.scatter_update_kind));
+    hasher.update(std.mem.asBytes(&instruction.dimension));
+    hasher.update(std.mem.asBytes(&instruction.top_k_k));
+    hasher.update(std.mem.asBytes(&instruction.iota_dimension));
+    hasher.update(std.mem.asBytes(&instruction.fft_kind));
+    updateOptionalI64Slice(hasher, instruction.dimensions);
+    hasher.update(std.mem.asBytes(&instruction.tuple_index));
+    hasher.update(std.mem.asBytes(&instruction.lower));
+    hasher.update(std.mem.asBytes(&instruction.triangular_left_side));
+    hasher.update(std.mem.asBytes(&instruction.triangular_lower));
+    hasher.update(std.mem.asBytes(&instruction.triangular_unit_diagonal));
+    hasher.update(std.mem.asBytes(&instruction.triangular_transpose));
+    updateOptionalBytes(hasher, instruction.custom_call_target);
+    updateOptionalI64Slice(hasher, instruction.reduce_dimensions);
+    updateOptionalI64Slice(hasher, instruction.lhs_batch_dimensions);
+    updateOptionalI64Slice(hasher, instruction.rhs_batch_dimensions);
+    updateOptionalI64Slice(hasher, instruction.lhs_contracting_dimensions);
+    updateOptionalI64Slice(hasher, instruction.rhs_contracting_dimensions);
+    hasher.update(std.mem.asBytes(&instruction.compare_direction));
+    updateOptionalBytes(hasher, instruction.literal);
+}
+
+fn bytesFromC(ptr: [*c]const u8, len: usize) ?[]const u8 {
+    if (ptr == null and len != 0) return null;
+    if (len == 0) return &.{};
+    return ptr[0..len];
+}
+
+fn parseUnaryCustomCallOp(name: []const u8) ?backend_api.CustomCallRegistration {
+    const op: core.ElementwiseUnaryOp = if (std.mem.eql(u8, name, "negate"))
+        .negate
+    else if (std.mem.eql(u8, name, "exp"))
+        .exp
+    else if (std.mem.eql(u8, name, "expm1"))
+        .expm1
+    else if (std.mem.eql(u8, name, "tanh"))
+        .tanh
+    else if (std.mem.eql(u8, name, "sqrt"))
+        .sqrt
+    else if (std.mem.eql(u8, name, "rsqrt"))
+        .rsqrt
+    else if (std.mem.eql(u8, name, "abs"))
+        .abs
+    else if (std.mem.eql(u8, name, "cbrt"))
+        .cbrt
+    else if (std.mem.eql(u8, name, "ceil"))
+        .ceil
+    else if (std.mem.eql(u8, name, "floor"))
+        .floor
+    else if (std.mem.eql(u8, name, "log"))
+        .log
+    else if (std.mem.eql(u8, name, "log1p"))
+        .log1p
+    else if (std.mem.eql(u8, name, "logistic"))
+        .logistic
+    else if (std.mem.eql(u8, name, "sine"))
+        .sine
+    else if (std.mem.eql(u8, name, "cosine"))
+        .cosine
+    else if (std.mem.eql(u8, name, "not"))
+        .not_
+    else if (std.mem.eql(u8, name, "sign"))
+        .sign
+    else if (std.mem.eql(u8, name, "is_finite"))
+        .is_finite
+    else if (std.mem.eql(u8, name, "round_nearest_afz"))
+        .round_nearest_afz
+    else if (std.mem.eql(u8, name, "round_nearest_even"))
+        .round_nearest_even
+    else if (std.mem.eql(u8, name, "popcnt"))
+        .popcnt
+    else if (std.mem.eql(u8, name, "count_leading_zeros"))
+        .count_leading_zeros
+    else
+        return null;
+    return .{ .target = "", .kind = .unary, .unary_op = op };
+}
+
+fn parseBinaryCustomCallOp(name: []const u8) ?backend_api.CustomCallRegistration {
+    const op: core.ElementwiseBinaryOp = if (std.mem.eql(u8, name, "add"))
+        .add
+    else if (std.mem.eql(u8, name, "subtract"))
+        .subtract
+    else if (std.mem.eql(u8, name, "multiply"))
+        .multiply
+    else if (std.mem.eql(u8, name, "divide"))
+        .divide
+    else if (std.mem.eql(u8, name, "maximum"))
+        .maximum
+    else if (std.mem.eql(u8, name, "minimum"))
+        .minimum
+    else if (std.mem.eql(u8, name, "power"))
+        .power
+    else if (std.mem.eql(u8, name, "atan2"))
+        .atan2
+    else if (std.mem.eql(u8, name, "remainder"))
+        .remainder
+    else if (std.mem.eql(u8, name, "and"))
+        .and_
+    else if (std.mem.eql(u8, name, "or"))
+        .or_
+    else if (std.mem.eql(u8, name, "xor"))
+        .xor
+    else if (std.mem.eql(u8, name, "shift_left"))
+        .shift_left
+    else if (std.mem.eql(u8, name, "shift_right_logical"))
+        .shift_right_logical
+    else if (std.mem.eql(u8, name, "shift_right_arithmetic"))
+        .shift_right_arithmetic
+    else
+        return null;
+    return .{ .target = "", .kind = .binary, .binary_op = op };
+}
+
+fn registerPjrtxCustomCall(registration: backend_api.CustomCallRegistration) ?*c.PJRT_Error {
+    var backend_impl = backend_registry.create(.metal_mlx);
+    backend_impl.registerCustomCall(registration) catch |err| switch (err) {
+        error.InvalidCustomCall => return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "invalid PjRTx custom call registration"),
+        error.OutOfMemory => return makeError(c.PJRT_Error_Code_RESOURCE_EXHAUSTED, "failed to allocate PjRTx custom call registration"),
+        else => return makeError(c.PJRT_Error_Code_INTERNAL, "failed to register PjRTx custom call"),
+    };
+    return null;
+}
+
+fn markerAddress(comptime marker: anytype) usize {
+    return @intFromPtr(&marker);
+}
+
+fn registerPjrtxCustomCallHandler(target: []const u8, api_version: c_int, handler_execute: ?*anyopaque) ?*c.PJRT_Error {
+    if (api_version != 0) return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "PjRTx custom calls currently support PJRT GPU untyped API version 0");
+    const handler = handler_execute orelse return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "custom call handler_execute is null");
+    const handler_address = @intFromPtr(handler);
+
+    if (handler_address == markerAddress(PjRTx_CustomCall_Identity)) {
+        return registerPjrtxCustomCall(.{ .target = target, .kind = .identity });
+    }
+    if (handler_address == markerAddress(PjRTx_CustomCall_UnarySqrt)) {
+        return registerPjrtxCustomCall(.{ .target = target, .kind = .unary, .unary_op = .sqrt });
+    }
+    if (handler_address == markerAddress(PjRTx_CustomCall_BinaryAdd)) {
+        return registerPjrtxCustomCall(.{ .target = target, .kind = .binary, .binary_op = .add });
+    }
+
+    return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "custom call handler is not a PjRTx MLX executable handler");
+}
+
+fn pjrtGpuRegisterCustomCall(args: [*c]PJRT_Gpu_Register_Custom_Call_Args) callconv(.c) ?*c.PJRT_Error {
+    if (args == null) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "custom call registration args are null");
+    if (args[0].struct_size < @sizeOf(PJRT_Gpu_Register_Custom_Call_Args)) {
+        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "custom call registration args struct is too small");
+    }
+    const target = bytesFromC(args[0].function_name, args[0].function_name_size) orelse return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "custom call target is null");
+    return registerPjrtxCustomCallHandler(target, args[0].api_version, args[0].handler_execute);
+}
+
+fn updateTargetDeviceFingerprint(hasher: *std.hash.Wyhash, client: *const runtime.Client, plan: *const compiler.ExecutablePlan) void {
+    const device_count = plan.options.numDevices();
+    hasher.update(std.mem.asBytes(&device_count));
+    for (0..device_count) |i| {
+        const device_id = if (plan.options.device_assignment.len != 0) plan.options.device_assignment[i] else client.devices[i].id;
+        hasher.update(std.mem.asBytes(&device_id));
+        const device = client.lookupDevice(device_id) orelse {
+            const missing_device: i32 = -1;
+            hasher.update(std.mem.asBytes(&missing_device));
+            continue;
+        };
+        hasher.update(std.mem.asBytes(&device.local_hardware_id));
+        hasher.update(std.mem.asBytes(&device.registry_id));
+        hasher.update(std.mem.asBytes(&device.process_index));
+        hasher.update(std.mem.asBytes(&device.addressable));
+        hasher.update(std.mem.asBytes(&device.memory_bytes));
+        hasher.update(std.mem.asBytes(&device.has_unified_memory));
+        hasher.update(std.mem.asBytes(&device.default_memory_id));
+        hasher.update(device.name);
+        hasher.update(device.debug_string);
+        const memory = client.lookupMemory(device.default_memory_id) orelse continue;
+        hasher.update(std.mem.asBytes(&memory.id));
+        hasher.update(std.mem.asBytes(&memory.kind));
+        hasher.update(std.mem.sliceAsBytes(memory.addressable_device_ids));
+    }
+}
+
+fn allocExecutableFingerprint(
+    alloc: std.mem.Allocator,
+    client: *const runtime.Client,
+    optimized_program: []const u8,
+    plan: *const compiler.ExecutablePlan,
+) ![]u8 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update("pjrtx-executable-cache-v4");
+    hasher.update(optimized_program);
+    const caps = client.backend.capabilities();
+    hasher.update(@tagName(client.backend_kind));
+    hasher.update(caps.name);
+    hasher.update(std.mem.asBytes(&caps.kind));
+    hasher.update(std.mem.asBytes(&caps.supports_device_buffers));
+    hasher.update(std.mem.asBytes(&caps.supports_unified_memory));
+    hasher.update(std.mem.asBytes(&caps.supports_async_execution));
+    const custom_call_registry_version = client.backend.customCallRegistryVersion();
+    hasher.update(std.mem.asBytes(&custom_call_registry_version));
+    updateTargetDeviceFingerprint(&hasher, client, plan);
+    hasher.update(std.mem.asBytes(&plan.options.num_replicas));
+    hasher.update(std.mem.asBytes(&plan.options.num_partitions));
+    hasher.update(std.mem.asBytes(&plan.options.use_shardy_partitioner));
+    hasher.update(std.mem.sliceAsBytes(plan.options.device_assignment));
+    updateShardingFingerprint(&hasher, plan.parameter_shardings);
+    updateShardingFingerprint(&hasher, plan.output_shardings);
+    hasher.update(std.mem.sliceAsBytes(plan.output_ids));
+    hasher.update(std.mem.sliceAsBytes(plan.donated_parameter_indices));
+    for (plan.output_aliases) |alias| {
+        hasher.update(std.mem.asBytes(&alias.output_index));
+        hasher.update(std.mem.asBytes(&alias.parameter_index));
+        hasher.update(std.mem.asBytes(&alias.kind));
+    }
+    for (plan.values) |value| {
+        hasher.update(std.mem.asBytes(&value.role));
+        hasher.update(std.mem.asBytes(&value.descriptor.element_type));
+        hasher.update(std.mem.sliceAsBytes(value.descriptor.dims));
+        hasher.update(std.mem.asBytes(&value.descriptor.layout));
+        hasher.update(std.mem.asBytes(&value.descriptor.device_id));
+        hasher.update(std.mem.asBytes(&value.descriptor.memory_id));
+        hasher.update(std.mem.asBytes(&value.descriptor.shard_index));
+        hasher.update(std.mem.asBytes(&value.storage));
+        hasher.update(std.mem.sliceAsBytes(value.elements));
+    }
+    for (plan.regions) |region| {
+        hasher.update(std.mem.asBytes(&region.id));
+        hasher.update(std.mem.asBytes(&region.parent_instruction_index));
+        hasher.update(std.mem.asBytes(&region.kind));
+        for (region.argument_descriptors) |descriptor| {
+            hasher.update(std.mem.asBytes(&descriptor.element_type));
+            hasher.update(std.mem.sliceAsBytes(descriptor.dims));
+            hasher.update(std.mem.asBytes(&descriptor.layout));
+        }
+        for (region.return_descriptors) |descriptor| {
+            hasher.update(std.mem.asBytes(&descriptor.element_type));
+            hasher.update(std.mem.sliceAsBytes(descriptor.dims));
+            hasher.update(std.mem.asBytes(&descriptor.layout));
+        }
+    }
+    for (plan.instructions) |instruction| updateInstructionFingerprint(&hasher, instruction);
+    return std.fmt.allocPrint(alloc, "pjrtx-{x}", .{hasher.final()});
+}
+
 var api_storage: c.PJRT_Api = undefined;
+var gpu_custom_call_extension: PJRT_Gpu_Custom_Call = .{
+    .base = .{
+        .struct_size = @sizeOf(PJRT_Gpu_Custom_Call),
+        .type = c.PJRT_Extension_Type_Gpu_Custom_Call,
+        .next = null,
+    },
+    .custom_call = pjrtGpuRegisterCustomCall,
+};
 var api_ready = false;
 var attrs_ready = false;
 var attrs: [5]c.PJRT_NamedValue = undefined;
@@ -105,7 +577,8 @@ fn elementSize(t: c.PJRT_Buffer_Type) usize {
         c.PJRT_Buffer_Type_PRED, c.PJRT_Buffer_Type_S8, c.PJRT_Buffer_Type_U8 => 1,
         c.PJRT_Buffer_Type_S16, c.PJRT_Buffer_Type_U16, c.PJRT_Buffer_Type_F16, c.PJRT_Buffer_Type_BF16 => 2,
         c.PJRT_Buffer_Type_S32, c.PJRT_Buffer_Type_U32, c.PJRT_Buffer_Type_F32 => 4,
-        c.PJRT_Buffer_Type_S64, c.PJRT_Buffer_Type_U64, c.PJRT_Buffer_Type_F64 => 8,
+        c.PJRT_Buffer_Type_S64, c.PJRT_Buffer_Type_U64, c.PJRT_Buffer_Type_F64, c.PJRT_Buffer_Type_C64 => 8,
+        c.PJRT_Buffer_Type_C128 => 16,
         else => 0,
     };
 }
@@ -125,6 +598,8 @@ fn runtimeTypeFromPjrt(t: c.PJRT_Buffer_Type) runtime.BufferType {
         c.PJRT_Buffer_Type_F32 => .f32,
         c.PJRT_Buffer_Type_F64 => .f64,
         c.PJRT_Buffer_Type_BF16 => .bf16,
+        c.PJRT_Buffer_Type_C64 => .c64,
+        c.PJRT_Buffer_Type_C128 => .c128,
         else => .invalid,
     };
 }
@@ -145,6 +620,8 @@ fn pjrtTypeFromRuntime(t: runtime.BufferType) c.PJRT_Buffer_Type {
         .f32 => c.PJRT_Buffer_Type_F32,
         .f64 => c.PJRT_Buffer_Type_F64,
         .bf16 => c.PJRT_Buffer_Type_BF16,
+        .c64 => c.PJRT_Buffer_Type_C64,
+        .c128 => c.PJRT_Buffer_Type_C128,
     };
 }
 
@@ -166,8 +643,19 @@ fn memoryFromC(memory: ?*c.PJRT_Memory) *runtime.Memory {
     return @ptrCast(@alignCast(memory.?));
 }
 
+fn deviceIndex(client: *const runtime.Client, device: *const runtime.Device) ?usize {
+    for (client.devices, 0..) |*candidate, i| {
+        if (candidate == device or candidate.id == device.id) return i;
+    }
+    return null;
+}
+
 fn bufferFromC(buffer: ?*c.PJRT_Buffer) *runtime.Buffer {
     return @ptrCast(@alignCast(buffer.?));
+}
+
+fn asyncH2DManagerFromC(manager: ?*c.PJRT_AsyncHostToDeviceTransferManager) *AsyncHostToDeviceTransferManager {
+    return @ptrCast(@alignCast(manager.?));
 }
 
 fn executableFromC(executable: ?*c.PJRT_LoadedExecutable) *Executable {
@@ -225,9 +713,21 @@ const ClientCreateConfig = struct {
 };
 
 fn traceEnabled() bool {
-    const value = std.c.getenv("PJRTX_TRACE") orelse return false;
+    if (envFlag("PJRTX_PROFILE")) return true;
+    return envFlag("PJRTX_TRACE");
+}
+
+fn envFlag(comptime name: [:0]const u8) bool {
+    const value = std.c.getenv(name) orelse return false;
     const text = std.mem.span(value);
     return text.len != 0 and !std.mem.eql(u8, text, "0") and !std.ascii.eqlIgnoreCase(text, "false");
+}
+
+fn executableCacheMaxBytesFromEnv() ?u64 {
+    const value = std.c.getenv("PJRTX_EXECUTABLE_CACHE_MAX_BYTES") orelse return null;
+    const text = std.mem.span(value);
+    if (text.len == 0) return null;
+    return std.fmt.parseUnsigned(u64, text, 10) catch null;
 }
 
 fn nowNs() u64 {
@@ -320,40 +820,98 @@ fn eventCreateReady() ?*c.PJRT_Event {
     return @ptrCast(event);
 }
 
+fn eventCreatePending() ?*c.PJRT_Event {
+    const event = allocator.create(runtime.Event) catch return null;
+    event.* = runtime.Event.pending();
+    return @ptrCast(event);
+}
+
 fn eventCreateFailed(message: []const u8) ?*c.PJRT_Event {
     const event = allocator.create(runtime.Event) catch return null;
     event.* = runtime.Event.failed(message);
     return @ptrCast(event);
 }
 
+fn eventCreateFromRuntime(source: runtime.Event) ?*c.PJRT_Event {
+    return switch (source.state) {
+        .pending => eventCreatePending(),
+        .ready => eventCreateReady(),
+        .failed => eventCreateFailed(source.message),
+    };
+}
+
+fn eventSetReady(event: ?*c.PJRT_Event) void {
+    if (event) |opaque_event| {
+        eventFromC(opaque_event).setReady();
+    }
+}
+
+fn eventSetFailed(event: ?*c.PJRT_Event, message: []const u8) void {
+    if (event) |opaque_event| {
+        eventFromC(opaque_event).setFailed(message);
+    }
+}
+
+fn eventFromC(event: *c.PJRT_Event) *runtime.Event {
+    return @ptrCast(@alignCast(event));
+}
+
+const EventOnReadyBridge = struct {
+    callback: c.PJRT_Event_OnReadyCallback,
+    user_arg: ?*anyopaque,
+};
+
+fn eventOnReadyBridge(message: ?[]const u8, user_arg: ?*anyopaque) void {
+    const bridge: *EventOnReadyBridge = @ptrCast(@alignCast(user_arg.?));
+    defer allocator.destroy(bridge);
+    const maybe_error = if (message) |msg| makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, msg) else null;
+    bridge.callback.?(maybe_error, bridge.user_arg);
+}
+
 fn pjrtEventDestroy(args: [*c]c.PJRT_Event_Destroy_Args) callconv(.c) ?*c.PJRT_Error {
-    if (args[0].event) |event| allocator.destroy(@as(*runtime.Event, @ptrCast(@alignCast(event))));
+    if (args[0].event) |event| {
+        const runtime_event = eventFromC(event);
+        runtime_event.deinit();
+        allocator.destroy(runtime_event);
+    }
     return null;
 }
 
 fn pjrtEventIsReady(args: [*c]c.PJRT_Event_IsReady_Args) callconv(.c) ?*c.PJRT_Error {
-    const event: *runtime.Event = @ptrCast(@alignCast(args[0].event.?));
+    const event = eventFromC(args[0].event.?);
     args[0].is_ready = event.isReady();
     return null;
 }
 
 fn pjrtEventError(args: [*c]c.PJRT_Event_Error_Args) callconv(.c) ?*c.PJRT_Error {
-    const event: *runtime.Event = @ptrCast(@alignCast(args[0].event.?));
+    const event = eventFromC(args[0].event.?);
     if (event.state == .failed) return makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, event.message);
     return null;
 }
 
 fn pjrtEventAwait(args: [*c]c.PJRT_Event_Await_Args) callconv(.c) ?*c.PJRT_Error {
-    const event: *runtime.Event = @ptrCast(@alignCast(args[0].event.?));
-    if (event.state == .pending) event.state = .ready;
-    if (event.state == .failed) return makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, event.message);
+    const event = eventFromC(args[0].event.?);
+    event.awaitReady() catch |err| return switch (err) {
+        error.EventFailed => makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, event.message),
+        error.EventPending => makeError(c.PJRT_Error_Code_INTERNAL, "pending event has no scheduler completion source"),
+    };
     return null;
 }
 
 fn pjrtEventOnReady(args: [*c]c.PJRT_Event_OnReady_Args) callconv(.c) ?*c.PJRT_Error {
-    const event: *runtime.Event = @ptrCast(@alignCast(args[0].event.?));
-    const maybe_error = if (event.state == .failed) makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, event.message) else null;
-    if (args[0].callback) |callback| callback(maybe_error, args[0].user_arg);
+    const event = eventFromC(args[0].event.?);
+    const callback = args[0].callback orelse return null;
+    const bridge = allocator.create(EventOnReadyBridge) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate event callback");
+    bridge.* = .{
+        .callback = callback,
+        .user_arg = args[0].user_arg,
+    };
+    event.onReady(eventOnReadyBridge, bridge) catch |err| {
+        allocator.destroy(bridge);
+        return switch (err) {
+            error.TooManyEventCallbacks => makeError(c.PJRT_Error_Code_RESOURCE_EXHAUSTED, "too many callbacks registered on event"),
+        };
+    };
     return null;
 }
 
@@ -366,6 +924,9 @@ fn pjrtClientCreate(args: [*c]c.PJRT_Client_Create_Args) callconv(.c) ?*c.PJRT_E
     } catch {
         return makeError(c.PJRT_Error_Code_INTERNAL, "failed to create PjRTx client");
     };
+    if (executableCacheMaxBytesFromEnv()) |max_resident_bytes| {
+        client.setExecutableCacheMaxResidentBytes(max_resident_bytes);
+    }
     args[0].client = @ptrCast(client);
     return null;
 }
@@ -469,11 +1030,17 @@ fn pjrtClientCompile(args: [*c]c.PJRT_Client_Compile_Args) callconv(.c) ?*c.PJRT
         const program = args[0].program[0];
         const module_bytes = program.code[0..program.code_size];
         const format_text = if (program.format != null) program.format[0..program.format_size] else "";
+        trace("event=compile_start format={s} program_bytes={d} compile_options_bytes={d}", .{
+            format_text,
+            module_bytes.len,
+            args[0].compile_options_size,
+        });
         var module_reader: std.Io.Reader = .fixed(module_bytes);
         var diagnostics = std.Io.Writer.Allocating.init(allocator);
         defer diagnostics.deinit();
         analysis = compiler.analyzeProgramFromReader(allocator, format_text, &module_reader, &diagnostics.writer) catch |err| {
             const message = diagnostics.writer.buffered();
+            trace("event=compile_ingest_error err={s} diagnostic_bytes={d}", .{ @errorName(err), message.len });
             const fallback = "failed to ingest StableHLO/MLIR program";
             const text = if (message.len == 0) fallback else message;
             const code: c.PJRT_Error_Code = @intCast(switch (err) {
@@ -532,20 +1099,7 @@ fn pjrtClientCompile(args: [*c]c.PJRT_Client_Compile_Args) callconv(.c) ?*c.PJRT
     errdefer allocator.free(output_memory_kind_sizes);
     fillMemoryKindArrays(output_memory_kinds, output_memory_kind_sizes);
 
-    var fingerprint_hasher = std.hash.Wyhash.init(0);
-    fingerprint_hasher.update(optimized_program);
-    fingerprint_hasher.update(@tagName(client.backend_kind));
-    fingerprint_hasher.update(std.mem.asBytes(&plan.options.num_replicas));
-    fingerprint_hasher.update(std.mem.asBytes(&plan.options.num_partitions));
-    fingerprint_hasher.update(std.mem.asBytes(&plan.options.use_shardy_partitioner));
-    fingerprint_hasher.update(std.mem.sliceAsBytes(plan.options.device_assignment));
-    for (plan.values) |value| {
-        fingerprint_hasher.update(std.mem.asBytes(&value.descriptor.element_type));
-        fingerprint_hasher.update(std.mem.sliceAsBytes(value.descriptor.dims));
-        fingerprint_hasher.update(std.mem.asBytes(&value.descriptor.layout));
-    }
-    const fingerprint_value = fingerprint_hasher.final();
-    const fingerprint = std.fmt.allocPrint(allocator, "pjrtx-{x}", .{fingerprint_value}) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable fingerprint");
+    const fingerprint = allocExecutableFingerprint(allocator, client, optimized_program, &plan) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable fingerprint");
     errdefer allocator.free(fingerprint);
     const cache_hit = client.recordExecutableCompile(fingerprint) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to update executable cache");
 
@@ -560,12 +1114,12 @@ fn pjrtClientCompile(args: [*c]c.PJRT_Client_Compile_Args) callconv(.c) ?*c.PJRT
     var lowering_diagnostics = std.Io.Writer.Allocating.init(allocator);
     defer lowering_diagnostics.deinit();
     var graph = runtime.ExecutableGraph.initWithOptions(allocator, client, plan_ptr, .{
-        .mode = .require_backend_executable,
         .diagnostic_writer = &lowering_diagnostics.writer,
+        .cache_fingerprint = fingerprint,
     }) catch |err| switch (err) {
         error.UnsupportedRuntimeFeature => {
             const message = lowering_diagnostics.writer.buffered();
-            const fallback = "program is not fully lowered to the MLX backend executable; host fallback is disabled";
+            const fallback = "program is not fully lowered to the MLX backend executable; runtime execution is device-only";
             return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, if (message.len == 0) fallback else message);
         },
         else => return makeError(c.PJRT_Error_Code_INTERNAL, "failed to build executable graph"),
@@ -586,18 +1140,58 @@ fn pjrtClientCompile(args: [*c]c.PJRT_Client_Compile_Args) callconv(.c) ?*c.PJRT
         .fingerprint = fingerprint,
     };
     args[0].executable = @ptrCast(executable);
+    const backend_stats = graph.backendExecutableStats() orelse backend_api.ExecutableStats{};
     trace(
-        "event=compile backend={s} devices={d} values={d} instructions={d} outputs={d} cache_hit={d} backend_executable={d} lowered={d} fallback={d} elapsed_us={d}",
+        "event=compile backend={s} backend_devices={d} values={d} instructions={d} cache_hit={d} cache_hits_total={d} cache_misses_total={d} backend_cache_reuse={d} backend_cache_entries={d} backend_cache_bytes={d} backend_cache_peak_bytes={d} backend_cache_evictions={d} backend_cache_evicted_bytes={d} backend_executable={d} lowered={d} unlowered={d} resident_constants={d} resident_constant_bytes={d} program_values={d} program_nodes={d} program_edges={d} schedule_items={d} subprograms={d} control_flows={d} fusion_groups={d} materialization_boundaries={d} planned_releases={d} planned_release_bytes={d} peak_live_values={d} peak_live_bytes={d} elapsed_us={d}",
         .{
             @tagName(client.backend_kind),
-            plan_ptr.options.numDevices(),
+            backend_stats.program_device_count,
             plan_ptr.values.len,
             plan_ptr.instructions.len,
-            plan_ptr.output_ids.len,
             @intFromBool(cache_hit),
+            client.executable_cache.stats.hits,
+            client.executable_cache.stats.misses,
+            @intFromBool(graph.lowering.backend_executable_cache_reused),
+            client.executable_cache.stats.resident_entries,
+            client.executable_cache.stats.resident_bytes,
+            client.executable_cache.stats.peak_resident_bytes,
+            client.executable_cache.stats.evictions,
+            client.executable_cache.stats.evicted_resident_bytes,
             @intFromBool(graph.backend_executable != null),
             graph.lowering.lowered_instruction_count,
-            graph.lowering.fallback_instruction_count,
+            0,
+            backend_stats.resident_constant_count,
+            backend_stats.resident_constant_bytes,
+            backend_stats.program_value_count,
+            backend_stats.program_node_count,
+            backend_stats.program_edge_count,
+            backend_stats.program_schedule_item_count,
+            backend_stats.program_subprogram_count,
+            backend_stats.program_control_flow_count,
+            backend_stats.program_fusion_group_count,
+            backend_stats.program_materialization_boundary_count,
+            backend_stats.program_planned_release_count,
+            backend_stats.program_planned_release_bytes,
+            backend_stats.program_peak_live_value_count,
+            backend_stats.program_peak_live_bytes,
+            elapsedUs(trace_start_ns),
+        },
+    );
+    trace("event=compile_aliases output_aliases={d} donated_parameters={d}", .{ plan_ptr.output_aliases.len, plan_ptr.donated_parameter_indices.len });
+    trace(
+        "event=compile_cache cache_hit={d} backend_cache_reuse={d} backend_cache_entries={d} backend_cache_bytes={d} backend_cache_compile_samples={d} backend_cache_compile_us_total={d} backend_cache_compile_us_peak={d} cache_trim_bytes={d} cache_trim_evictions={d} cache_pressure_remaining_bytes={d} cache_pressure_failed={d} elapsed_us={d}",
+        .{
+            @intFromBool(cache_hit),
+            @intFromBool(graph.lowering.backend_executable_cache_reused),
+            client.executable_cache.stats.resident_entries,
+            client.executable_cache.stats.resident_bytes,
+            client.executable_cache.stats.compile_latency_samples,
+            client.executable_cache.stats.compile_latency_us_total,
+            client.executable_cache.stats.compile_latency_us_peak,
+            graph.last_compile_cache_trim.freed_bytes,
+            graph.last_compile_cache_trim.evicted_entries,
+            graph.last_compile_cache_trim.remaining_resident_bytes,
+            @intFromBool(graph.last_compile_cache_trim.still_over_capacity),
             elapsedUs(trace_start_ns),
         },
     );
@@ -618,26 +1212,277 @@ fn pjrtClientBufferFromHostBuffer(args: [*c]c.PJRT_Client_BufferFromHostBuffer_A
     const trace_start_ns = nowNs();
     const client = clientFromC(args[0].client);
     const device = if (args[0].device) |dev| deviceFromC(dev) else &client.devices[0];
-    const memory = if (args[0].memory) |mem| memoryFromC(mem) else &client.memories[@intCast(device.default_memory_id)];
+    const memory = if (args[0].memory) |mem| memoryFromC(mem) else device.default_memory;
+    const shard_index = deviceIndex(client, device) orelse {
+        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "buffer device does not belong to client");
+    };
     const dims = args[0].dims[0..args[0].num_dims];
     const byte_size = denseByteSize(args[0].type, dims);
     const data = @as([*]const u8, @ptrCast(args[0].data))[0..byte_size];
-    const buffer = runtime.Buffer.initHostCopyForBackend(allocator, client.backend, runtimeTypeFromPjrt(args[0].type), dims, device, memory, @intCast(device.id), data) catch {
-        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to create host buffer copy");
+    const trim = client.trimExecutableCacheForAllocation(memory, byte_size);
+    const buffer = runtime.Buffer.initHostCopyForBackend(allocator, client.backend, runtimeTypeFromPjrt(args[0].type), dims, device, memory, shard_index, data) catch |err| {
+        return switch (err) {
+            error.InvalidArgument => makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "memory is not addressable by requested device"),
+            else => makeError(c.PJRT_Error_Code_INTERNAL, "failed to create host buffer copy"),
+        };
     };
     args[0].buffer = @ptrCast(buffer);
-    args[0].done_with_host_buffer = eventCreateReady();
+    args[0].done_with_host_buffer = eventCreatePending();
+    eventSetReady(args[0].done_with_host_buffer);
     trace(
-        "event=h2d bytes={d} dtype={s} rank={d} device={d} backend_storage={d} elapsed_us={d}",
+        "event=h2d bytes={d} dtype={s} rank={d} device={d} backend_storage={d} cache_trim_bytes={d} cache_trim_evictions={d} cache_pressure_remaining_bytes={d} cache_pressure_failed={d} elapsed_us={d}",
         .{
             byte_size,
             @tagName(buffer.element_type),
             dims.len,
             device.id,
             @intFromBool(buffer.hasBackendStorage()),
+            trim.freed_bytes,
+            trim.evicted_entries,
+            trim.remaining_resident_bytes,
+            @intFromBool(trim.still_over_capacity),
             elapsedUs(trace_start_ns),
         },
     );
+    return null;
+}
+
+fn pjrtClientCreateUninitializedBuffer(args: [*c]c.PJRT_Client_CreateUninitializedBuffer_Args) callconv(.c) ?*c.PJRT_Error {
+    const trace_start_ns = nowNs();
+    const client = clientFromC(args[0].client);
+    const memory = if (args[0].memory) |mem| memoryFromC(mem) else blk: {
+        const device = if (args[0].device) |dev| deviceFromC(dev) else &client.devices[0];
+        break :blk device.default_memory;
+    };
+    const device = if (args[0].device) |dev| deviceFromC(dev) else blk: {
+        if (memory.addressable_devices.len == 0) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "memory is not addressable by any device");
+        break :blk memory.addressable_devices[0];
+    };
+    const shard_index = deviceIndex(client, device) orelse {
+        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "buffer device does not belong to client");
+    };
+    if (!memory.isAddressableBy(device)) {
+        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "memory is not addressable by requested device");
+    }
+    const dims = args[0].shape_dims[0..args[0].shape_num_dims];
+    const byte_size = denseByteSize(args[0].shape_element_type, dims);
+    const trim = client.trimExecutableCacheForAllocation(memory, byte_size);
+    const buffer = runtime.Buffer.initDeviceAllocationForBackend(allocator, client.backend, runtimeTypeFromPjrt(args[0].shape_element_type), dims, device, memory, shard_index) catch |err| {
+        return switch (err) {
+            error.InvalidArgument => makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "memory is not addressable by requested device"),
+            error.UnsupportedElementType, error.UnsupportedRuntimeFeature => makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "backend cannot allocate requested buffer type"),
+            else => makeError(c.PJRT_Error_Code_INTERNAL, "failed to create device buffer"),
+        };
+    };
+    args[0].buffer = @ptrCast(buffer);
+    trace(
+        "event=device_alloc bytes={d} dtype={s} rank={d} device={d} cache_trim_bytes={d} cache_trim_evictions={d} cache_pressure_remaining_bytes={d} cache_pressure_failed={d} elapsed_us={d}",
+        .{
+            byte_size,
+            @tagName(buffer.element_type),
+            dims.len,
+            device.id,
+            trim.freed_bytes,
+            trim.evicted_entries,
+            trim.remaining_resident_bytes,
+            @intFromBool(trim.still_over_capacity),
+            elapsedUs(trace_start_ns),
+        },
+    );
+    return null;
+}
+
+fn pjrtClientCreateBuffersForAsyncHostToDevice(args: [*c]c.PJRT_Client_CreateBuffersForAsyncHostToDevice_Args) callconv(.c) ?*c.PJRT_Error {
+    const trace_start_ns = nowNs();
+    const client = clientFromC(args[0].client);
+    const memory = if (args[0].memory) |mem| memoryFromC(mem) else client.devices[0].default_memory;
+    if (args[0].shape_specs == null and args[0].num_shape_specs != 0) {
+        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "shape specs are null");
+    }
+    const shape_specs = args[0].shape_specs[0..args[0].num_shape_specs];
+    const manager = AsyncHostToDeviceTransferManager.create(client, memory, shape_specs) catch |err| {
+        return switch (err) {
+            error.InvalidArgument => makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "memory is not addressable by any device"),
+            error.UnsupportedRuntimeFeature, error.UnsupportedElementType => makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "backend cannot allocate async transfer buffer"),
+            else => makeError(c.PJRT_Error_Code_INTERNAL, "failed to create async host-to-device transfer manager"),
+        };
+    };
+    args[0].transfer_manager = @ptrCast(manager);
+    var total_bytes: usize = 0;
+    for (manager.buffers) |buffer| total_bytes += buffer.byte_size;
+    trace(
+        "event=async_h2d_create buffers={d} bytes={d} device={d} memory={d} elapsed_us={d}",
+        .{ manager.buffers.len, total_bytes, manager.device.id, manager.memory.id, elapsedUs(trace_start_ns) },
+    );
+    return null;
+}
+
+fn asyncH2DDestroy(args: [*c]c.PJRT_AsyncHostToDeviceTransferManager_Destroy_Args) callconv(.c) ?*c.PJRT_Error {
+    if (args[0].transfer_manager) |manager| asyncH2DManagerFromC(manager).deinit();
+    return null;
+}
+
+fn asyncH2DTransferData(args: [*c]c.PJRT_AsyncHostToDeviceTransferManager_TransferData_Args) callconv(.c) ?*c.PJRT_Error {
+    const trace_start_ns = nowNs();
+    const manager = asyncH2DManagerFromC(args[0].transfer_manager);
+    const i = manager.index(args[0].buffer_index) catch {
+        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "async transfer buffer index is out of range");
+    };
+    if (args[0].offset < 0 or args[0].transfer_size < 0) {
+        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "async transfer offset and size must be non-negative");
+    }
+    const offset: usize = @intCast(args[0].offset);
+    const transfer_size: usize = @intCast(args[0].transfer_size);
+    if (args[0].data == null and transfer_size != 0) {
+        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "async transfer data is null");
+    }
+    const buffer_size = manager.bufferByteSize(i);
+    if (offset > buffer_size or transfer_size > buffer_size - offset) {
+        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "async transfer range exceeds buffer size");
+    }
+
+    if (transfer_size != 0) {
+        const src = @as([*]const u8, @ptrCast(args[0].data))[0..transfer_size];
+        if (manager.backend_transfers[i]) |transfer| {
+            manager.client.backend.writeAsyncHostToDeviceTransfer(transfer, offset, src) catch |err| {
+                return switch (err) {
+                    error.BufferCopyFailed => makeError(c.PJRT_Error_Code_INTERNAL, "backend async transfer write failed"),
+                    else => makeError(c.PJRT_Error_Code_INTERNAL, "failed to write backend async transfer"),
+                };
+            };
+        } else {
+            copyBytesWithIo(manager.staging[i][offset .. offset + transfer_size], src) catch {
+                return makeError(c.PJRT_Error_Code_INTERNAL, "failed to stage async transfer data");
+            };
+        }
+        manager.written[i] = @max(manager.written[i], offset + transfer_size);
+    }
+
+    args[0].done_with_h2d_transfer = eventCreatePending();
+    if (args[0].done_with_h2d_transfer == null) {
+        return makeError(c.PJRT_Error_Code_RESOURCE_EXHAUSTED, "failed to allocate async transfer event");
+    }
+
+    if (args[0].is_last_transfer) {
+        if (manager.written[i] < buffer_size) {
+            eventSetFailed(args[0].done_with_h2d_transfer, "async transfer completed before full buffer was written");
+            manager.buffers[i].ready_event.setFailed("async transfer completed before full buffer was written");
+            return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "async transfer completed before full buffer was written");
+        }
+        manager.finishBuffer(i) catch |err| {
+            eventSetFailed(args[0].done_with_h2d_transfer, "failed to install async transfer buffer");
+            manager.buffers[i].ready_event.setFailed("failed to install async transfer buffer");
+            return switch (err) {
+                error.ShapeMismatch => makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "async transfer data does not match buffer shape"),
+                error.BufferDeleted, error.BufferDonated => makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, "async transfer buffer is deleted or donated"),
+                error.UnsupportedRuntimeFeature, error.UnsupportedElementType => makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "backend cannot import async transfer buffer"),
+                else => makeError(c.PJRT_Error_Code_INTERNAL, "failed to install async transfer buffer"),
+            };
+        };
+    }
+
+    eventSetReady(args[0].done_with_h2d_transfer);
+    trace(
+        "event=async_h2d_transfer buffer={d} offset={d} bytes={d} last={d} elapsed_us={d}",
+        .{ i, offset, transfer_size, @intFromBool(args[0].is_last_transfer), elapsedUs(trace_start_ns) },
+    );
+    return null;
+}
+
+fn asyncH2DTransferLiteral(args: [*c]c.PJRT_AsyncHostToDeviceTransferManager_TransferLiteral_Args) callconv(.c) ?*c.PJRT_Error {
+    const manager = asyncH2DManagerFromC(args[0].transfer_manager);
+    const i = manager.index(args[0].buffer_index) catch {
+        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "async transfer buffer index is out of range");
+    };
+    const dims = args[0].shape_dims[0..args[0].shape_num_dims];
+    const byte_size = denseByteSize(args[0].shape_element_type, dims);
+    if (byte_size != manager.bufferByteSize(i)) {
+        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "async literal size does not match target buffer");
+    }
+    if (args[0].data == null and byte_size != 0) {
+        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "async literal data is null");
+    }
+    if (byte_size != 0) {
+        const src = @as([*]const u8, @ptrCast(args[0].data))[0..byte_size];
+        if (manager.backend_transfers[i]) |transfer| {
+            manager.client.backend.writeAsyncHostToDeviceTransfer(transfer, 0, src) catch {
+                return makeError(c.PJRT_Error_Code_INTERNAL, "failed to write backend async transfer literal");
+            };
+        } else {
+            copyBytesWithIo(manager.staging[i], src) catch {
+                return makeError(c.PJRT_Error_Code_INTERNAL, "failed to stage async transfer literal");
+            };
+        }
+        manager.written[i] = byte_size;
+    }
+    args[0].done_with_h2d_transfer = eventCreatePending();
+    if (args[0].done_with_h2d_transfer == null) {
+        return makeError(c.PJRT_Error_Code_RESOURCE_EXHAUSTED, "failed to allocate async transfer event");
+    }
+    manager.finishBuffer(i) catch |err| {
+        eventSetFailed(args[0].done_with_h2d_transfer, "failed to install async transfer literal");
+        manager.buffers[i].ready_event.setFailed("failed to install async transfer literal");
+        return switch (err) {
+            error.ShapeMismatch => makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "async literal data does not match buffer shape"),
+            error.BufferDeleted, error.BufferDonated => makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, "async literal buffer is deleted or donated"),
+            error.UnsupportedRuntimeFeature, error.UnsupportedElementType => makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "backend cannot import async transfer literal"),
+            else => makeError(c.PJRT_Error_Code_INTERNAL, "failed to install async transfer literal"),
+        };
+    };
+    eventSetReady(args[0].done_with_h2d_transfer);
+    return null;
+}
+
+fn asyncH2DRetrieveBuffer(args: [*c]c.PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer_Args) callconv(.c) ?*c.PJRT_Error {
+    const manager = asyncH2DManagerFromC(args[0].transfer_manager);
+    const i = manager.index(args[0].buffer_index) catch {
+        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "async transfer buffer index is out of range");
+    };
+    manager.retrieved[i] = true;
+    args[0].buffer_out = @ptrCast(manager.buffers[i]);
+    return null;
+}
+
+fn asyncH2DDevice(args: [*c]c.PJRT_AsyncHostToDeviceTransferManager_Device_Args) callconv(.c) ?*c.PJRT_Error {
+    const manager = asyncH2DManagerFromC(args[0].transfer_manager);
+    args[0].device_out = @ptrCast(manager.device);
+    return null;
+}
+
+fn asyncH2DBufferCount(args: [*c]c.PJRT_AsyncHostToDeviceTransferManager_BufferCount_Args) callconv(.c) ?*c.PJRT_Error {
+    const manager = asyncH2DManagerFromC(args[0].transfer_manager);
+    args[0].buffer_count = manager.buffers.len;
+    return null;
+}
+
+fn asyncH2DBufferSize(args: [*c]c.PJRT_AsyncHostToDeviceTransferManager_BufferSize_Args) callconv(.c) ?*c.PJRT_Error {
+    const manager = asyncH2DManagerFromC(args[0].transfer_manager);
+    const i = manager.index(args[0].buffer_index) catch {
+        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "async transfer buffer index is out of range");
+    };
+    args[0].buffer_size = manager.bufferByteSize(i);
+    return null;
+}
+
+fn asyncH2DSetBufferError(args: [*c]c.PJRT_AsyncHostToDeviceTransferManager_SetBufferError_Args) callconv(.c) ?*c.PJRT_Error {
+    const manager = asyncH2DManagerFromC(args[0].transfer_manager);
+    const i = manager.index(args[0].buffer_index) catch {
+        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "async transfer buffer index is out of range");
+    };
+    const message = bytesFromC(args[0].error_message, args[0].error_message_size) orelse "async transfer buffer failed";
+    manager.buffers[i].ready_event.setFailed(message);
+    return null;
+}
+
+fn asyncH2DAddMetadata(_: [*c]c.PJRT_AsyncHostToDeviceTransferManager_AddMetadata_Args) callconv(.c) ?*c.PJRT_Error {
+    return null;
+}
+
+fn pjrtClientDmaMap(_: [*c]c.PJRT_Client_DmaMap_Args) callconv(.c) ?*c.PJRT_Error {
+    return null;
+}
+
+fn pjrtClientDmaUnmap(_: [*c]c.PJRT_Client_DmaUnmap_Args) callconv(.c) ?*c.PJRT_Error {
     return null;
 }
 
@@ -798,9 +1643,24 @@ fn deviceDefaultMemory(args: [*c]c.PJRT_Device_DefaultMemory_Args) callconv(.c) 
 fn deviceMemoryStats(args: [*c]c.PJRT_Device_MemoryStats_Args) callconv(.c) ?*c.PJRT_Error {
     const device = deviceFromC(args[0].device);
     const stats = device.default_memory.stats;
-    args[0].bytes_in_use = @intCast(stats.bytes_in_use);
-    args[0].peak_bytes_in_use = @intCast(stats.peak_bytes_in_use);
+    args[0].bytes_in_use = clampI64(stats.totalBytesInUse());
+    args[0].peak_bytes_in_use = clampI64(stats.peakTotalBytesInUse());
     args[0].peak_bytes_in_use_is_set = true;
+    args[0].num_allocs = clampI64(stats.live_allocs +| stats.executable_cache_resident_entries);
+    args[0].num_allocs_is_set = true;
+    args[0].largest_alloc_size = clampI64(@max(stats.largest_alloc_size, stats.executable_cache_largest_resident_bytes));
+    args[0].largest_alloc_size_is_set = true;
+    if (stats.capacity_bytes != 0) {
+        args[0].bytes_limit = clampI64(stats.capacity_bytes);
+        args[0].bytes_limit_is_set = true;
+        args[0].largest_free_block_bytes = if (stats.totalBytesInUse() >= stats.capacity_bytes)
+            0
+        else
+            clampI64(stats.capacity_bytes - stats.totalBytesInUse());
+        args[0].largest_free_block_bytes_is_set = true;
+        args[0].bytes_reservable_limit = args[0].largest_free_block_bytes;
+        args[0].bytes_reservable_limit_is_set = true;
+    }
     return null;
 }
 
@@ -935,87 +1795,32 @@ fn loadedExecutableGetDeviceAssignment(args: [*c]c.PJRT_LoadedExecutable_GetDevi
 }
 
 fn loadedExecutableDelete(args: [*c]c.PJRT_LoadedExecutable_Delete_Args) callconv(.c) ?*c.PJRT_Error {
-    executableFromC(args[0].executable).deleted = true;
+    const trace_start_ns = nowNs();
+    const executable = executableFromC(args[0].executable);
+    executable.deleted = true;
+    executable.releaseGraph();
+    trace(
+        "event=loaded_executable_delete cache_hits_total={d} cache_misses_total={d} backend_cache_entries={d} backend_cache_bytes={d} backend_cache_peak_bytes={d} backend_cache_evictions={d} backend_cache_evicted_bytes={d} backend_cache_compile_samples={d} backend_cache_compile_us_total={d} backend_cache_compile_us_peak={d} elapsed_us={d}",
+        .{
+            executable.client.executable_cache.stats.hits,
+            executable.client.executable_cache.stats.misses,
+            executable.client.executable_cache.stats.resident_entries,
+            executable.client.executable_cache.stats.resident_bytes,
+            executable.client.executable_cache.stats.peak_resident_bytes,
+            executable.client.executable_cache.stats.evictions,
+            executable.client.executable_cache.stats.evicted_resident_bytes,
+            executable.client.executable_cache.stats.compile_latency_samples,
+            executable.client.executable_cache.stats.compile_latency_us_total,
+            executable.client.executable_cache.stats.compile_latency_us_peak,
+            elapsedUs(trace_start_ns),
+        },
+    );
     return null;
 }
 
 fn loadedExecutableIsDeleted(args: [*c]c.PJRT_LoadedExecutable_IsDeleted_Args) callconv(.c) ?*c.PJRT_Error {
     args[0].is_deleted = executableFromC(args[0].executable).deleted;
     return null;
-}
-
-fn runtimeBinaryOp(kind: compiler.PlanInstructionKind) ?runtime.ElementwiseBinaryOp {
-    return switch (kind) {
-        .add => .add,
-        .subtract => .subtract,
-        .multiply => .multiply,
-        .divide => .divide,
-        .maximum => .maximum,
-        .minimum => .minimum,
-        .power => .power,
-        .atan2 => .atan2,
-        .remainder => .remainder,
-        .and_ => .and_,
-        .or_ => .or_,
-        .xor => .xor,
-        .shift_left => .shift_left,
-        .shift_right_arithmetic => .shift_right_arithmetic,
-        .shift_right_logical => .shift_right_logical,
-        else => null,
-    };
-}
-
-fn runtimeUnaryOp(kind: compiler.PlanInstructionKind) ?runtime.ElementwiseUnaryOp {
-    return switch (kind) {
-        .negate => .negate,
-        .exp => .exp,
-        .expm1 => .expm1,
-        .tanh => .tanh,
-        .sqrt => .sqrt,
-        .rsqrt => .rsqrt,
-        .abs => .abs,
-        .cbrt => .cbrt,
-        .ceil => .ceil,
-        .floor => .floor,
-        .log => .log,
-        .log1p => .log1p,
-        .logistic => .logistic,
-        .sine => .sine,
-        .cosine => .cosine,
-        .not_ => .not_,
-        .sign => .sign,
-        .is_finite => .is_finite,
-        .round_nearest_afz => .round_nearest_afz,
-        .round_nearest_even => .round_nearest_even,
-        .popcnt => .popcnt,
-        .count_leading_zeros => .count_leading_zeros,
-        else => null,
-    };
-}
-
-fn destroyOwnedBuffer(buffer: *runtime.Buffer, owned: bool) void {
-    if (owned) buffer.deinit();
-}
-
-fn destroyExecuteValues(value_buffers: []?*runtime.Buffer, value_owned: []const bool) void {
-    for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-}
-
-fn unsupportedRuntimeFeature(kind: compiler.PlanInstructionKind) ?*c.PJRT_Error {
-    const message = switch (kind) {
-        .complex => "StableHLO complex execution is staged for complex dtype support; feature=heavy-control-random-structural",
-        .real => "StableHLO real execution is staged for complex dtype support; feature=heavy-control-random-structural",
-        .imag => "StableHLO imag execution is staged for complex dtype support; feature=heavy-control-random-structural",
-        .fft => "StableHLO fft execution is staged for complex dtype and backend FFT lowering; feature=heavy-control-random-structural",
-        .convolution => "StableHLO convolution execution is staged for dimension-number lowering and backend legalization; feature=heavy-control-random-structural",
-        .scatter => "StableHLO scatter execution is staged for region-aware update lowering; feature=heavy-control-random-structural",
-        .custom_call => "StableHLO custom_call execution requires a registered PjRTx custom target; feature=heavy-control-random-structural",
-        .get_tuple_element, .tuple => "StableHLO tuple execution is staged for structural value lowering; feature=heavy-control-random-structural",
-        .while_ => "StableHLO while execution is staged for region/control-flow lowering; feature=heavy-control-random-structural",
-        .triangular_solve => "StableHLO triangular_solve execution is staged for option-aware linear algebra lowering; feature=heavy-control-random-structural",
-        else => "StableHLO execution is staged for this operation; feature=heavy-control-random-structural",
-    };
-    return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, message);
 }
 
 fn graphExecuteError(err: runtime.GraphExecuteError) ?*c.PJRT_Error {
@@ -1027,610 +1832,280 @@ fn graphExecuteError(err: runtime.GraphExecuteError) ?*c.PJRT_Error {
         error.UnsupportedRuntimeFeature => makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "executable graph is not fully lowered to the MLX backend executable"),
         error.BufferDeleted => makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, "execute attempted to use a deleted buffer"),
         error.BufferDonated => makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, "execute attempted to use a donated buffer"),
+        error.BufferNotReady => makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, "execute attempted to use a buffer that is not ready"),
+        error.BufferReadinessFailed => makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, "execute attempted to use a buffer with failed readiness"),
         error.Internal => makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute executable graph"),
     };
+}
+
+fn planDonatesParameter(plan: *const compiler.ExecutablePlan, parameter_index: usize) bool {
+    for (plan.donated_parameter_indices) |candidate| {
+        if (candidate == parameter_index) return true;
+    }
+    return false;
+}
+
+fn executeOptionsKeepParameter(options: ?*c.PJRT_ExecuteOptions, parameter_index: usize) bool {
+    const execute_options = options orelse return false;
+    if (execute_options.non_donatable_input_indices == null) return false;
+    for (0..execute_options.num_non_donatable_input_indices) |index| {
+        const non_donatable = execute_options.non_donatable_input_indices[index];
+        if (non_donatable >= 0 and @as(usize, @intCast(non_donatable)) == parameter_index) return true;
+    }
+    return false;
+}
+
+fn validateExecuteDonationOptions(options: ?*c.PJRT_ExecuteOptions, num_args: usize) ?*c.PJRT_Error {
+    const execute_options = options orelse return null;
+    if (execute_options.num_non_donatable_input_indices != 0 and execute_options.non_donatable_input_indices == null) {
+        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "non_donatable_input_indices count requires a non-null index list");
+    }
+    for (0..execute_options.num_non_donatable_input_indices) |index| {
+        const non_donatable = execute_options.non_donatable_input_indices[index];
+        if (non_donatable < 0 or @as(usize, @intCast(non_donatable)) >= num_args) {
+            return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "non_donatable_input_indices contains an out-of-range argument index");
+        }
+    }
+    return null;
+}
+
+fn validateExecuteDonationAliasHazards(
+    executable: *const Executable,
+    options: ?*c.PJRT_ExecuteOptions,
+    execute_args: c.PJRT_LoadedExecutable_Execute_Args,
+) ?*c.PJRT_Error {
+    for (0..execute_args.num_devices) |donor_device_index| {
+        for (0..execute_args.num_args) |donor_argument_index| {
+            if (!planDonatesParameter(executable.plan, donor_argument_index)) continue;
+            if (executeOptionsKeepParameter(options, donor_argument_index)) continue;
+            const donor_buffer = execute_args.argument_lists[donor_device_index][donor_argument_index].?;
+            for (0..execute_args.num_devices) |other_device_index| {
+                for (0..execute_args.num_args) |other_argument_index| {
+                    if (donor_device_index == other_device_index and donor_argument_index == other_argument_index) continue;
+                    if (execute_args.argument_lists[other_device_index][other_argument_index] == donor_buffer) {
+                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "donated execute argument aliases another argument");
+                    }
+                }
+            }
+        }
+    }
+    return null;
+}
+
+fn appendUniqueDonatedArgument(list: *std.ArrayList(*runtime.Buffer), buffer: *runtime.Buffer) !void {
+    for (list.items) |existing| {
+        if (existing == buffer) return;
+    }
+    try list.append(allocator, buffer);
+}
+
+fn validateExecuteLists(executable: *const Executable, execute_args: c.PJRT_LoadedExecutable_Execute_Args) ?*c.PJRT_Error {
+    const expected_args = executable.plan.parameter_shardings.len;
+    const expected_outputs = executable.plan.output_ids.len;
+    if (execute_args.num_devices == 0) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx execute requires at least one device");
+    if (execute_args.num_devices > executable.graph.device_ids.len) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx execute requested more devices than the executable graph contains");
+    if (execute_args.num_args != expected_args) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx execute argument count does not match executable parameters");
+    if (expected_args != 0 and execute_args.argument_lists == null) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx execute requires non-null argument_lists for executable parameters");
+    if (expected_outputs != 0 and execute_args.output_lists == null) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx execute requires non-null output_lists for executable outputs");
+    for (0..execute_args.num_devices) |device_index| {
+        if (expected_args != 0 and execute_args.argument_lists[device_index] == null) {
+            return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx execute requires a non-null argument list for every device");
+        }
+        if (expected_outputs != 0 and execute_args.output_lists[device_index] == null) {
+            return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx execute requires a non-null output list for every device");
+        }
+        for (0..expected_args) |argument_index| {
+            if (execute_args.argument_lists[device_index][argument_index] == null) {
+                return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx execute argument list contains a null buffer");
+            }
+        }
+    }
+    return null;
+}
+
+fn clearExecuteResults(execute_args: c.PJRT_LoadedExecutable_Execute_Args, output_count: usize) void {
+    for (0..execute_args.num_devices) |device_index| {
+        if (execute_args.output_lists != null) {
+            const outputs = execute_args.output_lists[device_index];
+            if (outputs != null) {
+                for (0..output_count) |output_index| outputs[output_index] = null;
+            }
+        }
+        if (execute_args.device_complete_events) |events| events[device_index] = null;
+    }
+}
+
+fn cleanupExecuteResults(execute_args: c.PJRT_LoadedExecutable_Execute_Args, output_count: usize) void {
+    for (0..execute_args.num_devices) |device_index| {
+        if (execute_args.output_lists != null) {
+            const outputs = execute_args.output_lists[device_index];
+            if (outputs != null) {
+                for (0..output_count) |output_index| {
+                    if (outputs[output_index]) |output| {
+                        bufferFromC(output).deinit();
+                        outputs[output_index] = null;
+                    }
+                }
+            }
+        }
+        if (execute_args.device_complete_events) |events| {
+            if (events[device_index]) |event| {
+                var event_destroy_args = std.mem.zeroes(c.PJRT_Event_Destroy_Args);
+                event_destroy_args.struct_size = c.PJRT_Event_Destroy_Args_STRUCT_SIZE;
+                event_destroy_args.event = event;
+                _ = pjrtEventDestroy(&event_destroy_args);
+                events[device_index] = null;
+            }
+        }
+    }
+}
+
+fn cleanupUnassignedExecuteOutputs(outputs: []const *runtime.Buffer, assigned_count: usize) void {
+    if (assigned_count >= outputs.len) return;
+    for (outputs[assigned_count..]) |output| output.deinit();
+}
+
+test "execute cleanup destroys only unassigned runtime outputs" {
+    const test_allocator = std.testing.allocator;
+    const client = try runtime.Client.init(test_allocator, backend_registry.create(.metal_mlx), 1);
+    defer client.deinit();
+
+    const dims = [_]i64{4};
+    const first_data = [_]u8{ 1, 2, 3, 4 };
+    const second_data = [_]u8{ 5, 6, 7, 8 };
+    const first = try runtime.Buffer.initHostCopyForBackend(test_allocator, client.backend, .u8, &dims, &client.devices[0], &client.memories[0], 0, &first_data);
+    defer first.deinit();
+    const second = try runtime.Buffer.initHostCopyForBackend(test_allocator, client.backend, .u8, &dims, &client.devices[0], &client.memories[0], 0, &second_data);
+
+    const bytes_before_cleanup = client.memories[0].stats.bytes_in_use;
+    const second_bytes: u64 = @intCast(second.byte_size);
+    var outputs = [_]*runtime.Buffer{ first, second };
+    cleanupUnassignedExecuteOutputs(&outputs, 1);
+
+    try first.ensureUsable();
+    try std.testing.expectEqual(bytes_before_cleanup - second_bytes, client.memories[0].stats.bytes_in_use);
 }
 
 fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callconv(.c) ?*c.PJRT_Error {
     const trace_start_ns = nowNs();
     const executable = executableFromC(args[0].executable);
-    if (args[0].num_args == 0 and executable.plan.parameter_shardings.len != 0) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx execute expects arguments for executable parameters");
-    if (args[0].num_devices > executable.graph.device_ids.len) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx execute requested more devices than the executable graph contains");
+    if (executable.deleted) return makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, "loaded executable has been deleted");
+    if (validateExecuteLists(executable, args[0])) |err| return err;
+    if (validateExecuteDonationOptions(args[0].options, args[0].num_args)) |err| return err;
+    if (validateExecuteDonationAliasHazards(executable, args[0].options, args[0])) |err| return err;
+    const output_count = executable.plan.output_ids.len;
+    clearExecuteResults(args[0], output_count);
+    var donated_arguments = std.ArrayList(*runtime.Buffer).empty;
+    defer donated_arguments.deinit(allocator);
     var total_outputs: usize = 0;
     var backend_candidate = executable.graph.backend_executable != null;
+    var execute_cache_trim_bytes: u64 = 0;
+    var execute_cache_trim_evictions: u64 = 0;
+    var execute_cache_pressure_remaining_bytes: u64 = 0;
+    var execute_cache_pressure_failed = false;
+    var backend_completion_pending_count: u64 = 0;
     for (0..args[0].num_devices) |device_index| {
-        const arguments = allocator.alloc(*runtime.Buffer, args[0].num_args) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable graph argument list");
+        const arguments = allocator.alloc(*runtime.Buffer, args[0].num_args) catch {
+            cleanupExecuteResults(args[0], output_count);
+            return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable graph argument list");
+        };
         defer allocator.free(arguments);
         for (arguments, 0..) |*argument, argument_index| {
             argument.* = bufferFromC(args[0].argument_lists[device_index][argument_index]);
             backend_candidate = backend_candidate and argument.*.hasBackendStorage();
+            if (planDonatesParameter(executable.plan, argument_index) and !executeOptionsKeepParameter(args[0].options, argument_index)) {
+                appendUniqueDonatedArgument(&donated_arguments, argument.*) catch {
+                    cleanupExecuteResults(args[0], output_count);
+                    return makeError(c.PJRT_Error_Code_INTERNAL, "failed to record donated executable argument");
+                };
+            }
         }
 
-        const outputs = executable.graph.executeDevice(allocator, executable.client, executable.plan, device_index, arguments) catch |err| {
+        const execute_result = executable.graph.executeDevice(allocator, executable.client, executable.plan, device_index, arguments) catch |err| {
+            cleanupExecuteResults(args[0], output_count);
             return graphExecuteError(err);
         };
+        execute_cache_trim_bytes +|= executable.graph.last_execute_cache_trim.freed_bytes;
+        execute_cache_trim_evictions +|= executable.graph.last_execute_cache_trim.evicted_entries;
+        execute_cache_pressure_remaining_bytes +|= executable.graph.last_execute_cache_trim.remaining_resident_bytes;
+        execute_cache_pressure_failed = execute_cache_pressure_failed or executable.graph.last_execute_cache_trim.still_over_capacity;
+        if (executable.graph.last_backend_completion.kind == .pending) backend_completion_pending_count += 1;
+        const outputs = execute_result.outputs;
         defer allocator.free(outputs);
+        var assigned_outputs: usize = 0;
+        var outputs_transferred = false;
+        defer if (!outputs_transferred) cleanupUnassignedExecuteOutputs(outputs, assigned_outputs);
+        var stack_completion_event = execute_result.completion_event;
+        const completion_event = if (args[0].device_complete_events) |events| blk: {
+            events[device_index] = eventCreateFromRuntime(execute_result.completion_event) orelse {
+                cleanupExecuteResults(args[0], output_count);
+                return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate execute completion event");
+            };
+            break :blk eventFromC(events[device_index].?);
+        } else &stack_completion_event;
         total_outputs += outputs.len;
         for (outputs, 0..) |output, output_index| {
             args[0].output_lists[device_index][output_index] = @ptrCast(output);
+            assigned_outputs = output_index + 1;
+            output.chainReadyAfter(completion_event) catch {
+                cleanupExecuteResults(args[0], output_count);
+                return makeError(c.PJRT_Error_Code_RESOURCE_EXHAUSTED, "too many output readiness dependencies for execute completion event");
+            };
         }
-        if (args[0].device_complete_events) |events| events[device_index] = eventCreateReady();
+        outputs_transferred = true;
     }
+    for (donated_arguments.items) |argument| argument.markDonated();
+    const backend_stats = executable.graph.backendExecutableStats() orelse backend_api.ExecutableStats{};
     trace(
-        "event=execute devices={d} args={d} outputs={d} backend_candidate={d} elapsed_us={d}",
+        "event=execute devices={d} args={d} outputs={d} backend_candidate={d} backend_executes={d} compiled_program_executes={d} captured_program_executes={d} captured_dynamic_inputs={d} captured_static_inputs={d} donation_alias_outputs={d} donation_alias_bytes={d} last_device_index={d} last_local_hardware_id={d} resident_constants={d} resident_constant_bytes={d} fusion_groups={d} fusion_group_executes={d} materialization_evals={d} materialization_buffers={d} released_intermediates={d} borrowed_constant_nodes={d} cache_trim_bytes={d} cache_trim_evictions={d} cache_pressure_remaining_bytes={d} cache_pressure_failed={d} backend_completion_pending={d} elapsed_us={d}",
         .{
             args[0].num_devices,
             args[0].num_args,
             total_outputs,
             @intFromBool(backend_candidate),
+            backend_stats.execute_count,
+            backend_stats.compiled_program_execute_count,
+            backend_stats.captured_program_execute_count,
+            backend_stats.captured_program_dynamic_input_count,
+            backend_stats.captured_program_captured_input_count,
+            backend_stats.donation_alias_output_count,
+            backend_stats.donation_alias_output_bytes,
+            backend_stats.last_execute_device_index,
+            backend_stats.last_execute_local_hardware_id,
+            backend_stats.resident_constant_count,
+            backend_stats.resident_constant_bytes,
+            backend_stats.program_fusion_group_count,
+            backend_stats.fusion_group_execute_count,
+            backend_stats.materialization_eval_count,
+            backend_stats.materialization_eval_buffer_count,
+            backend_stats.released_intermediate_count,
+            backend_stats.borrowed_constant_nodes,
+            execute_cache_trim_bytes,
+            execute_cache_trim_evictions,
+            execute_cache_pressure_remaining_bytes,
+            @intFromBool(execute_cache_pressure_failed),
+            backend_completion_pending_count,
             elapsedUs(trace_start_ns),
         },
     );
-    return null;
-}
-
-fn loadedExecutableExecuteLegacy(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callconv(.c) ?*c.PJRT_Error {
-    const executable = executableFromC(args[0].executable);
-    if (args[0].num_args == 0 and executable.plan.parameter_shardings.len != 0) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx bootstrap execute expects arguments for executable parameters");
-    if (executable.plan.instructions.len == 0) return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "executable plan has no runtime operations");
-    for (0..args[0].num_devices) |device_index| {
-        const value_buffers = allocator.alloc(?*runtime.Buffer, executable.plan.values.len) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate execute value table");
-        defer allocator.free(value_buffers);
-        @memset(value_buffers, null);
-        const value_owned = allocator.alloc(bool, executable.plan.values.len) catch {
-            allocator.free(value_buffers);
-            return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate execute ownership table");
-        };
-        defer allocator.free(value_owned);
-        @memset(value_owned, false);
-        var output_value_ids = allocator.alloc(bool, executable.plan.values.len) catch {
-            allocator.free(value_buffers);
-            allocator.free(value_owned);
-            return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate execute output id table");
-        };
-        defer allocator.free(output_value_ids);
-        @memset(output_value_ids, false);
-        for (executable.plan.output_ids) |id| {
-            if (id.index < output_value_ids.len) output_value_ids[id.index] = true;
-        }
-        var parameter_index: usize = 0;
-        for (executable.plan.values) |value| {
-            if (value.role != .parameter) continue;
-            if (parameter_index >= args[0].num_args) {
-                for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "PjRTx bootstrap execute received fewer arguments than executable parameters");
-            }
-            value_buffers[value.id.index] = bufferFromC(args[0].argument_lists[device_index][parameter_index]);
-            parameter_index += 1;
-        }
-        for (executable.plan.instructions) |plan_instruction| {
-            if (plan_instruction.kind == .rng_bit_generator) {
-                if (plan_instruction.inputs.len < 1 or plan_instruction.outputs.len != 2) {
-                    destroyExecuteValues(value_buffers, value_owned);
-                    return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "rng_bit_generator StableHLO plan must have one state input and two outputs");
-                }
-                const state_input = value_buffers[plan_instruction.inputs[0].index].?;
-                const state_output = runtime.Buffer.initRngStateUpdate(allocator, state_input, device_index) catch {
-                    destroyExecuteValues(value_buffers, value_owned);
-                    return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute rng_bit_generator state update");
-                };
-                const bits_descriptor = executable.plan.values[plan_instruction.outputs[1].index].descriptor;
-                const bits_output = runtime.Buffer.initRngBits(
-                    allocator,
-                    state_input,
-                    bits_descriptor.element_type,
-                    plan_instruction.dims orelse bits_descriptor.dims,
-                    device_index,
-                ) catch |err| switch (err) {
-                    error.UnsupportedElementType => {
-                        state_output.deinit();
-                        destroyExecuteValues(value_buffers, value_owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "rng_bit_generator StableHLO execution currently supports u32/s32 random bits");
-                    },
-                    else => {
-                        state_output.deinit();
-                        destroyExecuteValues(value_buffers, value_owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute rng_bit_generator StableHLO op");
-                    },
-                };
-                value_buffers[plan_instruction.outputs[0].index] = state_output;
-                value_owned[plan_instruction.outputs[0].index] = true;
-                value_buffers[plan_instruction.outputs[1].index] = bits_output;
-                value_owned[plan_instruction.outputs[1].index] = true;
-                continue;
-            }
-            if (plan_instruction.outputs.len != 1) {
-                destroyExecuteValues(value_buffers, value_owned);
-                return makeError(c.PJRT_Error_Code_INTERNAL, "executable plan instruction arity is invalid");
-            }
-            const output_id = plan_instruction.outputs[0];
-            const next = switch (plan_instruction.kind) {
-                .constant => blk: {
-                    const descriptor = executable.plan.values[output_id.index].descriptor;
-                    const device = &executable.client.devices[device_index];
-                    const memory = device.default_memory;
-                    break :blk runtime.Buffer.initHostCopyForBackend(
-                        allocator,
-                        executable.client.backend,
-                        descriptor.element_type,
-                        descriptor.dims,
-                        device,
-                        memory,
-                        device_index,
-                        plan_instruction.literal orelse &.{},
-                    ) catch {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate StableHLO constant");
-                    };
-                },
-                .copy_arg0 => runtime.Buffer.initDeviceCopy(allocator, value_buffers[plan_instruction.inputs[0].index].?, device_index) catch {
-                    for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                    return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate execute output");
-                },
-                .reduce_precision => runtime.Buffer.initDeviceCopy(allocator, value_buffers[plan_instruction.inputs[0].index].?, device_index) catch {
-                    destroyExecuteValues(value_buffers, value_owned);
-                    return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute reduce_precision StableHLO op");
-                },
-                .partition_id => blk: {
-                    const descriptor = executable.plan.values[output_id.index].descriptor;
-                    const device = &executable.client.devices[device_index];
-                    break :blk runtime.Buffer.initPartitionId(
-                        allocator,
-                        executable.client.backend,
-                        descriptor.element_type,
-                        descriptor.dims,
-                        device,
-                        device.default_memory,
-                        @intCast(device_index),
-                        device_index,
-                    ) catch |err| switch (err) {
-                        error.UnsupportedElementType => {
-                            destroyExecuteValues(value_buffers, value_owned);
-                            return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "partition_id StableHLO execution currently supports u32/s32 scalar outputs");
-                        },
-                        error.ShapeMismatch => {
-                            destroyExecuteValues(value_buffers, value_owned);
-                            return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "partition_id StableHLO output must be scalar");
-                        },
-                        else => {
-                            destroyExecuteValues(value_buffers, value_owned);
-                            return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute partition_id StableHLO op");
-                        },
-                    };
-                },
-                .cholesky => runtime.Buffer.initCholesky(
-                    allocator,
-                    value_buffers[plan_instruction.inputs[0].index].?,
-                    plan_instruction.lower orelse true,
-                    plan_instruction.dims orelse executable.plan.values[output_id.index].descriptor.dims,
-                    device_index,
-                ) catch |err| switch (err) {
-                    error.UnsupportedElementType => {
-                        destroyExecuteValues(value_buffers, value_owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "cholesky StableHLO execution currently supports dense f32 tensors only");
-                    },
-                    error.ShapeMismatch => {
-                        destroyExecuteValues(value_buffers, value_owned);
-                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "cholesky StableHLO input must be positive-definite square matrices");
-                    },
-                    else => {
-                        destroyExecuteValues(value_buffers, value_owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute cholesky StableHLO op");
-                    },
-                },
-                .rng => runtime.Buffer.initRngUniform(
-                    allocator,
-                    value_buffers[plan_instruction.inputs[0].index].?,
-                    value_buffers[plan_instruction.inputs[1].index].?,
-                    executable.plan.values[output_id.index].descriptor.element_type,
-                    plan_instruction.dims orelse executable.plan.values[output_id.index].descriptor.dims,
-                    device_index,
-                ) catch |err| switch (err) {
-                    error.UnsupportedElementType => {
-                        destroyExecuteValues(value_buffers, value_owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "rng StableHLO execution currently supports deterministic uniform f32/u32/s32 generation");
-                    },
-                    error.ShapeMismatch => {
-                        destroyExecuteValues(value_buffers, value_owned);
-                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "rng StableHLO min/max inputs must be scalar");
-                    },
-                    else => {
-                        destroyExecuteValues(value_buffers, value_owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute rng StableHLO op");
-                    },
-                },
-                .add, .subtract, .multiply, .divide, .maximum, .minimum, .power, .atan2, .remainder, .and_, .or_, .xor, .shift_left, .shift_right_arithmetic, .shift_right_logical => blk: {
-                    const lhs = value_buffers[plan_instruction.inputs[0].index].?;
-                    const rhs = value_buffers[plan_instruction.inputs[1].index].?;
-                    break :blk runtime.Buffer.initElementwiseBinary(allocator, runtimeBinaryOp(plan_instruction.kind).?, lhs, rhs, device_index) catch |err| switch (err) {
-                        error.UnsupportedElementType => {
-                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                            return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "binary StableHLO execution currently supports u8 and f32 buffers only");
-                        },
-                        error.ShapeMismatch => {
-                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                            return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "binary StableHLO arguments must have the same shape");
-                        },
-                        else => {
-                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                            return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute binary StableHLO op");
-                        },
-                    };
-                },
-                .negate, .exp, .expm1, .tanh, .sqrt, .rsqrt, .abs, .cbrt, .ceil, .floor, .log, .log1p, .logistic, .sine, .cosine, .not_, .sign, .is_finite, .round_nearest_afz, .round_nearest_even, .popcnt, .count_leading_zeros => runtime.Buffer.initElementwiseUnaryTyped(
-                    allocator,
-                    runtimeUnaryOp(plan_instruction.kind).?,
-                    value_buffers[plan_instruction.inputs[0].index].?,
-                    executable.plan.values[output_id.index].descriptor.element_type,
-                    plan_instruction.dims orelse executable.plan.values[output_id.index].descriptor.dims,
-                    device_index,
-                ) catch |err| switch (err) {
-                    error.UnsupportedElementType => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "unary StableHLO execution currently supports u8 negate and f32 math buffers only");
-                    },
-                    else => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute unary StableHLO op");
-                    },
-                },
-                .convert => runtime.Buffer.initConvert(
-                    allocator,
-                    value_buffers[plan_instruction.inputs[0].index].?,
-                    executable.plan.values[output_id.index].descriptor.element_type,
-                    plan_instruction.dims orelse executable.plan.values[output_id.index].descriptor.dims,
-                    device_index,
-                ) catch |err| switch (err) {
-                    error.UnsupportedElementType => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "convert StableHLO execution currently supports pred/u8/s8/s32/u32/f32 scalar conversions");
-                    },
-                    error.ShapeMismatch => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "convert StableHLO output shape must match input shape");
-                    },
-                    else => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute convert StableHLO op");
-                    },
-                },
-                .bitcast_convert => {
-                    for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                    return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "bitcast_convert StableHLO execution needs backend dtype reinterpretation support");
-                },
-                .iota => blk: {
-                    const descriptor = executable.plan.values[output_id.index].descriptor;
-                    const device = &executable.client.devices[device_index];
-                    break :blk runtime.Buffer.initIota(
-                        allocator,
-                        executable.client.backend,
-                        descriptor.element_type,
-                        plan_instruction.dims orelse descriptor.dims,
-                        device,
-                        device.default_memory,
-                        plan_instruction.iota_dimension orelse 0,
-                        device_index,
-                    ) catch |err| switch (err) {
-                        error.UnsupportedElementType => {
-                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                            return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "iota StableHLO execution currently supports scalar numeric element types");
-                        },
-                        error.ShapeMismatch => {
-                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                            return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "iota StableHLO dimension is invalid");
-                        },
-                        else => {
-                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                            return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute iota StableHLO op");
-                        },
-                    };
-                },
-                .reshape => runtime.Buffer.initReshape(allocator, value_buffers[plan_instruction.inputs[0].index].?, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
-                    error.UnsupportedElementType => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "reshape StableHLO execution currently supports u8 and f32 MLX buffers only");
-                    },
-                    error.ShapeMismatch => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "reshape StableHLO output shape must preserve byte size");
-                    },
-                    else => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute reshape StableHLO op");
-                    },
-                },
-                .transpose => runtime.Buffer.initTranspose(allocator, value_buffers[plan_instruction.inputs[0].index].?, plan_instruction.permutation orelse &.{}, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
-                    error.UnsupportedElementType => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "transpose StableHLO execution currently supports dense u8 and f32 buffers only");
-                    },
-                    error.ShapeMismatch => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "transpose StableHLO permutation or output shape is invalid");
-                    },
-                    else => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute transpose StableHLO op");
-                    },
-                },
-                .broadcast_in_dim => runtime.Buffer.initBroadcastInDim(allocator, value_buffers[plan_instruction.inputs[0].index].?, plan_instruction.broadcast_dimensions orelse &.{}, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
-                    error.UnsupportedElementType => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "broadcast_in_dim StableHLO execution currently supports dense u8 and f32 buffers only");
-                    },
-                    error.ShapeMismatch => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "broadcast_in_dim StableHLO dimensions or output shape are invalid");
-                    },
-                    else => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute broadcast_in_dim StableHLO op");
-                    },
-                },
-                .slice => runtime.Buffer.initSlice(
-                    allocator,
-                    value_buffers[plan_instruction.inputs[0].index].?,
-                    plan_instruction.start_indices orelse &.{},
-                    plan_instruction.limit_indices orelse &.{},
-                    plan_instruction.strides orelse &.{},
-                    plan_instruction.dims orelse &.{},
-                    device_index,
-                ) catch |err| switch (err) {
-                    error.UnsupportedElementType => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "slice StableHLO execution currently supports dense u8 and f32 buffers only");
-                    },
-                    error.ShapeMismatch => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "slice StableHLO bounds, strides, or output shape are invalid");
-                    },
-                    else => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute slice StableHLO op");
-                    },
-                },
-                .dynamic_slice => blk: {
-                    const src = value_buffers[plan_instruction.inputs[0].index].?;
-                    const starts = allocator.alloc(*runtime.Buffer, plan_instruction.inputs.len - 1) catch {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate dynamic_slice start table");
-                    };
-                    defer allocator.free(starts);
-                    for (plan_instruction.inputs[1..], 0..) |input_id, i| starts[i] = value_buffers[input_id.index].?;
-                    break :blk runtime.Buffer.initDynamicSlice(allocator, src, starts, plan_instruction.slice_sizes orelse &.{}, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
-                        error.UnsupportedElementType => {
-                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                            return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "dynamic_slice StableHLO execution currently supports dense host fallback buffers only");
-                        },
-                        error.ShapeMismatch => {
-                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                            return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "dynamic_slice StableHLO starts or slice sizes are invalid");
-                        },
-                        else => {
-                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                            return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute dynamic_slice StableHLO op");
-                        },
-                    };
-                },
-                .dynamic_update_slice => blk: {
-                    const starts = allocator.alloc(*runtime.Buffer, plan_instruction.inputs.len - 2) catch {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate dynamic_update_slice start table");
-                    };
-                    defer allocator.free(starts);
-                    for (plan_instruction.inputs[2..], 0..) |input_id, i| starts[i] = value_buffers[input_id.index].?;
-                    break :blk runtime.Buffer.initDynamicUpdateSlice(allocator, value_buffers[plan_instruction.inputs[0].index].?, value_buffers[plan_instruction.inputs[1].index].?, starts, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
-                        error.UnsupportedElementType => {
-                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                            return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "dynamic_update_slice StableHLO execution currently supports matching dense element types");
-                        },
-                        error.ShapeMismatch => {
-                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                            return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "dynamic_update_slice StableHLO update or starts are invalid");
-                        },
-                        else => {
-                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                            return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute dynamic_update_slice StableHLO op");
-                        },
-                    };
-                },
-                .pad => runtime.Buffer.initPad(allocator, value_buffers[plan_instruction.inputs[0].index].?, value_buffers[plan_instruction.inputs[1].index].?, plan_instruction.edge_padding_low orelse &.{}, plan_instruction.edge_padding_high orelse &.{}, plan_instruction.interior_padding orelse &.{}, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
-                    error.UnsupportedElementType => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "pad StableHLO execution currently supports scalar padding values with dense buffers");
-                    },
-                    error.ShapeMismatch => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "pad StableHLO padding attributes are invalid");
-                    },
-                    else => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute pad StableHLO op");
-                    },
-                },
-                .reverse => runtime.Buffer.initReverse(allocator, value_buffers[plan_instruction.inputs[0].index].?, plan_instruction.dimensions orelse &.{}, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
-                    error.UnsupportedElementType => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "reverse StableHLO execution currently supports dense buffers only");
-                    },
-                    error.ShapeMismatch => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "reverse StableHLO dimensions are invalid");
-                    },
-                    else => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute reverse StableHLO op");
-                    },
-                },
-                .concatenate => blk: {
-                    const lhs = value_buffers[plan_instruction.inputs[0].index].?;
-                    const rhs = value_buffers[plan_instruction.inputs[1].index].?;
-                    break :blk runtime.Buffer.initConcatenate(
-                        allocator,
-                        lhs,
-                        rhs,
-                        plan_instruction.dimension orelse 0,
-                        plan_instruction.dims orelse &.{},
-                        device_index,
-                    ) catch |err| switch (err) {
-                        error.UnsupportedElementType => {
-                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                            return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "concatenate StableHLO execution currently supports dense u8 and f32 buffers only");
-                        },
-                        error.ShapeMismatch => {
-                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                            return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "concatenate StableHLO input shapes, dimension, or output shape are invalid");
-                        },
-                        else => {
-                            for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                            return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute concatenate StableHLO op");
-                        },
-                    };
-                },
-                .dot_general => runtime.Buffer.initDotGeneral(
-                    allocator,
-                    value_buffers[plan_instruction.inputs[0].index].?,
-                    value_buffers[plan_instruction.inputs[1].index].?,
-                    plan_instruction.lhs_batch_dimensions orelse &.{},
-                    plan_instruction.rhs_batch_dimensions orelse &.{},
-                    plan_instruction.lhs_contracting_dimensions orelse &.{},
-                    plan_instruction.rhs_contracting_dimensions orelse &.{},
-                    plan_instruction.dims orelse &.{},
-                    device_index,
-                ) catch |err| switch (err) {
-                    error.UnsupportedElementType => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "dot_general StableHLO execution currently supports f32 matmul-like tensors only");
-                    },
-                    error.ShapeMismatch => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "dot_general StableHLO dimension numbers or output shape are invalid");
-                    },
-                    else => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute dot_general StableHLO op");
-                    },
-                },
-                .reduce_sum, .reduce_max => runtime.Buffer.initReduce(allocator, plan_instruction.kind, value_buffers[plan_instruction.inputs[0].index].?, plan_instruction.reduce_dimensions orelse &.{}, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
-                    error.UnsupportedElementType => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "reduce StableHLO execution currently supports f32 sum/max only");
-                    },
-                    error.ShapeMismatch => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "reduce StableHLO dimensions or output shape are invalid");
-                    },
-                    else => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute reduce StableHLO op");
-                    },
-                },
-                .gather => runtime.Buffer.initGather(allocator, value_buffers[plan_instruction.inputs[0].index].?, value_buffers[plan_instruction.inputs[1].index].?, plan_instruction.offset_dims orelse &.{}, plan_instruction.collapsed_slice_dims orelse &.{}, plan_instruction.operand_batching_dims orelse &.{}, plan_instruction.start_indices_batching_dims orelse &.{}, plan_instruction.start_index_map orelse &.{}, plan_instruction.index_vector_dim orelse 0, plan_instruction.slice_sizes orelse &.{}, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
-                    error.UnsupportedElementType => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "gather StableHLO execution currently supports embedding-style collapsed single-axis gathers");
-                    },
-                    error.ShapeMismatch => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "gather StableHLO dimension numbers or slice sizes are invalid");
-                    },
-                    else => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute gather StableHLO op");
-                    },
-                },
-                .sort => runtime.Buffer.initSort(allocator, value_buffers[plan_instruction.inputs[0].index].?, plan_instruction.dimension orelse 0, plan_instruction.dims orelse &.{}, plan_instruction.compare_direction orelse .lt, device_index) catch |err| switch (err) {
-                    error.UnsupportedElementType => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "sort StableHLO execution currently supports numeric dense buffers with lt/le/gt/ge comparator direction");
-                    },
-                    error.ShapeMismatch => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "sort StableHLO dimension, comparator, or output shape is invalid");
-                    },
-                    error.UnsupportedRuntimeFeature => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "sort StableHLO execution requires a supported MLX device path");
-                    },
-                    else => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute sort StableHLO op");
-                    },
-                },
-                .compare => runtime.Buffer.initCompare(allocator, value_buffers[plan_instruction.inputs[0].index].?, value_buffers[plan_instruction.inputs[1].index].?, plan_instruction.compare_direction orelse .eq, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
-                    error.UnsupportedElementType => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "compare StableHLO execution currently supports f32 predicates only");
-                    },
-                    error.ShapeMismatch => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "compare StableHLO input or output shape is invalid");
-                    },
-                    else => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute compare StableHLO op");
-                    },
-                },
-                .select => runtime.Buffer.initSelect(allocator, value_buffers[plan_instruction.inputs[0].index].?, value_buffers[plan_instruction.inputs[1].index].?, value_buffers[plan_instruction.inputs[2].index].?, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
-                    error.UnsupportedElementType => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "select StableHLO execution currently supports pred with matching dense data buffers");
-                    },
-                    error.ShapeMismatch => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "select StableHLO input or output shape is invalid");
-                    },
-                    else => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute select StableHLO op");
-                    },
-                },
-                .clamp => runtime.Buffer.initClamp(allocator, value_buffers[plan_instruction.inputs[0].index].?, value_buffers[plan_instruction.inputs[1].index].?, value_buffers[plan_instruction.inputs[2].index].?, plan_instruction.dims orelse &.{}, device_index) catch |err| switch (err) {
-                    error.UnsupportedElementType => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "clamp StableHLO execution currently supports matching dense numeric buffers");
-                    },
-                    error.ShapeMismatch => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "clamp StableHLO input or output shape is invalid");
-                    },
-                    else => {
-                        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to execute clamp StableHLO op");
-                    },
-                },
-                .rng_bit_generator => unreachable,
-                .complex, .real, .imag, .fft, .convolution, .custom_call, .get_tuple_element, .scatter, .triangular_solve, .tuple, .while_ => {
-                    destroyExecuteValues(value_buffers, value_owned);
-                    return unsupportedRuntimeFeature(plan_instruction.kind);
-                },
-                .unsupported => {
-                    for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                    return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "executable plan contains an unsupported runtime operation");
-                },
-            };
-            value_buffers[output_id.index] = next;
-            value_owned[output_id.index] = true;
-        }
-        for (executable.plan.output_ids, 0..) |output_id, output_index| {
-            const output_buffer = value_buffers[output_id.index] orelse {
-                for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                return makeError(c.PJRT_Error_Code_INTERNAL, "executable output value was not produced");
-            };
-            if (value_owned[output_id.index]) {
-                args[0].output_lists[device_index][output_index] = @ptrCast(output_buffer);
-                value_owned[output_id.index] = false;
-            } else {
-                const copied = runtime.Buffer.initDeviceCopy(allocator, output_buffer, device_index) catch {
-                    for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-                    return makeError(c.PJRT_Error_Code_INTERNAL, "failed to copy argument output");
-                };
-                args[0].output_lists[device_index][output_index] = @ptrCast(copied);
-            }
-        }
-        for (value_buffers, value_owned) |maybe_buffer, owned| if (maybe_buffer) |buffer| destroyOwnedBuffer(buffer, owned);
-        if (args[0].device_complete_events) |events| events[device_index] = eventCreateReady();
-    }
+    trace(
+        "event=execute_backend_profile backend_executes={d} execute_us_total={d} execute_us_peak={d} schedule_us_total={d} schedule_us_peak={d} node_us_total={d} node_us_peak={d} fusion_us_total={d} fusion_us_peak={d} materialization_us_total={d} materialization_us_peak={d} output_clone_us_total={d} output_clone_us_peak={d}",
+        .{
+            backend_stats.execute_count,
+            backend_stats.execute_wall_us_total,
+            backend_stats.execute_wall_us_peak,
+            backend_stats.schedule_us_total,
+            backend_stats.schedule_us_peak,
+            backend_stats.node_us_total,
+            backend_stats.node_us_peak,
+            backend_stats.fusion_group_us_total,
+            backend_stats.fusion_group_us_peak,
+            backend_stats.materialization_eval_us_total,
+            backend_stats.materialization_eval_us_peak,
+            backend_stats.output_clone_us_total,
+            backend_stats.output_clone_us_peak,
+        },
+    );
     return null;
 }
 
@@ -1759,11 +2234,22 @@ fn bufferToHost(args: [*c]c.PJRT_Buffer_ToHostBuffer_Args) callconv(.c) ?*c.PJRT
         args[0].dst_size = buffer.byte_size;
         return null;
     }
-    if (args[0].dst_size < buffer.byte_size) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "destination buffer is too small");
-    buffer.copyToHost(@as([*]u8, @ptrCast(args[0].dst))[0..buffer.byte_size]) catch {
-        return makeError(c.PJRT_Error_Code_INTERNAL, "failed to copy buffer to host");
+    buffer.ensureReady() catch |err| return switch (err) {
+        error.BufferNotReady => makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, "buffer is not ready"),
+        error.BufferReadinessFailed => makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, "buffer readiness failed"),
     };
-    args[0].event = eventCreateReady();
+    if (args[0].dst_size < buffer.byte_size) return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "destination buffer is too small");
+    buffer.copyToHost(@as([*]u8, @ptrCast(args[0].dst))[0..buffer.byte_size]) catch |err| {
+        return switch (err) {
+            error.DestinationTooSmall => makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "destination buffer is too small"),
+            error.BufferDeleted, error.BufferDonated => makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, "buffer has been deleted or donated"),
+            error.BufferNotReady => makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, "buffer is not ready"),
+            error.BufferReadinessFailed => makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, "buffer readiness failed"),
+            else => makeError(c.PJRT_Error_Code_INTERNAL, "failed to copy buffer to host"),
+        };
+    };
+    args[0].event = eventCreatePending();
+    eventSetReady(args[0].event);
     trace(
         "event=d2h bytes={d} dtype={s} rank={d} device={d} backend_storage={d} elapsed_us={d}",
         .{
@@ -1780,11 +2266,7 @@ fn bufferToHost(args: [*c]c.PJRT_Buffer_ToHostBuffer_Args) callconv(.c) ?*c.PJRT
 
 fn bufferReadyEvent(args: [*c]c.PJRT_Buffer_ReadyEvent_Args) callconv(.c) ?*c.PJRT_Error {
     const buffer = bufferFromC(args[0].buffer);
-    args[0].event = switch (buffer.state) {
-        .live => eventCreateReady(),
-        .deleted => eventCreateFailed("buffer has been deleted"),
-        .donated => eventCreateFailed("buffer has been donated"),
-    };
+    args[0].event = eventCreateFromRuntime(buffer.ready_event);
     return null;
 }
 
@@ -1804,7 +2286,8 @@ fn initApi() void {
     if (api_ready) return;
     api_storage = std.mem.zeroes(c.PJRT_Api);
     api_storage.struct_size = c.PJRT_Api_STRUCT_SIZE;
-    api_storage.extension_start = null;
+    gpu_custom_call_extension.base.next = null;
+    api_storage.extension_start = @ptrCast(&gpu_custom_call_extension.base);
     api_storage.pjrt_api_version = .{
         .struct_size = c.PJRT_Api_Version_STRUCT_SIZE,
         .extension_start = null,
@@ -1837,6 +2320,19 @@ fn initApi() void {
     api_storage.PJRT_Client_Compile = pjrtClientCompile;
     api_storage.PJRT_Client_DefaultDeviceAssignment = pjrtClientDefaultDeviceAssignment;
     api_storage.PJRT_Client_BufferFromHostBuffer = pjrtClientBufferFromHostBuffer;
+    api_storage.PJRT_Client_CreateUninitializedBuffer = pjrtClientCreateUninitializedBuffer;
+    api_storage.PJRT_Client_CreateBuffersForAsyncHostToDevice = pjrtClientCreateBuffersForAsyncHostToDevice;
+    api_storage.PJRT_AsyncHostToDeviceTransferManager_Destroy = asyncH2DDestroy;
+    api_storage.PJRT_AsyncHostToDeviceTransferManager_TransferData = asyncH2DTransferData;
+    api_storage.PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer = asyncH2DRetrieveBuffer;
+    api_storage.PJRT_AsyncHostToDeviceTransferManager_Device = asyncH2DDevice;
+    api_storage.PJRT_AsyncHostToDeviceTransferManager_BufferCount = asyncH2DBufferCount;
+    api_storage.PJRT_AsyncHostToDeviceTransferManager_BufferSize = asyncH2DBufferSize;
+    api_storage.PJRT_AsyncHostToDeviceTransferManager_SetBufferError = asyncH2DSetBufferError;
+    api_storage.PJRT_AsyncHostToDeviceTransferManager_AddMetadata = asyncH2DAddMetadata;
+    api_storage.PJRT_AsyncHostToDeviceTransferManager_TransferLiteral = asyncH2DTransferLiteral;
+    api_storage.PJRT_Client_DmaMap = pjrtClientDmaMap;
+    api_storage.PJRT_Client_DmaUnmap = pjrtClientDmaUnmap;
     api_storage.PJRT_TopologyDescription_Create = topologyDescriptionCreate;
     api_storage.PJRT_TopologyDescription_Destroy = topologyDescriptionDestroy;
     api_storage.PJRT_TopologyDescription_PlatformName = topologyDescriptionPlatformName;
@@ -1903,6 +2399,40 @@ pub export fn GetPjrtApi() *const c.PJRT_Api {
     return &api_storage;
 }
 
+pub export fn PjRTx_RegisterCustomCallIdentity(function_name: [*c]const u8, function_name_size: usize) ?*c.PJRT_Error {
+    const target = bytesFromC(function_name, function_name_size) orelse return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "custom call target is null");
+    return registerPjrtxCustomCall(.{
+        .target = target,
+        .kind = .identity,
+    });
+}
+
+pub export fn PjRTx_RegisterCustomCallUnary(function_name: [*c]const u8, function_name_size: usize, op_name: [*c]const u8, op_name_size: usize) ?*c.PJRT_Error {
+    const target = bytesFromC(function_name, function_name_size) orelse return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "custom call target is null");
+    const op_text = bytesFromC(op_name, op_name_size) orelse return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "custom call op name is null");
+    var registration = parseUnaryCustomCallOp(op_text) orelse return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "unsupported PjRTx unary custom call op");
+    registration.target = target;
+    return registerPjrtxCustomCall(registration);
+}
+
+pub export fn PjRTx_RegisterCustomCallBinary(function_name: [*c]const u8, function_name_size: usize, op_name: [*c]const u8, op_name_size: usize) ?*c.PJRT_Error {
+    const target = bytesFromC(function_name, function_name_size) orelse return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "custom call target is null");
+    const op_text = bytesFromC(op_name, op_name_size) orelse return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "custom call op name is null");
+    var registration = parseBinaryCustomCallOp(op_text) orelse return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "unsupported PjRTx binary custom call op");
+    registration.target = target;
+    return registerPjrtxCustomCall(registration);
+}
+
+pub export fn PjRTx_CustomCall_Identity() callconv(.c) void {}
+pub export fn PjRTx_CustomCall_UnarySqrt() callconv(.c) void {}
+pub export fn PjRTx_CustomCall_BinaryAdd() callconv(.c) void {}
+
+pub export fn PjRTx_UnregisterCustomCall(function_name: [*c]const u8, function_name_size: usize) void {
+    const target = bytesFromC(function_name, function_name_size) orelse return;
+    var backend_impl = backend_registry.create(.metal_mlx);
+    backend_impl.unregisterCustomCall(target);
+}
+
 test "api table exposes bootstrap PJRT surface" {
     const api = GetPjrtApi();
     try std.testing.expectEqual(@as(usize, c.PJRT_Api_STRUCT_SIZE), api.struct_size);
@@ -1945,6 +2475,231 @@ test "plugin attributes and client create expose backend selection" {
     try std.testing.expectEqual(runtime.BackendKind.metal_mlx, clientFromC(create_args.client).backend_kind);
 }
 
+test "PJRT memory stats include resident executable cache bytes" {
+    const api = GetPjrtApi();
+
+    var create_args = std.mem.zeroes(c.PJRT_Client_Create_Args);
+    create_args.struct_size = c.PJRT_Client_Create_Args_STRUCT_SIZE;
+    try expectOk(api.PJRT_Client_Create.?(&create_args));
+    defer {
+        var destroy_args = std.mem.zeroes(c.PJRT_Client_Destroy_Args);
+        destroy_args.struct_size = c.PJRT_Client_Destroy_Args_STRUCT_SIZE;
+        destroy_args.client = create_args.client;
+        _ = api.PJRT_Client_Destroy.?(&destroy_args);
+    }
+    clientFromC(create_args.client).setExecutableCacheMaxResidentBytes(0);
+
+    var devices_args = std.mem.zeroes(c.PJRT_Client_Devices_Args);
+    devices_args.struct_size = c.PJRT_Client_Devices_Args_STRUCT_SIZE;
+    devices_args.client = create_args.client;
+    try expectOk(api.PJRT_Client_Devices.?(&devices_args));
+
+    var before_stats = std.mem.zeroes(c.PJRT_Device_MemoryStats_Args);
+    before_stats.struct_size = c.PJRT_Device_MemoryStats_Args_STRUCT_SIZE;
+    before_stats.device = devices_args.devices[0];
+    try expectOk(api.PJRT_Device_MemoryStats.?(&before_stats));
+    try std.testing.expect(before_stats.peak_bytes_in_use_is_set);
+    try std.testing.expect(before_stats.num_allocs_is_set);
+    try std.testing.expect(before_stats.largest_alloc_size_is_set);
+    if (before_stats.bytes_limit_is_set) {
+        try std.testing.expect(before_stats.bytes_limit >= before_stats.bytes_in_use);
+        try std.testing.expect(before_stats.largest_free_block_bytes_is_set);
+        try std.testing.expect(before_stats.bytes_reservable_limit_is_set);
+    }
+
+    const module_text =
+        \\module {
+        \\  func.func @main() -> tensor<4xf32> {
+        \\    %0 = stablehlo.constant dense<[1.0, 2.0, 3.0, 4.0]> : tensor<4xf32>
+        \\    return %0 : tensor<4xf32>
+        \\  }
+        \\}
+    ;
+    var program = std.mem.zeroes(c.PJRT_Program);
+    program.struct_size = c.PJRT_Program_STRUCT_SIZE;
+    program.code = @constCast(module_text.ptr);
+    program.code_size = module_text.len;
+    program.format = "mlir";
+    program.format_size = "mlir".len;
+
+    var compile_args = std.mem.zeroes(c.PJRT_Client_Compile_Args);
+    compile_args.struct_size = c.PJRT_Client_Compile_Args_STRUCT_SIZE;
+    compile_args.client = create_args.client;
+    compile_args.program = &program;
+    try expectOk(api.PJRT_Client_Compile.?(&compile_args));
+
+    var after_compile_stats = std.mem.zeroes(c.PJRT_Device_MemoryStats_Args);
+    after_compile_stats.struct_size = c.PJRT_Device_MemoryStats_Args_STRUCT_SIZE;
+    after_compile_stats.device = devices_args.devices[0];
+    try expectOk(api.PJRT_Device_MemoryStats.?(&after_compile_stats));
+    try std.testing.expect(after_compile_stats.bytes_in_use >= before_stats.bytes_in_use + 16);
+    try std.testing.expect(after_compile_stats.peak_bytes_in_use >= after_compile_stats.bytes_in_use);
+    try std.testing.expect(after_compile_stats.num_allocs_is_set);
+    try std.testing.expect(after_compile_stats.num_allocs >= before_stats.num_allocs + 1);
+    try std.testing.expect(after_compile_stats.largest_alloc_size_is_set);
+    try std.testing.expect(after_compile_stats.largest_alloc_size >= 16);
+    if (after_compile_stats.bytes_limit_is_set) {
+        try std.testing.expect(after_compile_stats.bytes_limit >= after_compile_stats.bytes_in_use);
+        try std.testing.expect(after_compile_stats.largest_free_block_bytes_is_set);
+        try std.testing.expect(after_compile_stats.bytes_reservable_limit_is_set);
+    }
+
+    var invalid_device_outputs = [_]?*c.PJRT_Buffer{null};
+    var invalid_output_lists = [_][*c]?*c.PJRT_Buffer{&invalid_device_outputs};
+    var wrong_arg_count_execute_args = std.mem.zeroes(c.PJRT_LoadedExecutable_Execute_Args);
+    wrong_arg_count_execute_args.struct_size = c.PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
+    wrong_arg_count_execute_args.executable = compile_args.executable;
+    wrong_arg_count_execute_args.num_devices = 1;
+    wrong_arg_count_execute_args.num_args = 1;
+    wrong_arg_count_execute_args.output_lists = &invalid_output_lists;
+    const wrong_arg_count_err = api.PJRT_LoadedExecutable_Execute.?(&wrong_arg_count_execute_args) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, errorMessage(api, wrong_arg_count_err), "argument count") != null);
+    destroyError(api, wrong_arg_count_err);
+
+    var missing_outputs_execute_args = std.mem.zeroes(c.PJRT_LoadedExecutable_Execute_Args);
+    missing_outputs_execute_args.struct_size = c.PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
+    missing_outputs_execute_args.executable = compile_args.executable;
+    missing_outputs_execute_args.num_devices = 1;
+    missing_outputs_execute_args.num_args = 0;
+    const missing_outputs_err = api.PJRT_LoadedExecutable_Execute.?(&missing_outputs_execute_args) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, errorMessage(api, missing_outputs_err), "output_lists") != null);
+    destroyError(api, missing_outputs_err);
+
+    var executable_delete_args = std.mem.zeroes(c.PJRT_LoadedExecutable_Delete_Args);
+    executable_delete_args.struct_size = c.PJRT_LoadedExecutable_Delete_Args_STRUCT_SIZE;
+    executable_delete_args.executable = compile_args.executable;
+    try expectOk(api.PJRT_LoadedExecutable_Delete.?(&executable_delete_args));
+
+    var executable_deleted_args = std.mem.zeroes(c.PJRT_LoadedExecutable_IsDeleted_Args);
+    executable_deleted_args.struct_size = c.PJRT_LoadedExecutable_IsDeleted_Args_STRUCT_SIZE;
+    executable_deleted_args.executable = compile_args.executable;
+    try expectOk(api.PJRT_LoadedExecutable_IsDeleted.?(&executable_deleted_args));
+    try std.testing.expect(executable_deleted_args.is_deleted);
+
+    var device_outputs = [_]?*c.PJRT_Buffer{null};
+    var output_lists = [_][*c]?*c.PJRT_Buffer{&device_outputs};
+    var execute_args = std.mem.zeroes(c.PJRT_LoadedExecutable_Execute_Args);
+    execute_args.struct_size = c.PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
+    execute_args.executable = compile_args.executable;
+    execute_args.num_devices = 1;
+    execute_args.num_args = 0;
+    execute_args.output_lists = &output_lists;
+    const execute_err = api.PJRT_LoadedExecutable_Execute.?(&execute_args) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, errorMessage(api, execute_err), "deleted") != null);
+    destroyError(api, execute_err);
+
+    var after_destroy_stats = std.mem.zeroes(c.PJRT_Device_MemoryStats_Args);
+    after_destroy_stats.struct_size = c.PJRT_Device_MemoryStats_Args_STRUCT_SIZE;
+    after_destroy_stats.device = devices_args.devices[0];
+    try expectOk(api.PJRT_Device_MemoryStats.?(&after_destroy_stats));
+    try std.testing.expectEqual(before_stats.bytes_in_use, after_destroy_stats.bytes_in_use);
+    try std.testing.expectEqual(before_stats.num_allocs, after_destroy_stats.num_allocs);
+    try std.testing.expect(after_destroy_stats.peak_bytes_in_use >= after_compile_stats.bytes_in_use);
+
+    var executable_destroy_args = std.mem.zeroes(c.PJRT_LoadedExecutable_Destroy_Args);
+    executable_destroy_args.struct_size = c.PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+    executable_destroy_args.executable = compile_args.executable;
+    try expectOk(api.PJRT_LoadedExecutable_Destroy.?(&executable_destroy_args));
+}
+
+test "PJRT compile trims idle resident executable cache under memory pressure" {
+    const api = GetPjrtApi();
+
+    var create_args = std.mem.zeroes(c.PJRT_Client_Create_Args);
+    create_args.struct_size = c.PJRT_Client_Create_Args_STRUCT_SIZE;
+    try expectOk(api.PJRT_Client_Create.?(&create_args));
+    defer {
+        var destroy_args = std.mem.zeroes(c.PJRT_Client_Destroy_Args);
+        destroy_args.struct_size = c.PJRT_Client_Destroy_Args_STRUCT_SIZE;
+        destroy_args.client = create_args.client;
+        _ = api.PJRT_Client_Destroy.?(&destroy_args);
+    }
+
+    const client = clientFromC(create_args.client);
+    client.setExecutableCacheMaxResidentBytes(std.math.maxInt(u64));
+
+    const large_module =
+        \\module {
+        \\  func.func @main() -> tensor<8xf32> {
+        \\    %0 = stablehlo.constant dense<[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]> : tensor<8xf32>
+        \\    return %0 : tensor<8xf32>
+        \\  }
+        \\}
+    ;
+    var large_program = std.mem.zeroes(c.PJRT_Program);
+    large_program.struct_size = c.PJRT_Program_STRUCT_SIZE;
+    large_program.code = @constCast(large_module.ptr);
+    large_program.code_size = large_module.len;
+    large_program.format = "mlir";
+    large_program.format_size = "mlir".len;
+
+    var large_compile_args = std.mem.zeroes(c.PJRT_Client_Compile_Args);
+    large_compile_args.struct_size = c.PJRT_Client_Compile_Args_STRUCT_SIZE;
+    large_compile_args.client = create_args.client;
+    large_compile_args.program = &large_program;
+    try expectOk(api.PJRT_Client_Compile.?(&large_compile_args));
+    defer {
+        var destroy_args = std.mem.zeroes(c.PJRT_LoadedExecutable_Destroy_Args);
+        destroy_args.struct_size = c.PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+        destroy_args.executable = large_compile_args.executable;
+        _ = api.PJRT_LoadedExecutable_Destroy.?(&destroy_args);
+    }
+
+    const large_resident_bytes = client.executable_cache.stats.resident_bytes;
+    try std.testing.expect(large_resident_bytes >= 32);
+    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.resident_entries);
+
+    var large_delete_args = std.mem.zeroes(c.PJRT_LoadedExecutable_Delete_Args);
+    large_delete_args.struct_size = c.PJRT_LoadedExecutable_Delete_Args_STRUCT_SIZE;
+    large_delete_args.executable = large_compile_args.executable;
+    try expectOk(api.PJRT_LoadedExecutable_Delete.?(&large_delete_args));
+    try std.testing.expectEqual(large_resident_bytes, client.executable_cache.stats.resident_bytes);
+
+    client.memories[0].stats.capacity_bytes = 4;
+
+    const small_module =
+        \\module {
+        \\  func.func @main() -> tensor<1xf32> {
+        \\    %0 = stablehlo.constant dense<[9.0]> : tensor<1xf32>
+        \\    return %0 : tensor<1xf32>
+        \\  }
+        \\}
+    ;
+    var small_program = std.mem.zeroes(c.PJRT_Program);
+    small_program.struct_size = c.PJRT_Program_STRUCT_SIZE;
+    small_program.code = @constCast(small_module.ptr);
+    small_program.code_size = small_module.len;
+    small_program.format = "mlir";
+    small_program.format_size = "mlir".len;
+
+    var small_compile_args = std.mem.zeroes(c.PJRT_Client_Compile_Args);
+    small_compile_args.struct_size = c.PJRT_Client_Compile_Args_STRUCT_SIZE;
+    small_compile_args.client = create_args.client;
+    small_compile_args.program = &small_program;
+    try expectOk(api.PJRT_Client_Compile.?(&small_compile_args));
+    defer {
+        var destroy_args = std.mem.zeroes(c.PJRT_LoadedExecutable_Destroy_Args);
+        destroy_args.struct_size = c.PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+        destroy_args.executable = small_compile_args.executable;
+        _ = api.PJRT_LoadedExecutable_Destroy.?(&destroy_args);
+    }
+
+    const small_executable = executableFromC(small_compile_args.executable);
+    const small_resident_bytes = small_executable.graph.backendExecutableStats().?.resident_constant_bytes;
+    try std.testing.expectEqual(@as(u64, 4), small_resident_bytes);
+    try std.testing.expectEqual(@as(u64, 4), small_executable.graph.last_compile_cache_trim.requested_bytes);
+    try std.testing.expectEqual(@as(u64, 0), small_executable.graph.last_compile_cache_trim.target_resident_bytes);
+    try std.testing.expectEqual(large_resident_bytes, small_executable.graph.last_compile_cache_trim.freed_bytes);
+    try std.testing.expectEqual(@as(u64, 1), small_executable.graph.last_compile_cache_trim.evicted_entries);
+    try std.testing.expectEqual(@as(u64, 0), small_executable.graph.last_compile_cache_trim.remaining_resident_bytes);
+    try std.testing.expect(!small_executable.graph.last_compile_cache_trim.still_over_capacity);
+    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.pressure_trim_requests);
+    try std.testing.expectEqual(large_resident_bytes, client.executable_cache.stats.pressure_trimmed_bytes);
+    try std.testing.expectEqual(@as(u64, 0), client.executable_cache.stats.pressure_trim_failures);
+    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.resident_entries);
+    try std.testing.expectEqual(@as(u64, 4), client.executable_cache.stats.resident_bytes);
+}
+
 fn expectOk(err: [*c]c.PJRT_Error) !void {
     if (err) |actual| {
         const api = GetPjrtApi();
@@ -1967,6 +2722,140 @@ fn errorMessage(api: *const c.PJRT_Api, err: [*c]c.PJRT_Error) []const u8 {
     message_args.@"error" = err;
     api.PJRT_Error_Message.?(&message_args);
     return message_args.message[0..message_args.message_size];
+}
+
+test "executable cache fingerprint includes plan metadata" {
+    const client = try runtime.Client.init(allocator, backend_registry.create(.metal_mlx), 1);
+    defer client.deinit();
+
+    var plan = try compiler.makeReplicatedPlan(allocator, .{}, 1, 1);
+    defer plan.deinit();
+
+    const source = "module {}\n";
+    const first = try allocExecutableFingerprint(allocator, client, source, &plan);
+    defer allocator.free(first);
+    const repeated = try allocExecutableFingerprint(allocator, client, source, &plan);
+    defer allocator.free(repeated);
+    try std.testing.expectEqualStrings(first, repeated);
+
+    const custom_call_target = "pjrtx.test.cache_binary_add";
+    try client.backend.registerCustomCall(.{
+        .target = custom_call_target,
+        .kind = .binary,
+        .binary_op = .add,
+    });
+    defer client.backend.unregisterCustomCall(custom_call_target);
+    const with_custom_call_registry = try allocExecutableFingerprint(allocator, client, source, &plan);
+    defer allocator.free(with_custom_call_registry);
+    try std.testing.expect(!std.mem.eql(u8, first, with_custom_call_registry));
+
+    plan.donated_parameter_indices = try allocator.dupe(u32, &.{0});
+    const with_donation = try allocExecutableFingerprint(allocator, client, source, &plan);
+    defer allocator.free(with_donation);
+    try std.testing.expect(!std.mem.eql(u8, first, with_donation));
+
+    client.devices[0].local_hardware_id += 1;
+    const with_target_hardware = try allocExecutableFingerprint(allocator, client, source, &plan);
+    defer allocator.free(with_target_hardware);
+    try std.testing.expect(!std.mem.eql(u8, first, with_target_hardware));
+    client.devices[0].local_hardware_id -= 1;
+
+    client.devices[0].memory_bytes += 4096;
+    client.memories[0].stats.capacity_bytes += 4096;
+    const with_target_memory = try allocExecutableFingerprint(allocator, client, source, &plan);
+    defer allocator.free(with_target_memory);
+    try std.testing.expect(!std.mem.eql(u8, first, with_target_memory));
+    client.devices[0].memory_bytes -= 4096;
+    client.memories[0].stats.capacity_bytes -= 4096;
+
+    var partitioned_plan = try compiler.makeReplicatedPlan(allocator, .{ .num_partitions = 2 }, 1, 1);
+    defer partitioned_plan.deinit();
+    const with_partitions = try allocExecutableFingerprint(allocator, client, source, &partitioned_plan);
+    defer allocator.free(with_partitions);
+    try std.testing.expect(!std.mem.eql(u8, first, with_partitions));
+}
+
+const PjrtEventCallbackState = struct {
+    count: usize = 0,
+    ready_count: usize = 0,
+    error_count: usize = 0,
+    saw_expected_message: bool = false,
+};
+
+fn testPjrtEventCallback(err: [*c]c.PJRT_Error, user_arg: ?*anyopaque) callconv(.c) void {
+    const state: *PjrtEventCallbackState = @ptrCast(@alignCast(user_arg.?));
+    state.count += 1;
+    if (err) |actual| {
+        state.error_count += 1;
+        const api = GetPjrtApi();
+        const message = errorMessage(api, actual);
+        if (std.mem.indexOf(u8, message, "buffer has been deleted") != null) {
+            state.saw_expected_message = true;
+        }
+        destroyError(api, actual);
+    } else {
+        state.ready_count += 1;
+    }
+}
+
+test "event callbacks bridge PJRT errors and pending runtime transitions" {
+    const api = GetPjrtApi();
+
+    const ready_event = eventCreateReady().?;
+    defer {
+        var destroy_args = std.mem.zeroes(c.PJRT_Event_Destroy_Args);
+        destroy_args.struct_size = c.PJRT_Event_Destroy_Args_STRUCT_SIZE;
+        destroy_args.event = ready_event;
+        _ = api.PJRT_Event_Destroy.?(&destroy_args);
+    }
+    var ready_state = PjrtEventCallbackState{};
+    var ready_on_ready_args = std.mem.zeroes(c.PJRT_Event_OnReady_Args);
+    ready_on_ready_args.struct_size = c.PJRT_Event_OnReady_Args_STRUCT_SIZE;
+    ready_on_ready_args.event = ready_event;
+    ready_on_ready_args.callback = testPjrtEventCallback;
+    ready_on_ready_args.user_arg = &ready_state;
+    try expectOk(api.PJRT_Event_OnReady.?(&ready_on_ready_args));
+    try std.testing.expectEqual(@as(usize, 1), ready_state.count);
+    try std.testing.expectEqual(@as(usize, 1), ready_state.ready_count);
+
+    const failed_event = eventCreateFailed("buffer has been deleted").?;
+    defer {
+        var destroy_args = std.mem.zeroes(c.PJRT_Event_Destroy_Args);
+        destroy_args.struct_size = c.PJRT_Event_Destroy_Args_STRUCT_SIZE;
+        destroy_args.event = failed_event;
+        _ = api.PJRT_Event_Destroy.?(&destroy_args);
+    }
+    var failed_state = PjrtEventCallbackState{};
+    var failed_on_ready_args = std.mem.zeroes(c.PJRT_Event_OnReady_Args);
+    failed_on_ready_args.struct_size = c.PJRT_Event_OnReady_Args_STRUCT_SIZE;
+    failed_on_ready_args.event = failed_event;
+    failed_on_ready_args.callback = testPjrtEventCallback;
+    failed_on_ready_args.user_arg = &failed_state;
+    try expectOk(api.PJRT_Event_OnReady.?(&failed_on_ready_args));
+    try std.testing.expectEqual(@as(usize, 1), failed_state.count);
+    try std.testing.expectEqual(@as(usize, 1), failed_state.error_count);
+    try std.testing.expect(failed_state.saw_expected_message);
+
+    const pending_runtime_event = allocator.create(runtime.Event) catch return error.OutOfMemory;
+    pending_runtime_event.* = runtime.Event.pending();
+    const pending_event: ?*c.PJRT_Event = @ptrCast(pending_runtime_event);
+    defer {
+        var destroy_args = std.mem.zeroes(c.PJRT_Event_Destroy_Args);
+        destroy_args.struct_size = c.PJRT_Event_Destroy_Args_STRUCT_SIZE;
+        destroy_args.event = pending_event;
+        _ = api.PJRT_Event_Destroy.?(&destroy_args);
+    }
+    var pending_state = PjrtEventCallbackState{};
+    var pending_on_ready_args = std.mem.zeroes(c.PJRT_Event_OnReady_Args);
+    pending_on_ready_args.struct_size = c.PJRT_Event_OnReady_Args_STRUCT_SIZE;
+    pending_on_ready_args.event = pending_event;
+    pending_on_ready_args.callback = testPjrtEventCallback;
+    pending_on_ready_args.user_arg = &pending_state;
+    try expectOk(api.PJRT_Event_OnReady.?(&pending_on_ready_args));
+    try std.testing.expectEqual(@as(usize, 0), pending_state.count);
+    pending_runtime_event.setReady();
+    try std.testing.expectEqual(@as(usize, 1), pending_state.count);
+    try std.testing.expectEqual(@as(usize, 1), pending_state.ready_count);
 }
 
 test "client device memory and buffer ownership callbacks return stable handles" {
@@ -2025,6 +2914,85 @@ test "client device memory and buffer ownership callbacks return stable handles"
     try expectOk(api.PJRT_Device_DefaultMemory.?(&default_memory_args));
     try std.testing.expectEqual(memories_args.addressable_memories[0], default_memory_args.memory);
 
+    const async_dims = [_]i64{4};
+    var async_shape = std.mem.zeroes(c.PJRT_ShapeSpec);
+    async_shape.struct_size = c.PJRT_ShapeSpec_STRUCT_SIZE;
+    async_shape.dims = &async_dims;
+    async_shape.num_dims = async_dims.len;
+    async_shape.element_type = c.PJRT_Buffer_Type_U8;
+    var async_create_args = std.mem.zeroes(c.PJRT_Client_CreateBuffersForAsyncHostToDevice_Args);
+    async_create_args.struct_size = c.PJRT_Client_CreateBuffersForAsyncHostToDevice_Args_STRUCT_SIZE;
+    async_create_args.client = create_args.client;
+    async_create_args.shape_specs = &async_shape;
+    async_create_args.num_shape_specs = 1;
+    async_create_args.memory = default_memory_args.memory;
+    try expectOk(api.PJRT_Client_CreateBuffersForAsyncHostToDevice.?(&async_create_args));
+    defer {
+        if (async_create_args.transfer_manager) |manager| {
+            var destroy_transfer_args = std.mem.zeroes(c.PJRT_AsyncHostToDeviceTransferManager_Destroy_Args);
+            destroy_transfer_args.struct_size = c.PJRT_AsyncHostToDeviceTransferManager_Destroy_Args_STRUCT_SIZE;
+            destroy_transfer_args.transfer_manager = manager;
+            _ = api.PJRT_AsyncHostToDeviceTransferManager_Destroy.?(&destroy_transfer_args);
+        }
+    }
+
+    var async_size_args = std.mem.zeroes(c.PJRT_AsyncHostToDeviceTransferManager_BufferSize_Args);
+    async_size_args.struct_size = c.PJRT_AsyncHostToDeviceTransferManager_BufferSize_Args_STRUCT_SIZE;
+    async_size_args.transfer_manager = async_create_args.transfer_manager;
+    async_size_args.buffer_index = 0;
+    try expectOk(api.PJRT_AsyncHostToDeviceTransferManager_BufferSize.?(&async_size_args));
+    try std.testing.expectEqual(@as(usize, 4), async_size_args.buffer_size);
+
+    var async_retrieve_args = std.mem.zeroes(c.PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer_Args);
+    async_retrieve_args.struct_size = c.PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer_Args_STRUCT_SIZE;
+    async_retrieve_args.transfer_manager = async_create_args.transfer_manager;
+    async_retrieve_args.buffer_index = 0;
+    try expectOk(api.PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer.?(&async_retrieve_args));
+    defer {
+        var destroy_buffer_args = std.mem.zeroes(c.PJRT_Buffer_Destroy_Args);
+        destroy_buffer_args.struct_size = c.PJRT_Buffer_Destroy_Args_STRUCT_SIZE;
+        destroy_buffer_args.buffer = async_retrieve_args.buffer_out;
+        _ = api.PJRT_Buffer_Destroy.?(&destroy_buffer_args);
+    }
+
+    const async_input = [_]u8{ 9, 8, 7, 6 };
+    var async_transfer_args = std.mem.zeroes(c.PJRT_AsyncHostToDeviceTransferManager_TransferData_Args);
+    async_transfer_args.struct_size = c.PJRT_AsyncHostToDeviceTransferManager_TransferData_Args_STRUCT_SIZE;
+    async_transfer_args.transfer_manager = async_create_args.transfer_manager;
+    async_transfer_args.buffer_index = 0;
+    async_transfer_args.data = &async_input;
+    async_transfer_args.offset = 0;
+    async_transfer_args.transfer_size = 2;
+    async_transfer_args.is_last_transfer = false;
+    try expectOk(api.PJRT_AsyncHostToDeviceTransferManager_TransferData.?(&async_transfer_args));
+    if (async_transfer_args.done_with_h2d_transfer) |event| {
+        var event_destroy_args = std.mem.zeroes(c.PJRT_Event_Destroy_Args);
+        event_destroy_args.struct_size = c.PJRT_Event_Destroy_Args_STRUCT_SIZE;
+        event_destroy_args.event = event;
+        _ = api.PJRT_Event_Destroy.?(&event_destroy_args);
+    }
+    async_transfer_args.done_with_h2d_transfer = null;
+    async_transfer_args.data = &async_input[2];
+    async_transfer_args.offset = 2;
+    async_transfer_args.transfer_size = 2;
+    async_transfer_args.is_last_transfer = true;
+    try expectOk(api.PJRT_AsyncHostToDeviceTransferManager_TransferData.?(&async_transfer_args));
+    if (async_transfer_args.done_with_h2d_transfer) |event| {
+        var event_destroy_args = std.mem.zeroes(c.PJRT_Event_Destroy_Args);
+        event_destroy_args.struct_size = c.PJRT_Event_Destroy_Args_STRUCT_SIZE;
+        event_destroy_args.event = event;
+        _ = api.PJRT_Event_Destroy.?(&event_destroy_args);
+    }
+
+    var async_output: [4]u8 = undefined;
+    var async_to_host_args = std.mem.zeroes(c.PJRT_Buffer_ToHostBuffer_Args);
+    async_to_host_args.struct_size = c.PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
+    async_to_host_args.src = async_retrieve_args.buffer_out;
+    async_to_host_args.dst = &async_output;
+    async_to_host_args.dst_size = async_output.len;
+    try expectOk(api.PJRT_Buffer_ToHostBuffer.?(&async_to_host_args));
+    try std.testing.expectEqualSlices(u8, &async_input, &async_output);
+
     var device_memories_args = std.mem.zeroes(c.PJRT_Device_AddressableMemories_Args);
     device_memories_args.struct_size = c.PJRT_Device_AddressableMemories_Args_STRUCT_SIZE;
     device_memories_args.device = devices_args.devices[0];
@@ -2076,20 +3044,49 @@ test "client device memory and buffer ownership callbacks return stable handles"
     try expectOk(api.PJRT_Buffer_Memory.?(&buffer_memory_args));
     try std.testing.expectEqual(default_memory_args.memory, buffer_memory_args.memory);
 
+    var memory_stats_before_delete = std.mem.zeroes(c.PJRT_Device_MemoryStats_Args);
+    memory_stats_before_delete.struct_size = c.PJRT_Device_MemoryStats_Args_STRUCT_SIZE;
+    memory_stats_before_delete.device = devices_args.devices[0];
+    try expectOk(api.PJRT_Device_MemoryStats.?(&memory_stats_before_delete));
+    try std.testing.expect(memory_stats_before_delete.bytes_in_use >= input.len);
+
+    var delete_args = std.mem.zeroes(c.PJRT_Buffer_Delete_Args);
+    delete_args.struct_size = c.PJRT_Buffer_Delete_Args_STRUCT_SIZE;
+    delete_args.buffer = from_host_args.buffer;
+    try expectOk(api.PJRT_Buffer_Delete.?(&delete_args));
+
+    var memory_stats_after_delete = std.mem.zeroes(c.PJRT_Device_MemoryStats_Args);
+    memory_stats_after_delete.struct_size = c.PJRT_Device_MemoryStats_Args_STRUCT_SIZE;
+    memory_stats_after_delete.device = devices_args.devices[0];
+    try expectOk(api.PJRT_Device_MemoryStats.?(&memory_stats_after_delete));
+    try std.testing.expectEqual(memory_stats_before_delete.bytes_in_use - @as(i64, @intCast(input.len)), memory_stats_after_delete.bytes_in_use);
+
+    var ready_event_args = std.mem.zeroes(c.PJRT_Buffer_ReadyEvent_Args);
+    ready_event_args.struct_size = c.PJRT_Buffer_ReadyEvent_Args_STRUCT_SIZE;
+    ready_event_args.buffer = from_host_args.buffer;
+    try expectOk(api.PJRT_Buffer_ReadyEvent.?(&ready_event_args));
+    defer if (ready_event_args.event) |event| {
+        var event_destroy_args = std.mem.zeroes(c.PJRT_Event_Destroy_Args);
+        event_destroy_args.struct_size = c.PJRT_Event_Destroy_Args_STRUCT_SIZE;
+        event_destroy_args.event = event;
+        _ = api.PJRT_Event_Destroy.?(&event_destroy_args);
+    };
+    var ready_event_error_args = std.mem.zeroes(c.PJRT_Event_Error_Args);
+    ready_event_error_args.struct_size = c.PJRT_Event_Error_Args_STRUCT_SIZE;
+    ready_event_error_args.event = ready_event_args.event;
+    const ready_err = api.PJRT_Event_Error.?(&ready_event_error_args) orelse return error.TestUnexpectedResult;
+    defer destroyError(api, ready_err);
+    try std.testing.expect(std.mem.indexOf(u8, errorMessage(api, ready_err), "deleted") != null);
+
     var output: [4]u8 = undefined;
     var to_host_args = std.mem.zeroes(c.PJRT_Buffer_ToHostBuffer_Args);
     to_host_args.struct_size = c.PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
     to_host_args.src = from_host_args.buffer;
     to_host_args.dst = &output;
     to_host_args.dst_size = output.len;
-    try expectOk(api.PJRT_Buffer_ToHostBuffer.?(&to_host_args));
-    defer if (to_host_args.event) |event| {
-        var event_destroy_args = std.mem.zeroes(c.PJRT_Event_Destroy_Args);
-        event_destroy_args.struct_size = c.PJRT_Event_Destroy_Args_STRUCT_SIZE;
-        event_destroy_args.event = event;
-        _ = api.PJRT_Event_Destroy.?(&event_destroy_args);
-    };
-    try std.testing.expectEqualSlices(u8, &input, &output);
+    const to_host_err = api.PJRT_Buffer_ToHostBuffer.?(&to_host_args) orelse return error.TestUnexpectedResult;
+    defer destroyError(api, to_host_err);
+    try std.testing.expect(std.mem.indexOf(u8, errorMessage(api, to_host_err), "deleted or donated") != null);
 }
 
 test "loaded executable execute chains u8 StableHLO ops through PJRT argument lists" {
@@ -2197,12 +3194,84 @@ test "loaded executable execute chains u8 StableHLO ops through PJRT argument li
     compile_args.client = create_args.client;
     compile_args.program = &program;
     try expectOk(api.PJRT_Client_Compile.?(&compile_args));
+    executableFromC(compile_args.executable).plan.donated_parameter_indices = try allocator.dupe(u32, &.{0});
     defer {
         var destroy_args = std.mem.zeroes(c.PJRT_LoadedExecutable_Destroy_Args);
         destroy_args.struct_size = c.PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
         destroy_args.executable = compile_args.executable;
         _ = api.PJRT_LoadedExecutable_Destroy.?(&destroy_args);
     }
+
+    var deleted_from_host_args = std.mem.zeroes(c.PJRT_Client_BufferFromHostBuffer_Args);
+    deleted_from_host_args.struct_size = c.PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
+    deleted_from_host_args.client = create_args.client;
+    deleted_from_host_args.data = &lhs;
+    deleted_from_host_args.type = c.PJRT_Buffer_Type_S8;
+    deleted_from_host_args.dims = &dims;
+    deleted_from_host_args.num_dims = dims.len;
+    deleted_from_host_args.device = devices_args.devices[0];
+    deleted_from_host_args.memory = default_memory_args.memory;
+    try expectOk(api.PJRT_Client_BufferFromHostBuffer.?(&deleted_from_host_args));
+    defer {
+        if (deleted_from_host_args.done_with_host_buffer) |event| {
+            var event_destroy_args = std.mem.zeroes(c.PJRT_Event_Destroy_Args);
+            event_destroy_args.struct_size = c.PJRT_Event_Destroy_Args_STRUCT_SIZE;
+            event_destroy_args.event = event;
+            _ = api.PJRT_Event_Destroy.?(&event_destroy_args);
+        }
+        var buffer_destroy_args = std.mem.zeroes(c.PJRT_Buffer_Destroy_Args);
+        buffer_destroy_args.struct_size = c.PJRT_Buffer_Destroy_Args_STRUCT_SIZE;
+        buffer_destroy_args.buffer = deleted_from_host_args.buffer;
+        _ = api.PJRT_Buffer_Destroy.?(&buffer_destroy_args);
+    }
+    var delete_buffer_args = std.mem.zeroes(c.PJRT_Buffer_Delete_Args);
+    delete_buffer_args.struct_size = c.PJRT_Buffer_Delete_Args_STRUCT_SIZE;
+    delete_buffer_args.buffer = deleted_from_host_args.buffer;
+    try expectOk(api.PJRT_Buffer_Delete.?(&delete_buffer_args));
+
+    var bad_device_args = [_]?*c.PJRT_Buffer{ deleted_from_host_args.buffer, rhs_from_host_args.buffer };
+    var bad_argument_lists = [_][*c]const ?*c.PJRT_Buffer{&bad_device_args};
+    var bad_device_outputs = [_]?*c.PJRT_Buffer{null};
+    var bad_output_lists = [_][*c]?*c.PJRT_Buffer{&bad_device_outputs};
+    var bad_device_events = [_]?*c.PJRT_Event{null};
+    var bad_execute_args = std.mem.zeroes(c.PJRT_LoadedExecutable_Execute_Args);
+    bad_execute_args.struct_size = c.PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
+    bad_execute_args.executable = compile_args.executable;
+    bad_execute_args.argument_lists = &bad_argument_lists;
+    bad_execute_args.num_devices = 1;
+    bad_execute_args.num_args = bad_device_args.len;
+    bad_execute_args.output_lists = &bad_output_lists;
+    bad_execute_args.device_complete_events = &bad_device_events;
+    const bad_execute_err = api.PJRT_LoadedExecutable_Execute.?(&bad_execute_args) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, errorMessage(api, bad_execute_err), "deleted buffer") != null);
+    destroyError(api, bad_execute_err);
+    try std.testing.expectEqual(@as(?*c.PJRT_Buffer, null), bad_device_outputs[0]);
+    try std.testing.expectEqual(@as(?*c.PJRT_Event, null), bad_device_events[0]);
+
+    var alias_device_args = [_]?*c.PJRT_Buffer{ lhs_from_host_args.buffer, lhs_from_host_args.buffer };
+    var alias_argument_lists = [_][*c]const ?*c.PJRT_Buffer{&alias_device_args};
+    var alias_device_outputs = [_]?*c.PJRT_Buffer{null};
+    var alias_output_lists = [_][*c]?*c.PJRT_Buffer{&alias_device_outputs};
+    var alias_device_events = [_]?*c.PJRT_Event{null};
+    var alias_execute_args = std.mem.zeroes(c.PJRT_LoadedExecutable_Execute_Args);
+    alias_execute_args.struct_size = c.PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
+    alias_execute_args.executable = compile_args.executable;
+    alias_execute_args.argument_lists = &alias_argument_lists;
+    alias_execute_args.num_devices = 1;
+    alias_execute_args.num_args = alias_device_args.len;
+    alias_execute_args.output_lists = &alias_output_lists;
+    alias_execute_args.device_complete_events = &alias_device_events;
+    const alias_execute_err = api.PJRT_LoadedExecutable_Execute.?(&alias_execute_args) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, errorMessage(api, alias_execute_err), "aliases another argument") != null);
+    destroyError(api, alias_execute_err);
+    try std.testing.expectEqual(@as(?*c.PJRT_Buffer, null), alias_device_outputs[0]);
+    try std.testing.expectEqual(@as(?*c.PJRT_Event, null), alias_device_events[0]);
+
+    var lhs_after_alias_args = std.mem.zeroes(c.PJRT_Buffer_IsDeleted_Args);
+    lhs_after_alias_args.struct_size = c.PJRT_Buffer_IsDeleted_Args_STRUCT_SIZE;
+    lhs_after_alias_args.buffer = lhs_from_host_args.buffer;
+    try expectOk(api.PJRT_Buffer_IsDeleted.?(&lhs_after_alias_args));
+    try std.testing.expect(!lhs_after_alias_args.is_deleted);
 
     var device_args = [_]?*c.PJRT_Buffer{ lhs_from_host_args.buffer, rhs_from_host_args.buffer };
     var argument_lists = [_][*c]const ?*c.PJRT_Buffer{&device_args};
@@ -2219,6 +3288,23 @@ test "loaded executable execute chains u8 StableHLO ops through PJRT argument li
     execute_args.output_lists = &output_lists;
     execute_args.device_complete_events = &device_events;
     try expectOk(api.PJRT_LoadedExecutable_Execute.?(&execute_args));
+    var execute_event_ready_args = std.mem.zeroes(c.PJRT_Event_IsReady_Args);
+    execute_event_ready_args.struct_size = c.PJRT_Event_IsReady_Args_STRUCT_SIZE;
+    execute_event_ready_args.event = device_events[0];
+    try expectOk(api.PJRT_Event_IsReady.?(&execute_event_ready_args));
+    try std.testing.expect(execute_event_ready_args.is_ready);
+    var execute_event_await_args = std.mem.zeroes(c.PJRT_Event_Await_Args);
+    execute_event_await_args.struct_size = c.PJRT_Event_Await_Args_STRUCT_SIZE;
+    execute_event_await_args.event = device_events[0];
+    try expectOk(api.PJRT_Event_Await.?(&execute_event_await_args));
+    var execute_event_callback_state = PjrtEventCallbackState{};
+    var execute_event_on_ready_args = std.mem.zeroes(c.PJRT_Event_OnReady_Args);
+    execute_event_on_ready_args.struct_size = c.PJRT_Event_OnReady_Args_STRUCT_SIZE;
+    execute_event_on_ready_args.event = device_events[0];
+    execute_event_on_ready_args.callback = testPjrtEventCallback;
+    execute_event_on_ready_args.user_arg = &execute_event_callback_state;
+    try expectOk(api.PJRT_Event_OnReady.?(&execute_event_on_ready_args));
+    try std.testing.expectEqual(@as(usize, 1), execute_event_callback_state.ready_count);
     defer if (device_events[0]) |event| {
         var event_destroy_args = std.mem.zeroes(c.PJRT_Event_Destroy_Args);
         event_destroy_args.struct_size = c.PJRT_Event_Destroy_Args_STRUCT_SIZE;
@@ -2232,7 +3318,33 @@ test "loaded executable execute chains u8 StableHLO ops through PJRT argument li
         _ = api.PJRT_Buffer_Destroy.?(&buffer_destroy_args);
     };
 
+    var lhs_deleted_args = std.mem.zeroes(c.PJRT_Buffer_IsDeleted_Args);
+    lhs_deleted_args.struct_size = c.PJRT_Buffer_IsDeleted_Args_STRUCT_SIZE;
+    lhs_deleted_args.buffer = lhs_from_host_args.buffer;
+    try expectOk(api.PJRT_Buffer_IsDeleted.?(&lhs_deleted_args));
+    try std.testing.expect(lhs_deleted_args.is_deleted);
+
+    var rhs_deleted_args = std.mem.zeroes(c.PJRT_Buffer_IsDeleted_Args);
+    rhs_deleted_args.struct_size = c.PJRT_Buffer_IsDeleted_Args_STRUCT_SIZE;
+    rhs_deleted_args.buffer = rhs_from_host_args.buffer;
+    try expectOk(api.PJRT_Buffer_IsDeleted.?(&rhs_deleted_args));
+    try std.testing.expect(!rhs_deleted_args.is_deleted);
+
     try std.testing.expect(device_outputs[0] != null);
+    var output_ready_event_args = std.mem.zeroes(c.PJRT_Buffer_ReadyEvent_Args);
+    output_ready_event_args.struct_size = c.PJRT_Buffer_ReadyEvent_Args_STRUCT_SIZE;
+    output_ready_event_args.buffer = device_outputs[0];
+    try expectOk(api.PJRT_Buffer_ReadyEvent.?(&output_ready_event_args));
+    defer if (output_ready_event_args.event) |event| {
+        var event_destroy_args = std.mem.zeroes(c.PJRT_Event_Destroy_Args);
+        event_destroy_args.struct_size = c.PJRT_Event_Destroy_Args_STRUCT_SIZE;
+        event_destroy_args.event = event;
+        _ = api.PJRT_Event_Destroy.?(&event_destroy_args);
+    };
+    var output_ready_await_args = std.mem.zeroes(c.PJRT_Event_Await_Args);
+    output_ready_await_args.struct_size = c.PJRT_Event_Await_Args_STRUCT_SIZE;
+    output_ready_await_args.event = output_ready_event_args.event;
+    try expectOk(api.PJRT_Event_Await.?(&output_ready_await_args));
     var output: [4]u8 = undefined;
     var to_host_args = std.mem.zeroes(c.PJRT_Buffer_ToHostBuffer_Args);
     to_host_args.struct_size = c.PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
@@ -2249,8 +3361,12 @@ test "loaded executable execute chains u8 StableHLO ops through PJRT argument li
     try std.testing.expectEqualSlices(u8, &.{ 9, 18, 27, 36 }, &output);
 }
 
-test "loaded executable execute chains f32 binary and unary buffers through PJRT argument lists" {
+test "loaded executable execute chains f32 unary and metadata custom_call through PJRT argument lists" {
     const api = GetPjrtApi();
+    const registered_add_target = "pjrtx.test.plugin_binary_add";
+    const add_op = "add";
+    try expectOk(PjRTx_RegisterCustomCallBinary(registered_add_target.ptr, registered_add_target.len, add_op.ptr, add_op.len));
+    defer PjRTx_UnregisterCustomCall(registered_add_target.ptr, registered_add_target.len);
 
     var option = std.mem.zeroes(c.PJRT_NamedValue);
     option.struct_size = c.PJRT_NamedValue_STRUCT_SIZE;
@@ -2335,9 +3451,10 @@ test "loaded executable execute chains f32 binary and unary buffers through PJRT
     const module_text =
         \\module {
         \\  func.func @main(%arg0: tensor<2xf32>, %arg1: tensor<2xf32>) -> tensor<2xf32> {
-        \\    %0 = stablehlo.add %arg0, %arg1 : tensor<2xf32>
+        \\    %0 = "stablehlo.custom_call"(%arg0, %arg1) {call_target_name = "pjrtx.test.plugin_binary_add"} : (tensor<2xf32>, tensor<2xf32>) -> tensor<2xf32>
         \\    %1 = stablehlo.sqrt %0 : tensor<2xf32>
-        \\    return %1 : tensor<2xf32>
+        \\    %2 = "stablehlo.custom_call"(%1) {call_target_name = "annotate_device_placement"} : (tensor<2xf32>) -> tensor<2xf32>
+        \\    return %2 : tensor<2xf32>
         \\  }
         \\}
     ;
@@ -3208,8 +4325,11 @@ test "compile unsupported op returns detailed PJRT diagnostic" {
 
     const module_text =
         \\sdy.mesh @mesh = <["x"=2]>
-        \\func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
-        \\  %0 = "stablehlo.optimization_barrier"(%arg0) {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{"x"}]>]>} : (tensor<4xf32>) -> tensor<4xf32>
+        \\func.func @main(%arg0: tensor<f32>) -> tensor<4xf32> {
+        \\  %0 = "stablehlo.broadcast"(%arg0) {
+        \\    broadcast_sizes = array<i64: 4>,
+        \\    sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{"x"}]>]>
+        \\  } : (tensor<f32>) -> tensor<4xf32>
         \\  return %0 : tensor<4xf32>
         \\}
     ;
@@ -3235,7 +4355,7 @@ test "compile unsupported op returns detailed PJRT diagnostic" {
     try std.testing.expectEqual(@as(c.PJRT_Error_Code, @intCast(c.PJRT_Error_Code_UNIMPLEMENTED)), code_args.code);
 
     const message = errorMessage(api, err);
-    try std.testing.expect(std.mem.indexOf(u8, message, "op=optimization_barrier") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "op=broadcast") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "dtype=f32") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "rank=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "sharding=sdy.sharding_per_value") != null);
@@ -3283,5 +4403,5 @@ test "compile rejects frontend-supported op without MLX executable lowering" {
     const message = errorMessage(api, err);
     try std.testing.expect(std.mem.indexOf(u8, message, "pass=mlx-backend-legalization") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "op=custom_call") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "feature=mlx-backend-executable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "feature=pjrtx.test") != null);
 }

@@ -1,3 +1,4 @@
+load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 load("@rules_zig//zig:defs.bzl", "zig_shared_library", "zig_test")
 
 filegroup(
@@ -9,17 +10,56 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
+copy_file(
+    name = "mlx_metallib",
+    src = "@mlx_metal//:mlx_metallib",
+    out = "mlx.metallib",
+    visibility = ["//visibility:public"],
+)
+
+copy_file(
+    name = "libjaccl_dylib",
+    src = "@mlx_metal//:libjaccl_dylib",
+    out = "libjaccl.dylib",
+    visibility = ["//visibility:public"],
+)
+
+copy_file(
+    name = "libmlx_dylib",
+    src = "@mlx_metal//:libmlx_dylib",
+    out = "libmlx.dylib",
+    visibility = ["//visibility:public"],
+)
+
 zig_shared_library(
     name = "pjrtx_metal_plugin",
+    data = [
+        ":libjaccl_dylib",
+        ":libmlx_dylib",
+        ":mlx_metallib",
+    ],
     main = "plugin.zig",
     shared_lib_name = "libpjrtx_metal_plugin.dylib",
     visibility = ["//visibility:public"],
+    linkopts = [
+        "-Wl,-rpath,@loader_path",
+        "-Wl,-exported_symbol,_GetPjrtApi",
+        "-Wl,-exported_symbol,_PjRTx_CustomCall_BinaryAdd",
+        "-Wl,-exported_symbol,_PjRTx_CustomCall_Identity",
+        "-Wl,-exported_symbol,_PjRTx_CustomCall_UnarySqrt",
+        "-Wl,-exported_symbol,_PjRTx_RegisterCustomCallBinary",
+        "-Wl,-exported_symbol,_PjRTx_RegisterCustomCallIdentity",
+        "-Wl,-exported_symbol,_PjRTx_RegisterCustomCallUnary",
+        "-Wl,-exported_symbol,_PjRTx_UnregisterCustomCall",
+    ],
     zigopts = ["-fno-stack-check"],
     deps = [
         "//src/backend",
         "//src/backend:registry",
         "//src/compiler",
+        "//src/core",
         "//src/runtime",
+        "@xla//xla/pjrt/c:pjrt_c_api_gpu_extension_hdrs",
         "@xla//xla/pjrt/c:pjrt_c_api_hdrs",
     ],
 )
@@ -31,7 +71,9 @@ zig_test(
         "//src/backend",
         "//src/backend:registry",
         "//src/compiler",
+        "//src/core",
         "//src/runtime",
+        "@xla//xla/pjrt/c:pjrt_c_api_gpu_extension_hdrs",
         "@xla//xla/pjrt/c:pjrt_c_api_hdrs",
     ],
 )

@@ -25,7 +25,7 @@ cc_library(
     visibility = ["//visibility:private"],
     copts = ["-std=c++20"],
     deps = [
-        "@mlx//:metal_runtime",
+        "@mlx_metal//:metal_runtime",
     ],
 )
 
@@ -41,7 +41,7 @@ cc_library(
     hdrs = ["vendor_probe.h"],
     visibility = ["//visibility:private"],
     copts = ["-std=c++20"],
-    deps = ["@mlx//:metal_runtime"],
+    deps = ["@mlx_metal//:metal_runtime"],
 )
 
 cc_test(

@@ -1,0 +1,24 @@
+load("@rules_zig//zig:defs.bzl", "zig_library", "zig_test")
+
+filegroup(
+    name = "boundary_files",
+    srcs = glob(["*.zig"]) + ["BUILD.bazel"],
+    visibility = ["//next/pjrtx/architecture:__pkg__"],
+)
+
+zig_library(
+    name = "plugin",
+    import_name = "pjrtx/plugin",
+    main = "plugin.zig",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//next/pjrtx/compiler",
+        "//next/pjrtx/core",
+        "//next/pjrtx/runtime",
+    ],
+)
+
+zig_test(
+    name = "unit_tests",
+    deps = [":plugin"],
+)

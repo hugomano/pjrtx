@@ -17,34 +17,34 @@ bazel build //src/plugin:pjrtx_metal_plugin
 The first JAX-facing sandbox is split into two targets:
 
 ```sh
-bazel test //tests/pjrt:plugin_ctypes_smoke_test
-bazel build //tests/jax:jax_plugin_smoke
+bazel test //src/plugin/pjrt:plugin_ctypes_smoke_test
+bazel build //src/plugin/jax:jax_plugin_smoke
 ```
 
-`//tests/pjrt:plugin_ctypes_smoke_test` runs in the Bazel macOS sandbox, loads
+`//src/plugin/pjrt:plugin_ctypes_smoke_test` runs in the Bazel macOS sandbox, loads
 the plugin dylib, and verifies `GetPjrtApi` is exported.
-`//tests/jax:jax_plugin_smoke` registers the same dylib with JAX as the `pjrtx`
+`//src/plugin/jax:jax_plugin_smoke` registers the same dylib with JAX as the `pjrtx`
 backend and runs a tiny `jax.jit` add program through JAX's normal PJRT plugin
 path. The hermetic Python graph pins `jax` and `jaxlib`.
 
 ```sh
-bazel run //tests/jax:jax_plugin_smoke
-PJRTX_BACKEND=metal_mlx PJRTX_TRACE=1 bazel run //tests/jax:jax_op_suite
-PJRTX_BACKEND=metal_mlx PJRTX_TRACE=1 bazel run //tests/jax:jax_llama_like_inference
-PJRTX_BACKEND=metal_mlx bazel test //tests/jax:jax_upstream_subset_test --test_output=errors
-PJRTX_BACKEND=metal_mlx bazel test //tests/jax:jax_upstream_all_test --test_output=errors
+bazel run //src/plugin/jax:jax_plugin_smoke
+PJRTX_BACKEND=metal_mlx PJRTX_TRACE=1 bazel run //src/plugin/jax:jax_op_suite
+PJRTX_BACKEND=metal_mlx PJRTX_TRACE=1 bazel run //src/plugin/jax:jax_llama_like_inference
+PJRTX_BACKEND=metal_mlx bazel test //src/plugin/jax:jax_upstream_subset_test --test_output=errors
+PJRTX_BACKEND=metal_mlx bazel test //src/plugin/jax:jax_upstream_all_test --test_output=errors
 # or, as an explicit manual test:
-bazel test //tests/jax:jax_plugin_smoke_test --test_output=streamed
+bazel test //src/plugin/jax:jax_plugin_smoke_test --test_output=streamed
 ```
 
 The runner uses the MLX/Metal backend. PjRTx currently supports only this
 backend:
 
 ```sh
-PJRTX_BACKEND=metal_mlx bazel run //tests/jax:jax_plugin_smoke
+PJRTX_BACKEND=metal_mlx bazel run //src/plugin/jax:jax_plugin_smoke
 ```
 
-`//tests/jax:jax_upstream_subset_test` runs a curated slice of the pinned
+`//src/plugin/jax:jax_upstream_subset_test` runs a curated slice of the pinned
 official JAX test tree through `@jax_upstream`. The pytest adapter mirrors the
 JAX Bazel backend matrix by setting `jax_test_dut=pjrtx` and registering JAX
 test-util tags `pjrtx,metal,gpu`, so upstream `run_on_devices`,
@@ -54,11 +54,11 @@ the plugin. Upstream JAX runs are plugin-only by default:
 executing tests:
 
 ```sh
-bazel run //tests/jax:jax_upstream_subset -- --collect-only
-bazel run //tests/jax:jax_upstream_all -- --collect-only
+bazel run //src/plugin/jax:jax_upstream_subset -- --collect-only
+bazel run //src/plugin/jax:jax_upstream_all -- --collect-only
 ```
 
-`//tests/jax:jax_upstream_all_test` points pytest at the full upstream JAX
+`//src/plugin/jax:jax_upstream_all_test` points pytest at the full upstream JAX
 `tests/` tree. It is tagged `manual` and `pjrtx_full_jax` with an eternal
 timeout because it is a broad conformance job rather than a quick smoke test.
 If a debugging run genuinely needs CPU as a secondary platform, pass
@@ -68,7 +68,7 @@ Set `PJRTX_TRACE=1` to print one-line compile, host-to-device, execute, and
 device-to-host timing/byte counters while running the sandbox:
 
 ```sh
-PJRTX_BACKEND=metal_mlx PJRTX_TRACE=1 bazel run //tests/jax:jax_plugin_smoke
+PJRTX_BACKEND=metal_mlx PJRTX_TRACE=1 bazel run //src/plugin/jax:jax_plugin_smoke
 ```
 
 Set `PJRTX_PROFILE=1` when investigating throughput. This enables the same
@@ -87,8 +87,8 @@ Use `PJRTX_PROFILE=verbose` for one `backend_schedule_item` row per scheduled
 node/fusion/materialization item:
 
 ```sh
-PJRTX_BACKEND=metal_mlx PJRTX_PROFILE=1 bazel run //tests/jax:jax_llama_like_inference
-PJRTX_BACKEND=metal_mlx PJRTX_PROFILE=verbose bazel run //tests/jax:jax_llama_like_inference
+PJRTX_BACKEND=metal_mlx PJRTX_PROFILE=1 bazel run //src/plugin/jax:jax_llama_like_inference
+PJRTX_BACKEND=metal_mlx PJRTX_PROFILE=verbose bazel run //src/plugin/jax:jax_llama_like_inference
 ```
 
 For device-side profiling, use MLX's Metal capture path. This writes one
@@ -103,7 +103,7 @@ MTL_CAPTURE_ENABLED=1 \
   PJRTX_BACKEND=metal_mlx \
   PJRTX_PROFILE=1 \
   PJRTX_METAL_CAPTURE_DIR=/tmp/pjrtx-metal-captures \
-  bazel run //tests/jax:jax_llama_like_inference
+  bazel run //src/plugin/jax:jax_llama_like_inference
 ```
 
 `PJRTX_PROFILE_DEVICE_SYNC=1` adds `device_sync_wait_us` to `event=mlx_eval_many`
@@ -115,10 +115,10 @@ timestamps:
 PJRTX_BACKEND=metal_mlx \
   PJRTX_PROFILE=1 \
   PJRTX_PROFILE_DEVICE_SYNC=1 \
-  bazel run //tests/jax:jax_llama_like_inference
+  bazel run //src/plugin/jax:jax_llama_like_inference
 ```
 
-`//tests/jax:jax_op_suite` compares the currently lowered PjRTx fast path
+`//src/plugin/jax:jax_op_suite` compares the currently lowered PjRTx fast path
 against JAX CPU for repeated `jax.jit` execution of elementwise float chains,
 reshape/transpose/broadcast, f32/f16 sum/max/min reductions, two-output
 max/index reductions for ZML-style argMax, f32/f16 matmul,
@@ -144,13 +144,13 @@ execution against the MLX Metal device fast path with no runtime fallback. With
 `PJRTX_TRACE=1`, it also parses per-case traces and rejects compile fallback,
 non-backend execute candidates, cache pressure failures, and pending backend
 completion in the MLX path.
-`//tests/jax:jax_custom_call` asks JAX to emit a `stablehlo.custom_call` to the
+`//src/plugin/jax:jax_custom_call` asks JAX to emit a `stablehlo.custom_call` to the
 built-in `pjrtx.mlx_metal.custom_binary_add_f32` target and executes that target
 through a backend-owned MLX `fast::metal_kernel` before a follow-on device
 `sqrt`; the test does not drive the PJRT C API from Python.
-`//tests/jax:jax_rng_u64` enables JAX x64 only for an isolated Threefry
+`//src/plugin/jax:jax_rng_u64` enables JAX x64 only for an isolated Threefry
 `uint64` output check so the main op suite stays on the narrower dtype surface.
-`//tests/jax:jax_llama_like_inference` also closes over tiny and medium
+`//src/plugin/jax:jax_llama_like_inference` also closes over tiny and medium
 llama-shaped weight sets, runs each compiled block three times with only the
 activation as a PJRT execute argument, captures `pjrtx_trace` from the plugin,
 and asserts that backend execute counters advance while resident constant

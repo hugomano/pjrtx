@@ -16,6 +16,8 @@ zig_library(
     visibility = ["//visibility:public"],
     deps = [
         "//src/backend",
+        "//src/backend:registry",
+        "//src/compiler",
         "//src/core",
     ],
 )

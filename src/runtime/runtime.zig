@@ -1,6 +1,10 @@
 const std = @import("std");
 const backend_api = @import("src/backend");
+const backend_registry = @import("src/backend/registry");
+const compiler = @import("src/compiler");
 const core = @import("src/core");
+
+const io = std.Io.Threaded.global_single_threaded.io();
 
 pub const MAX_DEVICES = core.MAX_DEVICES;
 pub const MemoryKind = core.MemoryKind;
@@ -9,14 +13,24 @@ pub const BufferType = core.BufferType;
 pub const ElementwiseBinaryOp = core.ElementwiseBinaryOp;
 pub const ElementwiseUnaryOp = core.ElementwiseUnaryOp;
 pub const CompareOp = core.CompareOp;
+pub const CompileOptions = core.CompileOptions;
+pub const ExecutablePlan = core.ExecutablePlan;
+pub const PlanInstruction = core.PlanInstruction;
+pub const ShardingPlan = core.ShardingPlan;
+pub const ExecutableStats = backend_api.ExecutableStats;
+pub const CustomCallKind = backend_api.CustomCallKind;
+pub const CustomCallRegistration = backend_api.CustomCallRegistration;
+pub const AsyncHostToDeviceTransferHandle = backend_api.AsyncHostToDeviceTransferHandle;
 
-const MachTimebaseInfo = extern struct {
-    numer: u32,
-    denom: u32,
-};
+pub fn registerCustomCall(registration: CustomCallRegistration) backend_api.Error!void {
+    var backend_impl = backend_registry.create(.metal_mlx);
+    return backend_impl.registerCustomCall(registration);
+}
 
-extern "c" fn mach_absolute_time() u64;
-extern "c" fn mach_timebase_info(info: *MachTimebaseInfo) c_int;
+pub fn unregisterCustomCall(target: []const u8) void {
+    var backend_impl = backend_registry.create(.metal_mlx);
+    backend_impl.unregisterCustomCall(target);
+}
 
 pub const Device = struct {
     id: i32,
@@ -228,15 +242,579 @@ pub const DonationAliasStats = struct {
     output_bytes: usize = 0,
 };
 
-fn nowNs() u64 {
-    var info: MachTimebaseInfo = undefined;
-    if (mach_timebase_info(&info) != 0 or info.denom == 0) return mach_absolute_time();
-    const ticks: u128 = mach_absolute_time();
-    return @intCast((ticks * info.numer) / info.denom);
+pub const ClientCreateOptions = struct {
+    backend_kind: BackendKind = .metal_mlx,
+    device_count: usize = 1,
+    executable_cache_max_resident_bytes: ?u64 = null,
+};
+
+pub fn createClient(allocator: std.mem.Allocator, options: ClientCreateOptions) !*Client {
+    const client = switch (options.backend_kind) {
+        .metal_mlx => try Client.init(allocator, backend_registry.create(.metal_mlx), options.device_count),
+    };
+    if (options.executable_cache_max_resident_bytes) |max_resident_bytes| {
+        client.setExecutableCacheMaxResidentBytes(max_resident_bytes);
+    }
+    return client;
 }
 
-fn elapsedMicrosSince(start_ns: u64) u64 {
-    return (nowNs() -| start_ns) / std.time.ns_per_us;
+pub const CompileProgram = struct {
+    format: []const u8 = "",
+    code: []const u8 = &.{},
+    compile_options: []const u8 = &.{},
+};
+
+pub const CompileProgramError = error{
+    InvalidOptions,
+    OptionsRequireMoreDevices,
+    UnknownDevice,
+    UnsupportedProgram,
+    InvalidProgram,
+    InvalidExecutablePlan,
+    UnsupportedRuntimeFeature,
+    OutOfMemory,
+    Internal,
+};
+
+pub const CompiledExecutable = struct {
+    plan: *ExecutablePlan,
+    graph: ExecutableGraph,
+    optimized_program: []u8,
+    fingerprint: []u8,
+    cache_hit: bool,
+    backend_stats: ExecutableStats,
+
+    pub fn deinit(self: *CompiledExecutable, allocator: std.mem.Allocator) void {
+        self.graph.deinit();
+        allocator.free(self.fingerprint);
+        allocator.free(self.optimized_program);
+        self.plan.deinit();
+        allocator.destroy(self.plan);
+        self.* = undefined;
+    }
+};
+
+fn writeDiagnostic(writer: *std.Io.Writer, comptime fmt: []const u8, args: anytype) void {
+    writer.print(fmt, args) catch {};
+}
+
+fn isPjrtxTextCompileOptions(text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (text) |byte| {
+        if (!(std.ascii.isPrint(byte) or std.ascii.isWhitespace(byte))) return false;
+    }
+    return std.mem.indexOf(u8, text, "replicas=") != null or
+        std.mem.indexOf(u8, text, "partitions=") != null or
+        std.mem.indexOf(u8, text, "assignment=") != null or
+        std.mem.indexOf(u8, text, "use_shardy=") != null;
+}
+
+const ProtoWire = enum(u3) {
+    varint = 0,
+    fixed64 = 1,
+    length_delimited = 2,
+    fixed32 = 5,
+};
+
+const ProtoField = struct {
+    number: u32,
+    wire: ProtoWire,
+};
+
+const ProtoReader = struct {
+    bytes: []const u8,
+    index: usize = 0,
+
+    fn eof(self: ProtoReader) bool {
+        return self.index >= self.bytes.len;
+    }
+
+    fn readByte(self: *ProtoReader) !u8 {
+        if (self.index >= self.bytes.len) return error.UnexpectedEnd;
+        defer self.index += 1;
+        return self.bytes[self.index];
+    }
+
+    fn readVarint(self: *ProtoReader) !u64 {
+        var result: u64 = 0;
+        var shift: u6 = 0;
+        while (true) {
+            const byte = try self.readByte();
+            result |= @as(u64, byte & 0x7f) << shift;
+            if ((byte & 0x80) == 0) return result;
+            if (shift >= 63) return error.InvalidVarint;
+            shift += 7;
+        }
+    }
+
+    fn readField(self: *ProtoReader) !ProtoField {
+        const tag = try self.readVarint();
+        if (tag == 0) return error.InvalidTag;
+        const wire_value: u3 = @intCast(tag & 0x7);
+        const wire: ProtoWire = switch (wire_value) {
+            0 => .varint,
+            1 => .fixed64,
+            2 => .length_delimited,
+            5 => .fixed32,
+            else => return error.UnsupportedWireType,
+        };
+        return .{
+            .number = @intCast(tag >> 3),
+            .wire = wire,
+        };
+    }
+
+    fn readLengthDelimited(self: *ProtoReader) ![]const u8 {
+        const len: usize = @intCast(try self.readVarint());
+        if (len > self.bytes.len - self.index) return error.UnexpectedEnd;
+        defer self.index += len;
+        return self.bytes[self.index .. self.index + len];
+    }
+
+    fn skip(self: *ProtoReader, wire: ProtoWire) !void {
+        switch (wire) {
+            .varint => _ = try self.readVarint(),
+            .fixed64 => {
+                if (8 > self.bytes.len - self.index) return error.UnexpectedEnd;
+                self.index += 8;
+            },
+            .length_delimited => _ = try self.readLengthDelimited(),
+            .fixed32 => {
+                if (4 > self.bytes.len - self.index) return error.UnexpectedEnd;
+                self.index += 4;
+            },
+        }
+    }
+};
+
+const DeviceAssignmentProto = struct {
+    replica_count: i32 = 0,
+    computation_count: i32 = 0,
+    computation_devices: std.ArrayList([]i32) = .empty,
+
+    fn deinit(self: *DeviceAssignmentProto, allocator: std.mem.Allocator) void {
+        for (self.computation_devices.items) |devices| allocator.free(devices);
+        self.computation_devices.deinit(allocator);
+    }
+
+    fn parse(allocator: std.mem.Allocator, bytes: []const u8) !DeviceAssignmentProto {
+        var assignment: DeviceAssignmentProto = .{};
+        errdefer assignment.deinit(allocator);
+
+        var reader: ProtoReader = .{ .bytes = bytes };
+        while (!reader.eof()) {
+            const field = try reader.readField();
+            switch (field.number) {
+                1 => {
+                    if (field.wire != .varint) return error.InvalidCompileOptionsProto;
+                    assignment.replica_count = @intCast(try reader.readVarint());
+                },
+                2 => {
+                    if (field.wire != .varint) return error.InvalidCompileOptionsProto;
+                    assignment.computation_count = @intCast(try reader.readVarint());
+                },
+                3 => {
+                    if (field.wire != .length_delimited) return error.InvalidCompileOptionsProto;
+                    const devices = try parseComputationDevice(allocator, try reader.readLengthDelimited());
+                    errdefer allocator.free(devices);
+                    try assignment.computation_devices.append(allocator, devices);
+                },
+                else => try reader.skip(field.wire),
+            }
+        }
+        return assignment;
+    }
+
+    fn parseComputationDevice(allocator: std.mem.Allocator, bytes: []const u8) ![]i32 {
+        var ids = std.ArrayList(i32).empty;
+        errdefer ids.deinit(allocator);
+
+        var reader: ProtoReader = .{ .bytes = bytes };
+        while (!reader.eof()) {
+            const field = try reader.readField();
+            switch (field.number) {
+                1 => switch (field.wire) {
+                    .varint => try ids.append(allocator, @intCast(try reader.readVarint())),
+                    .length_delimited => {
+                        var packed_ids: ProtoReader = .{ .bytes = try reader.readLengthDelimited() };
+                        while (!packed_ids.eof()) try ids.append(allocator, @intCast(try packed_ids.readVarint()));
+                    },
+                    else => return error.InvalidCompileOptionsProto,
+                },
+                else => try reader.skip(field.wire),
+            }
+        }
+        return ids.toOwnedSlice(allocator);
+    }
+
+    fn appendFlattened(self: DeviceAssignmentProto, allocator: std.mem.Allocator, out: *std.ArrayList(i32)) !void {
+        const partitions = if (self.computation_count > 0) @as(usize, @intCast(self.computation_count)) else self.computation_devices.items.len;
+        const replicas = if (self.replica_count > 0) @as(usize, @intCast(self.replica_count)) else blk: {
+            var max_replicas: usize = 0;
+            for (self.computation_devices.items) |devices| max_replicas = @max(max_replicas, devices.len);
+            break :blk max_replicas;
+        };
+        if (partitions == 0 or replicas == 0) return;
+        if (self.computation_devices.items.len < partitions) return error.InvalidCompileOptionsProto;
+        for (0..replicas) |replica| {
+            for (0..partitions) |partition| {
+                const devices = self.computation_devices.items[partition];
+                if (replica >= devices.len) return error.InvalidCompileOptionsProto;
+                try out.append(allocator, devices[replica]);
+            }
+        }
+    }
+};
+
+fn parseXlaCompileOptionsProto(allocator: std.mem.Allocator, bytes: []const u8) !CompileOptions {
+    var options: CompileOptions = .{};
+    var assignment = std.ArrayList(i32).empty;
+    errdefer assignment.deinit(allocator);
+
+    var reader: ProtoReader = .{ .bytes = bytes };
+    while (!reader.eof()) {
+        const field = try reader.readField();
+        switch (field.number) {
+            3 => {
+                if (field.wire != .length_delimited) return error.InvalidCompileOptionsProto;
+                try parseExecutableBuildOptionsProto(allocator, try reader.readLengthDelimited(), &options, &assignment);
+            },
+            else => try reader.skip(field.wire),
+        }
+    }
+
+    if (options.num_replicas < 1 or options.num_partitions < 1) return error.InvalidCompileOptionsProto;
+    if (assignment.items.len != 0 and assignment.items.len < options.numDevices()) return error.InvalidCompileOptionsProto;
+    options.device_assignment = try assignment.toOwnedSlice(allocator);
+    return options;
+}
+
+fn parseExecutableBuildOptionsProto(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    options: *CompileOptions,
+    assignment: *std.ArrayList(i32),
+) !void {
+    var reader: ProtoReader = .{ .bytes = bytes };
+    while (!reader.eof()) {
+        const field = try reader.readField();
+        switch (field.number) {
+            4 => {
+                if (field.wire != .varint) return error.InvalidCompileOptionsProto;
+                options.num_replicas = @intCast(try reader.readVarint());
+            },
+            5 => {
+                if (field.wire != .varint) return error.InvalidCompileOptionsProto;
+                options.num_partitions = @intCast(try reader.readVarint());
+            },
+            9 => {
+                if (field.wire != .length_delimited) return error.InvalidCompileOptionsProto;
+                var device_assignment = try DeviceAssignmentProto.parse(allocator, try reader.readLengthDelimited());
+                defer device_assignment.deinit(allocator);
+                try device_assignment.appendFlattened(allocator, assignment);
+            },
+            19 => {
+                if (field.wire != .varint) return error.InvalidCompileOptionsProto;
+                options.use_shardy_partitioner = (try reader.readVarint()) != 0;
+            },
+            else => try reader.skip(field.wire),
+        }
+    }
+}
+
+test "parse XLA CompileOptionsProto emitted by ZML" {
+    const compile_options_proto = &[_]u8{
+        0x1a, 0x14, // CompileOptionsProto.executable_build_options
+        0x20, 0x01, // ExecutableBuildOptionsProto.num_replicas = 1
+        0x28, 0x01, // ExecutableBuildOptionsProto.num_partitions = 1
+        0x30, 0x01, // ExecutableBuildOptionsProto.use_spmd_partitioning = true
+        0x4a, 0x09, // ExecutableBuildOptionsProto.device_assignment
+        0x08, 0x01, // DeviceAssignmentProto.replica_count = 1
+        0x10, 0x01, // DeviceAssignmentProto.computation_count = 1
+        0x1a, 0x03, // DeviceAssignmentProto.computation_devices[0]
+        0x0a, 0x01, 0x00, // ComputationDevice.replica_device_ids = [0]
+        0x98, 0x01, 0x01, // ExecutableBuildOptionsProto.use_shardy_partitioner = true
+    };
+
+    const allocator = std.testing.allocator;
+    const options = try parseXlaCompileOptionsProto(allocator, compile_options_proto);
+    defer allocator.free(options.device_assignment);
+
+    try std.testing.expectEqual(@as(i32, 1), options.num_replicas);
+    try std.testing.expectEqual(@as(i32, 1), options.num_partitions);
+    try std.testing.expect(options.use_shardy_partitioner);
+    try std.testing.expectEqualSlices(i32, &.{0}, options.device_assignment);
+}
+
+test "parse XLA CompileOptionsProto flattens device assignment in PJRT order" {
+    const compile_options_proto = &[_]u8{
+        0x1a, 0x19, // CompileOptionsProto.executable_build_options
+        0x20, 0x02, // num_replicas = 2
+        0x28, 0x02, // num_partitions = 2
+        0x4a, 0x10, // device_assignment
+        0x08, 0x02, // replica_count = 2
+        0x10, 0x02, // computation_count = 2
+        0x1a, 0x04, // computation_devices[0]
+        0x0a, 0x02, 0x00, 0x02, // replica_device_ids = [0, 2]
+        0x1a, 0x04, // computation_devices[1]
+        0x0a, 0x02, 0x01, 0x03, // replica_device_ids = [1, 3]
+        0x98, 0x01, 0x00, // use_shardy_partitioner = false
+    };
+
+    const allocator = std.testing.allocator;
+    const options = try parseXlaCompileOptionsProto(allocator, compile_options_proto);
+    defer allocator.free(options.device_assignment);
+
+    try std.testing.expectEqual(@as(i32, 2), options.num_replicas);
+    try std.testing.expectEqual(@as(i32, 2), options.num_partitions);
+    try std.testing.expect(!options.use_shardy_partitioner);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 2, 3 }, options.device_assignment);
+}
+
+fn parseCompileOptions(
+    allocator: std.mem.Allocator,
+    client: *const Client,
+    text: []const u8,
+    parsed_options: *bool,
+    diagnostics: *std.Io.Writer,
+) CompileProgramError!CompileOptions {
+    var options: CompileOptions = .{
+        .num_partitions = @intCast(client.devices.len),
+    };
+    if (text.len != 0) {
+        if (isPjrtxTextCompileOptions(text)) {
+            var options_reader: std.Io.Reader = .fixed(text);
+            options = compiler.parseTextCompileOptionsFromReader(allocator, &options_reader) catch {
+                writeDiagnostic(diagnostics, "invalid PjRTx text compile options", .{});
+                return error.InvalidOptions;
+            };
+        } else {
+            options = parseXlaCompileOptionsProto(allocator, text) catch {
+                writeDiagnostic(diagnostics, "invalid XLA CompileOptionsProto", .{});
+                return error.InvalidOptions;
+            };
+        }
+        parsed_options.* = true;
+    }
+    if (options.numDevices() > client.devices.len) {
+        writeDiagnostic(diagnostics, "compile options require more devices than the client exposes", .{});
+        return error.OptionsRequireMoreDevices;
+    }
+    for (options.device_assignment) |device_id| {
+        if (client.lookupDevice(device_id) == null) {
+            writeDiagnostic(diagnostics, "compile options reference an unknown device id", .{});
+            return error.UnknownDevice;
+        }
+    }
+    return options;
+}
+
+fn analyzeProgram(
+    allocator: std.mem.Allocator,
+    program: CompileProgram,
+    diagnostics: *std.Io.Writer,
+) CompileProgramError!?compiler.ModuleAnalysis {
+    if (program.code.len == 0) return null;
+    var module_reader: std.Io.Reader = .fixed(program.code);
+    return compiler.analyzeProgramFromReader(allocator, program.format, &module_reader, diagnostics) catch |err| switch (err) {
+        error.UnsupportedOp, error.UnsupportedSharding, error.UnsupportedProgramEncoding, error.GspmdNotEnabled, error.InvalidManualComputation => error.UnsupportedProgram,
+        error.UnsupportedProgramFormat, error.InvalidStablehloModule => error.InvalidProgram,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.Internal,
+    };
+}
+
+fn makeExecutablePlan(
+    allocator: std.mem.Allocator,
+    options: CompileOptions,
+    analysis: ?compiler.ModuleAnalysis,
+) CompileProgramError!ExecutablePlan {
+    return if (analysis) |owned_analysis|
+        compiler.makeExecutablePlan(allocator, options, owned_analysis) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+        }
+    else
+        compiler.makeReplicatedPlan(allocator, options, 1, 1) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+        };
+}
+
+fn verifyPlan(
+    allocator: std.mem.Allocator,
+    plan: ExecutablePlan,
+    diagnostics: *std.Io.Writer,
+) CompileProgramError!void {
+    compiler.verifyExecutablePlan(allocator, plan, diagnostics) catch |err| switch (err) {
+        error.InvalidExecutablePlan => return error.InvalidExecutablePlan,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Internal,
+    };
+}
+
+fn updateOptionalI64Slice(hasher: *std.hash.Wyhash, values: ?[]const i64) void {
+    const present = values != null;
+    hasher.update(std.mem.asBytes(&present));
+    if (values) |slice| hasher.update(std.mem.sliceAsBytes(slice));
+}
+
+fn updateOptionalBytes(hasher: *std.hash.Wyhash, bytes: ?[]const u8) void {
+    const present = bytes != null;
+    hasher.update(std.mem.asBytes(&present));
+    if (bytes) |slice| hasher.update(slice);
+}
+
+fn updateShardingFingerprint(hasher: *std.hash.Wyhash, shardings: []const ShardingPlan) void {
+    hasher.update(std.mem.asBytes(&shardings.len));
+    for (shardings) |sharding| {
+        hasher.update(std.mem.asBytes(&sharding.kind));
+        hasher.update(sharding.mesh_name);
+        hasher.update(std.mem.sliceAsBytes(sharding.device_assignment));
+    }
+}
+
+fn updateInstructionFingerprint(hasher: *std.hash.Wyhash, instruction: PlanInstruction) void {
+    hasher.update(std.mem.asBytes(&instruction.kind));
+    hasher.update(std.mem.sliceAsBytes(instruction.inputs));
+    hasher.update(std.mem.sliceAsBytes(instruction.outputs));
+    hasher.update(std.mem.sliceAsBytes(instruction.region_ids));
+    updateOptionalI64Slice(hasher, instruction.dims);
+    updateOptionalI64Slice(hasher, instruction.permutation);
+    updateOptionalI64Slice(hasher, instruction.broadcast_dimensions);
+    updateOptionalI64Slice(hasher, instruction.start_indices);
+    updateOptionalI64Slice(hasher, instruction.limit_indices);
+    updateOptionalI64Slice(hasher, instruction.strides);
+    updateOptionalI64Slice(hasher, instruction.slice_sizes);
+    updateOptionalI64Slice(hasher, instruction.edge_padding_low);
+    updateOptionalI64Slice(hasher, instruction.edge_padding_high);
+    updateOptionalI64Slice(hasher, instruction.interior_padding);
+    updateOptionalI64Slice(hasher, instruction.offset_dims);
+    updateOptionalI64Slice(hasher, instruction.collapsed_slice_dims);
+    updateOptionalI64Slice(hasher, instruction.operand_batching_dims);
+    updateOptionalI64Slice(hasher, instruction.start_indices_batching_dims);
+    updateOptionalI64Slice(hasher, instruction.start_index_map);
+    updateOptionalI64Slice(hasher, instruction.update_window_dims);
+    updateOptionalI64Slice(hasher, instruction.inserted_window_dims);
+    updateOptionalI64Slice(hasher, instruction.input_batching_dims);
+    updateOptionalI64Slice(hasher, instruction.scatter_indices_batching_dims);
+    updateOptionalI64Slice(hasher, instruction.scatter_dims_to_operand_dims);
+    hasher.update(std.mem.asBytes(&instruction.index_vector_dim));
+    hasher.update(std.mem.asBytes(&instruction.scatter_update_kind));
+    hasher.update(std.mem.asBytes(&instruction.dimension));
+    hasher.update(std.mem.asBytes(&instruction.top_k_k));
+    hasher.update(std.mem.asBytes(&instruction.iota_dimension));
+    hasher.update(std.mem.asBytes(&instruction.fft_kind));
+    updateOptionalI64Slice(hasher, instruction.dimensions);
+    hasher.update(std.mem.asBytes(&instruction.tuple_index));
+    hasher.update(std.mem.asBytes(&instruction.lower));
+    hasher.update(std.mem.asBytes(&instruction.triangular_left_side));
+    hasher.update(std.mem.asBytes(&instruction.triangular_lower));
+    hasher.update(std.mem.asBytes(&instruction.triangular_unit_diagonal));
+    hasher.update(std.mem.asBytes(&instruction.triangular_transpose));
+    updateOptionalBytes(hasher, instruction.custom_call_target);
+    updateOptionalI64Slice(hasher, instruction.reduce_dimensions);
+    updateOptionalI64Slice(hasher, instruction.lhs_batch_dimensions);
+    updateOptionalI64Slice(hasher, instruction.rhs_batch_dimensions);
+    updateOptionalI64Slice(hasher, instruction.lhs_contracting_dimensions);
+    updateOptionalI64Slice(hasher, instruction.rhs_contracting_dimensions);
+    hasher.update(std.mem.asBytes(&instruction.compare_direction));
+    updateOptionalBytes(hasher, instruction.literal);
+}
+
+fn updateTargetDeviceFingerprint(hasher: *std.hash.Wyhash, client: *const Client, plan: *const ExecutablePlan) void {
+    const device_count = plan.options.numDevices();
+    hasher.update(std.mem.asBytes(&device_count));
+    for (0..device_count) |i| {
+        const device_id = if (plan.options.device_assignment.len != 0) plan.options.device_assignment[i] else client.devices[i].id;
+        hasher.update(std.mem.asBytes(&device_id));
+        const device = client.lookupDevice(device_id) orelse {
+            const missing_device: i32 = -1;
+            hasher.update(std.mem.asBytes(&missing_device));
+            continue;
+        };
+        hasher.update(std.mem.asBytes(&device.local_hardware_id));
+        hasher.update(std.mem.asBytes(&device.registry_id));
+        hasher.update(std.mem.asBytes(&device.process_index));
+        hasher.update(std.mem.asBytes(&device.addressable));
+        hasher.update(std.mem.asBytes(&device.memory_bytes));
+        hasher.update(std.mem.asBytes(&device.has_unified_memory));
+        hasher.update(std.mem.asBytes(&device.default_memory_id));
+        hasher.update(device.name);
+        hasher.update(device.debug_string);
+        const memory = client.lookupMemory(device.default_memory_id) orelse continue;
+        hasher.update(std.mem.asBytes(&memory.id));
+        hasher.update(std.mem.asBytes(&memory.kind));
+        hasher.update(std.mem.sliceAsBytes(memory.addressable_device_ids));
+    }
+}
+
+fn allocExecutableFingerprint(
+    allocator: std.mem.Allocator,
+    client: *const Client,
+    optimized_program: []const u8,
+    plan: *const ExecutablePlan,
+) ![]u8 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update("pjrtx-executable-cache-v4");
+    hasher.update(optimized_program);
+    const caps = client.backend.capabilities();
+    hasher.update(@tagName(client.backend_kind));
+    hasher.update(caps.name);
+    hasher.update(std.mem.asBytes(&caps.kind));
+    hasher.update(std.mem.asBytes(&caps.supports_device_buffers));
+    hasher.update(std.mem.asBytes(&caps.supports_unified_memory));
+    hasher.update(std.mem.asBytes(&caps.supports_async_execution));
+    const custom_call_registry_version = client.backend.customCallRegistryVersion();
+    hasher.update(std.mem.asBytes(&custom_call_registry_version));
+    updateTargetDeviceFingerprint(&hasher, client, plan);
+    hasher.update(std.mem.asBytes(&plan.options.num_replicas));
+    hasher.update(std.mem.asBytes(&plan.options.num_partitions));
+    hasher.update(std.mem.asBytes(&plan.options.use_shardy_partitioner));
+    hasher.update(std.mem.sliceAsBytes(plan.options.device_assignment));
+    updateShardingFingerprint(&hasher, plan.parameter_shardings);
+    updateShardingFingerprint(&hasher, plan.output_shardings);
+    hasher.update(std.mem.sliceAsBytes(plan.output_ids));
+    hasher.update(std.mem.sliceAsBytes(plan.donated_parameter_indices));
+    for (plan.output_aliases) |alias| {
+        hasher.update(std.mem.asBytes(&alias.output_index));
+        hasher.update(std.mem.asBytes(&alias.parameter_index));
+        hasher.update(std.mem.asBytes(&alias.kind));
+    }
+    for (plan.values) |value| {
+        hasher.update(std.mem.asBytes(&value.role));
+        hasher.update(std.mem.asBytes(&value.descriptor.element_type));
+        hasher.update(std.mem.sliceAsBytes(value.descriptor.dims));
+        hasher.update(std.mem.asBytes(&value.descriptor.layout));
+        hasher.update(std.mem.asBytes(&value.descriptor.device_id));
+        hasher.update(std.mem.asBytes(&value.descriptor.memory_id));
+        hasher.update(std.mem.asBytes(&value.descriptor.shard_index));
+        hasher.update(std.mem.asBytes(&value.storage));
+        hasher.update(std.mem.sliceAsBytes(value.elements));
+    }
+    for (plan.regions) |region| {
+        hasher.update(std.mem.asBytes(&region.id));
+        hasher.update(std.mem.asBytes(&region.parent_instruction_index));
+        hasher.update(std.mem.asBytes(&region.kind));
+        for (region.argument_descriptors) |descriptor| {
+            hasher.update(std.mem.asBytes(&descriptor.element_type));
+            hasher.update(std.mem.sliceAsBytes(descriptor.dims));
+            hasher.update(std.mem.asBytes(&descriptor.layout));
+        }
+        for (region.return_descriptors) |descriptor| {
+            hasher.update(std.mem.asBytes(&descriptor.element_type));
+            hasher.update(std.mem.sliceAsBytes(descriptor.dims));
+            hasher.update(std.mem.asBytes(&descriptor.layout));
+        }
+    }
+    for (plan.instructions) |instruction| updateInstructionFingerprint(&hasher, instruction);
+    return std.fmt.allocPrint(allocator, "pjrtx-{x}", .{hasher.final()});
+}
+
+fn nowTimestamp() std.Io.Timestamp {
+    return std.Io.Timestamp.now(io, .awake);
+}
+
+fn elapsedMicrosSince(start: std.Io.Timestamp) u64 {
+    return @intCast(@max(start.durationTo(nowTimestamp()).toMicroseconds(), 0));
 }
 
 pub const ExecutableCacheStats = struct {
@@ -691,12 +1269,12 @@ pub const Client = struct {
             }
         }
 
-        const compile_start_ns = nowNs();
+        const compile_start = nowTimestamp();
         const handle = self.backend.compileExecutable(allocator, plan, device_local_hardware_ids) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => null,
         };
-        const compile_latency_us = elapsedMicrosSince(compile_start_ns);
+        const compile_latency_us = elapsedMicrosSince(compile_start);
         const owned_handle = handle orelse return null;
         const stats = self.backend.executableStats(owned_handle);
         const resident_constant_bytes: usize = @intCast(stats.resident_constant_bytes);
@@ -735,6 +1313,129 @@ pub const Client = struct {
         defer self.executable_cache_mutex.unlock();
         self.executable_cache.release(self.backend, entry);
         self.syncExecutableCacheMemoryStats();
+    }
+
+    pub fn createHostBufferFromBytes(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        element_type: BufferType,
+        dims: []const i64,
+        device: *Device,
+        memory: *Memory,
+        shard_index: usize,
+        src: []const u8,
+    ) !*Buffer {
+        return Buffer.initHostCopyForBackend(allocator, self.backend, element_type, dims, device, memory, shard_index, src);
+    }
+
+    pub fn createDeviceBuffer(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        element_type: BufferType,
+        dims: []const i64,
+        device: *Device,
+        memory: *Memory,
+        shard_index: usize,
+    ) !*Buffer {
+        return Buffer.initDeviceAllocationForBackend(allocator, self.backend, element_type, dims, device, memory, shard_index);
+    }
+
+    pub fn createPendingBackendTransferBuffer(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        element_type: BufferType,
+        dims: []const i64,
+        device: *Device,
+        memory: *Memory,
+        shard_index: usize,
+    ) !*Buffer {
+        return Buffer.initPendingBackendTransfer(allocator, self.backend, element_type, dims, device, memory, shard_index);
+    }
+
+    pub fn beginAsyncHostToDeviceTransfer(
+        self: *Client,
+        device: *const Device,
+        element_type: BufferType,
+        dims: []const i64,
+        byte_size: usize,
+    ) ?AsyncHostToDeviceTransferHandle {
+        return self.backend.beginAsyncHostToDeviceTransfer(device.local_hardware_id, element_type, dims, byte_size) catch null;
+    }
+
+    pub fn destroyAsyncHostToDeviceTransfer(self: *Client, transfer: AsyncHostToDeviceTransferHandle) void {
+        self.backend.destroyAsyncHostToDeviceTransfer(transfer);
+    }
+
+    pub fn writeAsyncHostToDeviceTransfer(self: *Client, transfer: AsyncHostToDeviceTransferHandle, offset: usize, bytes: []const u8) !void {
+        try self.backend.writeAsyncHostToDeviceTransfer(transfer, offset, bytes);
+    }
+
+    pub fn finishAsyncHostToDeviceTransfer(self: *Client, buffer: *Buffer, transfer: AsyncHostToDeviceTransferHandle) !void {
+        const backend_buffer = try self.backend.finishAsyncHostToDeviceTransfer(transfer) orelse return error.UnsupportedRuntimeFeature;
+        errdefer self.backend.destroyBuffer(backend_buffer);
+        try buffer.replaceBackendStorage(backend_buffer);
+    }
+
+    pub fn installStagedHostBuffer(_: *Client, buffer: *Buffer, staging: []const u8) !void {
+        try buffer.replaceBackendStorageFromHost(staging);
+    }
+
+    pub fn compileProgram(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        program: CompileProgram,
+        diagnostics: *std.Io.Writer,
+    ) CompileProgramError!CompiledExecutable {
+        var parsed_options = false;
+        const options = try parseCompileOptions(allocator, self, program.compile_options, &parsed_options, diagnostics);
+        defer if (parsed_options) allocator.free(options.device_assignment);
+
+        var analysis = try analyzeProgram(allocator, program, diagnostics);
+        defer if (analysis) |*owned_analysis| owned_analysis.deinit();
+
+        var plan = try makeExecutablePlan(allocator, options, analysis);
+        var plan_moved = false;
+        errdefer if (!plan_moved) plan.deinit();
+
+        try verifyPlan(allocator, plan, diagnostics);
+
+        const optimized_program = if (analysis) |owned_analysis|
+            allocator.dupe(u8, owned_analysis.source) catch return error.OutOfMemory
+        else
+            allocator.dupe(u8, "module {}\n") catch return error.OutOfMemory;
+        errdefer allocator.free(optimized_program);
+
+        const fingerprint = allocExecutableFingerprint(allocator, self, optimized_program, &plan) catch return error.OutOfMemory;
+        errdefer allocator.free(fingerprint);
+
+        const cache_hit = self.recordExecutableCompile(fingerprint) catch return error.Internal;
+
+        const plan_ptr = allocator.create(ExecutablePlan) catch return error.OutOfMemory;
+        plan_ptr.* = plan;
+        plan_moved = true;
+        errdefer {
+            plan_ptr.deinit();
+            allocator.destroy(plan_ptr);
+        }
+
+        var graph = ExecutableGraph.initWithOptions(allocator, self, plan_ptr, .{
+            .diagnostic_writer = diagnostics,
+            .cache_fingerprint = fingerprint,
+        }) catch |err| switch (err) {
+            error.UnsupportedRuntimeFeature => return error.UnsupportedRuntimeFeature,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.Internal,
+        };
+        errdefer graph.deinit();
+
+        return .{
+            .plan = plan_ptr,
+            .graph = graph,
+            .optimized_program = optimized_program,
+            .fingerprint = fingerprint,
+            .cache_hit = cache_hit,
+            .backend_stats = graph.backendExecutableStats() orelse .{},
+        };
     }
 };
 
@@ -3583,7 +4284,7 @@ test "buffer reshape preserves typed bytes and updates dimensions" {
     try expectBufferF32(reshaped, &values);
 }
 
-test "buffer transpose permutes dense host bytes and updates dimensions" {
+test "buffer transpose permutes resident buffer values and updates dimensions" {
     const client = try initMlxMetalClientForTest();
     defer client.deinit();
 
@@ -3599,7 +4300,7 @@ test "buffer transpose permutes dense host bytes and updates dimensions" {
     try expectBufferBytes(transposed, &.{ 1, 4, 2, 5, 3, 6 });
 }
 
-test "buffer broadcast_in_dim expands dense host bytes and updates dimensions" {
+test "buffer broadcast_in_dim expands resident buffer values and updates dimensions" {
     const client = try initMlxMetalClientForTest();
     defer client.deinit();
 
@@ -3615,7 +4316,7 @@ test "buffer broadcast_in_dim expands dense host bytes and updates dimensions" {
     try expectBufferBytes(broadcasted, &.{ 7, 8, 9, 7, 8, 9 });
 }
 
-test "buffer slice copies strided dense host bytes and updates dimensions" {
+test "buffer slice copies strided resident buffer values and updates dimensions" {
     const client = try initMlxMetalClientForTest();
     defer client.deinit();
 
@@ -3639,7 +4340,7 @@ test "buffer slice copies strided dense host bytes and updates dimensions" {
     try expectBufferBytes(sliced, &.{ 5, 7, 9, 11 });
 }
 
-test "buffer concatenate joins dense host bytes along an axis" {
+test "buffer concatenate joins resident buffer values along an axis" {
     const client = try initMlxMetalClientForTest();
     defer client.deinit();
 

@@ -610,6 +610,18 @@ fn programCompileEnabled() bool {
     return text.len == 0 or (!std.mem.eql(u8, text, "0") and !std.ascii.eqlIgnoreCase(text, "false"));
 }
 
+fn planSupportsCompiledProgram(plan: *const core.ExecutablePlan) bool {
+    for (plan.instructions) |instruction| {
+        switch (instruction.kind) {
+            // The RNG path is device-native, but it uses a custom Metal kernel under MLX
+            // and is not currently valid inside an mlx::compile graph builder.
+            .rng_bit_generator => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
 fn profileStart(enabled: bool) i128 {
     return if (enabled) @intCast(nowNs()) else 0;
 }
@@ -1564,7 +1576,7 @@ fn compileExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
             .device_index = device_index,
         };
     }
-    if (programCompileEnabled()) {
+    if (programCompileEnabled() and planSupportsCompiledProgram(plan)) {
         for (compiled_program_handles, 0..) |*handle_slot, device_index| {
             handle_slot.* = c.pjrtx_mlx_metal_program_create(
                 &compiled_program_contexts[device_index],
@@ -5059,7 +5071,7 @@ fn validateWhileLowering(plan: *const core.ExecutablePlan, instruction: core.Pla
         .instruction_index = instruction_index,
         .value_id = output_id,
         .op = instruction.kind,
-        .detail = "while region subprogram lowering requires a supported device-side loop pattern; host-loop fallback is disabled",
+        .detail = "while region subprogram lowering requires a supported device-side loop pattern; host-loop execution is disabled",
         .feature = "mlx-while-region-pattern",
     };
 }

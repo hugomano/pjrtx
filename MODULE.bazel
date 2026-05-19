@@ -46,7 +46,7 @@ use_repo(zig, "zig_toolchains")
 
 register_toolchains("@rules_zig//zig/target:all")
 register_toolchains("@zig_toolchains//:all")
-register_toolchains("//:translate_c_toolchain")
+register_toolchains("//bazel:translate_c_toolchain")
 register_toolchains("@llvm//toolchain:all")
 
 uv = use_extension("@rules_python//python/uv:uv.bzl", "uv", dev_dependency = True)
@@ -61,7 +61,7 @@ pip.parse(
     download_only = True,
     hub_name = "jax_sandbox_deps",
     python_version = "3.12",
-    requirements_lock = "//tests/jax:requirements.lock.txt",
+    requirements_lock = "//src/plugin/jax:requirements.lock.txt",
 )
 use_repo(pip, "jax_sandbox_deps")
 

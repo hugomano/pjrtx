@@ -1,0 +1,35 @@
+load("@rules_zig//zig:defs.bzl", "zig_library", "zig_test")
+
+filegroup(
+    name = "boundary_files",
+    srcs = glob(["*.zig"]) + ["BUILD.bazel"],
+    visibility = ["//next/pjrtx/architecture:__pkg__"],
+)
+
+zig_library(
+    name = "mlir_state",
+    import_name = "pjrtx/compiler/mlir_state",
+    main = "package.zig",
+    srcs = [
+        "attrs.zig",
+        "fusion_passes.zig",
+        "limits.zig",
+        "lowering_policy.zig",
+        "passes.zig",
+        "placement_collective_passes.zig",
+        "state_target_passes.zig",
+        "types.zig",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//next/pjrtx/compiler:mlir_c_api",
+        "//next/pjrtx/compiler/facts",
+        "//next/pjrtx/core",
+        "//next/pjrtx/target",
+    ],
+)
+
+zig_test(
+    name = "unit_tests",
+    deps = [":mlir_state"],
+)

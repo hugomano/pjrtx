@@ -2506,10 +2506,10 @@ fn promoteExistingOutputAlias(builder: *CapiAnalysisBuilder, output_index: u32, 
     }
 }
 
-fn customCallAliasOutputIndex(attr: mlir.MlirAttribute, fallback_index: usize) ?usize {
+fn customCallAliasOutputIndex(attr: mlir.MlirAttribute, default_index: usize) ?usize {
     if (!mlir.stablehloAttributeIsAOutputOperandAlias(attr)) return null;
     const tuple_index_count = mlir.stablehloOutputOperandAliasGetOutputTupleIndicesSize(attr);
-    if (tuple_index_count == 0) return fallback_index;
+    if (tuple_index_count == 0) return default_index;
     if (tuple_index_count != 1) return null;
     const output_index = mlir.stablehloOutputOperandAliasGetOutputTupleIndicesElem(attr, 0);
     if (output_index < 0) return null;
@@ -4264,7 +4264,7 @@ test "executable plan values carry parameter and result descriptors" {
     try std.testing.expectEqualSlices(i64, &.{4}, plan.values[1].descriptor.dims);
 }
 
-test "executable plan supports parameter alias returns without synthetic instructions" {
+test "executable plan supports parameter alias returns without extra instructions" {
     const module_text =
         \\module {
         \\  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {

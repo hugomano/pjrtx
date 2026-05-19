@@ -1,0 +1,11 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+sh_test(
+    name = "architecture_boundary_test",
+    srcs = ["architecture_boundary_test.sh"],
+    data = [
+        "//src/compiler:sources",
+        "//src/plugin:sources",
+        "//src/runtime:sources",
+    ],
+)

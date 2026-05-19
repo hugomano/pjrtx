@@ -1,0 +1,102 @@
+load("@rules_zig//zig:defs.bzl", "zig_test")
+
+filegroup(
+    name = "boundary_files",
+    srcs = glob(["*.zig"]) + ["BUILD.bazel"],
+    visibility = ["//next/pjrtx/architecture:__pkg__"],
+)
+
+zig_test(
+    name = "report_test",
+    data = ["testdata/tiny_trace_report.txt"],
+    main = "report_test.zig",
+    srcs = ["runfiles.zig"],
+    deps = [
+        "//next/pjrtx/compiler/facts",
+        "//next/pjrtx/core",
+    ],
+)
+
+zig_test(
+    name = "import_tests",
+    data = ["//next/pjrtx/fixtures"],
+    main = "import_test.zig",
+    srcs = ["runfiles.zig"],
+    deps = [
+        "//next/pjrtx/compiler",
+        "//next/pjrtx/compiler/facts",
+        "//next/pjrtx/compiler/mlir_state",
+        "//next/pjrtx/core",
+    ],
+)
+
+zig_test(
+    name = "lowering_tests",
+    data = ["//next/pjrtx/fixtures"],
+    main = "lowering_test.zig",
+    srcs = ["runfiles.zig"],
+    deps = [
+        "//next/pjrtx/compiler",
+        "//next/pjrtx/compiler/facts",
+        "//next/pjrtx/compiler/mlir_state",
+        "//next/pjrtx/core",
+    ],
+)
+
+zig_test(
+    name = "mlir_state_test",
+    data = [
+        "//next/pjrtx/fixtures",
+        "testdata/mlir_state_after_fusion.txt",
+    ],
+    main = "mlir_state_test.zig",
+    srcs = ["runfiles.zig"],
+    deps = [
+        "//next/pjrtx/compiler",
+        "//next/pjrtx/compiler/mlir_state",
+    ],
+)
+
+zig_test(
+    name = "backend_binding_test",
+    main = "backend_binding_test.zig",
+    deps = [
+        "//next/pjrtx/backend",
+        "//next/pjrtx/core",
+    ],
+)
+
+zig_test(
+    name = "metal_bridge_test",
+    main = "metal_bridge_test.zig",
+    data = ["//next/pjrtx/fixtures"],
+    srcs = ["runfiles.zig"],
+    deps = [
+        "//next/pjrtx/backend",
+        "//next/pjrtx/backend:mlir_bridge",
+        "//next/pjrtx/compiler",
+        "//next/pjrtx/compiler/mlir_state",
+        "//next/pjrtx/runtime",
+    ],
+)
+
+zig_test(
+    name = "execution_test",
+    main = "execution_test.zig",
+    data = [
+        "//next/pjrtx/fixtures",
+        "testdata/v0_execution_report.txt",
+    ],
+    srcs = ["runfiles.zig"],
+    deps = [
+        "//next/pjrtx/backend",
+        "//next/pjrtx/backend:mlir_bridge",
+        "//next/pjrtx/compiler",
+        "//next/pjrtx/compiler/facts",
+        "//next/pjrtx/compiler/mlir_state",
+        "//next/pjrtx/core",
+        "//next/pjrtx/runtime",
+        "//next/pjrtx/runtime:mlir_bridge",
+        "//next/pjrtx/target",
+    ],
+)

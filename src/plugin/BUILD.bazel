@@ -1,12 +1,30 @@
 load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 load("@rules_zig//zig:defs.bzl", "zig_shared_library", "zig_test")
 
+PLUGIN_SRCS = [
+    "api.zig",
+    "async_h2d.zig",
+    "buffer.zig",
+    "client.zig",
+    "custom_call.zig",
+    "device_memory.zig",
+    "errors.zig",
+    "events.zig",
+    "executable.zig",
+    "execute.zig",
+    "pjrt_abi.zig",
+    "state.zig",
+    "topology.zig",
+    "trace.zig",
+    "types.zig",
+]
+
 filegroup(
     name = "sources",
     srcs = [
         "BUILD.bazel",
         "plugin.zig",
-    ],
+    ] + PLUGIN_SRCS,
     visibility = ["//visibility:public"],
 )
 
@@ -40,6 +58,7 @@ zig_shared_library(
     ],
     main = "plugin.zig",
     shared_lib_name = "libpjrtx_metal_plugin.dylib",
+    srcs = PLUGIN_SRCS,
     visibility = ["//visibility:public"],
     linkopts = [
         "-Wl,-rpath,@loader_path",
@@ -54,10 +73,6 @@ zig_shared_library(
     ],
     zigopts = ["-fno-stack-check"],
     deps = [
-        "//src/backend",
-        "//src/backend:registry",
-        "//src/compiler",
-        "//src/core",
         "//src/runtime",
         "@xla//xla/pjrt/c:pjrt_c_api_gpu_extension_hdrs",
         "@xla//xla/pjrt/c:pjrt_c_api_hdrs",
@@ -67,11 +82,8 @@ zig_shared_library(
 zig_test(
     name = "plugin_test",
     main = "plugin.zig",
+    srcs = PLUGIN_SRCS,
     deps = [
-        "//src/backend",
-        "//src/backend:registry",
-        "//src/compiler",
-        "//src/core",
         "//src/runtime",
         "@xla//xla/pjrt/c:pjrt_c_api_gpu_extension_hdrs",
         "@xla//xla/pjrt/c:pjrt_c_api_hdrs",

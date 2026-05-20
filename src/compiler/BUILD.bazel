@@ -6,6 +6,7 @@ filegroup(
     srcs = [
         "BUILD.bazel",
         "compiler.zig",
+        "ir.zig",
     ],
     visibility = ["//visibility:public"],
 )
@@ -29,13 +30,20 @@ cc_library(
 )
 
 zig_library(
+    name = "ir",
+    import_name = "src/compiler/ir",
+    main = "ir.zig",
+    visibility = ["//visibility:public"],
+)
+
+zig_library(
     name = "compiler",
     import_name = "src/compiler",
     main = "compiler.zig",
     visibility = ["//visibility:public"],
     deps = [
         ":mlir_c_api",
-        "//src/core",
+        ":ir",
     ],
 )
 

@@ -5,7 +5,8 @@ write idiomatic Zig whose packages and dependency edges explain the system.
 Avoid generic buckets and keep work at the layer that owns it.
 
 Some directories add narrower agent guidance. In particular, read
-`src/plugin/AGENTS.md` before editing the PJRT C API adapter.
+`src/plugin/AGENTS.md` before editing the PJRT C API adapter, and
+`src/runtime/AGENTS.md` before editing runtime lifecycle/scheduling code.
 
 ## Project Shape
 
@@ -28,6 +29,9 @@ Do not move behavior across those boundaries for convenience.
   internals.
 - Do not let compiler code allocate runtime buffers or depend on backend object
   handles.
+- Do not recreate `src/core`, backend vtables, backend registries, or synthetic
+  platforms. Compiler IR is the shared contract; Metal/MLX is the concrete
+  runtime backend.
 - Do not use `types.zig`, `state.zig`, `utils.zig`, `helpers.zig`, or similar
   generic files as a place for new behavior.
 - Do not scatter `toC` / `fromC` helpers. Put ABI mechanics in explicit boundary

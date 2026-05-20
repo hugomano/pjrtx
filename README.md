@@ -223,8 +223,9 @@ Agent-facing instructions for future edits live in [`AGENTS.md`](AGENTS.md).
 
 The architecture imports these ZML/v2 principles:
 
-- Platform ownership is explicit: clients select and own the backend they use
-  for transfer, compile, and execute.
+- Platform ownership is explicit: runtime clients own the concrete Metal/MLX
+  backend they use for transfer, compile, and execute. PjRTx no longer has a
+  dynamic backend vtable or registry in `//src`.
 - Build sandboxing is non-negotiable: runtime packages are stripped to the
   minimum, vendored hermetically, and built through Bazel with the sandboxed
   macOS SDK and hermetic LLVM.
@@ -236,30 +237,25 @@ The architecture imports these ZML/v2 principles:
   with DMA/pinned staging and overlapped host-to-device writes.
 - Sharding is first-class: meshes, shardings, placements, and manual shard-local
   computation are compiler/runtime data, not backend side channels.
-- Optimized libraries are pluggable backends: MLX/Metal is the only supported
-  backend today, while attention kernels, future Neuron-like hardware, and
-  CUDA/ROCm should all slot behind PjRTx-owned interfaces later.
+- Optimized libraries are backend-owned execution substrates: MLX/Metal is the
+  only supported production backend today. Future hardware must be introduced
+  through a deliberate architecture change, not by recreating a generic backend
+  bucket.
 
-- `src/core`: backend-neutral value types for dtype, shape, layout, sharding,
-  device ids, memory ids, topology, buffer descriptors, placements, compile
-  options, value/instruction executable plans, donated-parameter metadata, and
-  bootstrap plan instructions. These are the contracts shared across compiler,
-  runtime, plugin, and backends.
 - `src/compiler`: StableHLO/MLIR ingestion, verification, compile option
   parsing, Shardy metadata extraction, and construction of PjRTx executable
-  plans. The compiler depends on `src/core` and MLIR C API targets only; it does
-  not depend on runtime or backend packages.
+  plans. Compiler-owned IR and tensor vocabulary live here; `src/core` is gone.
+  The compiler does not depend on runtime or backend packages.
 - `src/runtime`: client/device/memory/topology/buffer/executable lifecycle and
-  scheduling. Runtime consumes PjRTx executable plans and dispatches through a
-  backend vtable with opaque backend buffer handles. Runtime owns execute
-  completion propagation and output readiness events. It does not import MLX,
-  Metal, or C symbols.
-- `src/backend`: the PjRTx backend interface plus implementations. MLX/Metal
-  specifics live under `src/backend/mlx_metal` behind the private C++ C ABI
-  shim.
+  scheduling. Runtime consumes compiler executable plans and calls the concrete
+  `src/backend/mlx_metal` Zig API directly. Runtime owns execute completion
+  propagation, output readiness events, donation, and executable-cache
+  residency. It must not import MLX C shims, Metal symbols, or C ABI structs.
+- `src/backend/mlx_metal`: the only production backend implementation. MLX/Metal
+  specifics and the private C++ C ABI shim stay inside this directory.
 - `src/plugin`: PJRT C API adapter only. It parses PJRT inputs, selects a
-  backend through the backend registry, calls compiler/runtime APIs, and
-  translates results back into PJRT structs. It does not import MLX symbols.
+  compatible Metal/MLX runtime configuration, calls runtime APIs, and translates
+  results back into PJRT structs. It does not import MLX symbols.
 
 Bazel enforces these boundaries with package dependencies and the
 `//:architecture_boundary_test` smoke test.
@@ -341,9 +337,11 @@ execution.
 - `third_party/metal_cpp`: pinned Apple `metal-cpp_26.zip`, used by the MLX
   Metal header target and linked against the sandboxed macOS SDK framework
   slices. No host Xcode SDK paths are used.
-- `src/backend`: a Zig backend vtable/interface plus backend-specific package
-  directories. Backends expose opaque buffer handles and opaque executable
-  handles. `src/backend/mlx_metal` owns the small private C ABI shim over vendored MLX
+- `src/backend`: backend-specific package directories only. There is no root
+  Zig backend vtable, registry, or synthetic platform in `//src`. The runtime
+  calls `src/backend/mlx_metal` through its concrete Zig API, which exposes
+  opaque buffer handles and opaque executable handles. `src/backend/mlx_metal`
+  owns the small private C ABI shim over vendored MLX
   Metal headers and MLX device APIs. It copies MLX Metal device names and
   recommended working-set sizes into plain C structs so Zig never owns
   C++/Objective-C objects. The same shim exposes opaque buffers that keep MLX
@@ -351,9 +349,10 @@ execution.
   `copy_to_host`. There is no persistent host shadow in the MLX backend. The
   typed constructor preserves dtype and shape metadata for the MLX array path,
   including `s8`, `u8`, `s32`, `u32`, `f16`, `bf16`, and `f32` host imports.
-  StableHLO `convert` lowers to MLX `astype` through the backend vtable, so
-  dtype casts on resident buffers stay on device. StableHLO `bitcast_convert`
-  lowers through the backend vtable to MLX `view(dtype)` plus a shape-only
+  StableHLO `convert` lowers to MLX `astype` through the concrete backend API,
+  so dtype casts on resident buffers stay on device. StableHLO
+  `bitcast_convert` lowers through the concrete backend API to MLX `view(dtype)`
+  plus a shape-only
   reshape when needed, so ZML byte views and same-byte dtype reinterpretation
   stay device-resident instead of becoming numeric casts or host roundtrips.
   MLX backend executables lower into an explicit backend program with value
@@ -558,10 +557,10 @@ execution.
   event, and adapts that runtime event into PJRT per-device completion events.
   Execute output buffer readiness is chained to that device completion event,
   so future async backend completion can use the same PJRT buffer/event
-  contract. Backends expose pending execution event status/destruction through
-  the backend vtable; until runtime scheduler integration owns polling/callback
-  progression, unresolved pending backend events fail closed instead of
-  leaking handles or marking outputs ready. If execution fails after producing
+  contract. The MLX backend exposes pending execution event status/destruction
+  through its concrete API; until runtime scheduler integration owns
+  polling/callback progression, unresolved pending backend events fail closed
+  instead of leaking handles or marking outputs ready. If execution fails after producing
   partial results it
   destroys those PjRTx-owned partial outputs/events before returning the PJRT
   error.

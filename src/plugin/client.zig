@@ -87,26 +87,19 @@ pub const Client = struct {
 };
 
 const ClientCreateRequest = struct {
-    backend_kind: runtime_mod.BackendKind = .metal_mlx,
-
     fn decode(args: c.PJRT_Client_Create_Args) !ClientCreateRequest {
-        var request: ClientCreateRequest = .{};
         if (args.create_options != null) {
             for (0..args.num_options) |i| {
                 const option = abi.NamedValue.borrow(args.create_options[i]);
                 if (std.mem.eql(u8, option.name(), plugin.Options.backend)) {
                     const value = option.stringValue() orelse return error.InvalidBackend;
-                    if (std.mem.eql(u8, value, "metal_mlx")) {
-                        request.backend_kind = .metal_mlx;
-                    } else {
-                        return error.InvalidBackend;
-                    }
+                    if (!std.mem.eql(u8, value, "metal_mlx")) return error.InvalidBackend;
                 } else {
                     return error.InvalidBackend;
                 }
             }
         }
-        return request;
+        return .{};
     }
 };
 
@@ -294,11 +287,10 @@ fn ClientDeviceListCallback(comptime Args: type, comptime devices_field: []const
 
 const ClientCreate = struct {
     fn call(args: [*c]c.PJRT_Client_Create_Args) callconv(.c) ?*c.PJRT_Error {
-        const request = ClientCreateRequest.decode(args[0]) catch {
+        _ = ClientCreateRequest.decode(args[0]) catch {
             return PjrtError.invalidArgument("invalid PjRTx client create option");
         };
         const client = runtime_mod.createClient(plugin.allocator(), .{
-            .backend_kind = request.backend_kind,
             .executable_cache_max_resident_bytes = trace_mod.Env.executableCacheMaxBytes(),
         }) catch {
             return PjrtError.internal("failed to create PjRTx client");

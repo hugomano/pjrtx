@@ -1,591 +1,627 @@
 const std = @import("std");
-const c = @import("c");
-const backend = @import("src/backend");
-const core = @import("src/core");
+const backend = @This();
+const ir = @import("src/compiler/ir");
+const program_mod = @import("program.zig");
+const device_mod = @import("device.zig");
+const buffer_mod = @import("buffer.zig");
+const async_transfer_mod = @import("async_transfer.zig");
+const mlx_call = @import("mlx_call.zig");
+const custom_call_mod = @import("custom_call.zig");
+const profiling_mod = @import("profiling.zig");
+const executable_mod = @import("executable.zig");
 
-const MachTimebaseInfo = extern struct {
-    numer: u32,
-    denom: u32,
+pub const BufferHandle = *anyopaque;
+pub const ExecutableHandle = *anyopaque;
+pub const ExecutionEventHandle = *anyopaque;
+pub const AsyncHostToDeviceTransferHandle = *anyopaque;
+
+pub const ReduceWindowMaxWithIndicesResult = struct {
+    values: BufferHandle,
+    indices: BufferHandle,
 };
 
-extern "c" fn mach_absolute_time() u64;
-extern "c" fn mach_timebase_info(info: *MachTimebaseInfo) c_int;
+pub const ReduceMaxWithIndicesResult = struct {
+    values: BufferHandle,
+    indices: BufferHandle,
+};
 
-pub fn create() backend.Backend {
-    return .{ .vtable = &vtable };
-}
+pub const RngBitGeneratorResult = struct {
+    state: BufferHandle,
+    bits: BufferHandle,
+};
 
-fn kind(_: backend.Backend) core.BackendKind {
-    return .metal_mlx;
+pub const Error = error{
+    InvalidDeviceCount,
+    InvalidProgram,
+    UnsupportedElementType,
+    ShapeMismatch,
+    BufferAllocationFailed,
+    CommandSubmissionFailed,
+    BufferCopyFailed,
+    OutOfMemory,
+    InvalidCustomCall,
+};
+
+/// Public custom-call registration kind accepted by the MLX/Metal backend.
+pub const CustomCallKind = custom_call_mod.Kind;
+
+/// Public custom-call registration record copied into the backend registry.
+pub const CustomCallRegistration = custom_call_mod.Registration;
+
+pub const ExecutableOutput = struct {
+    handle: BufferHandle,
+    element_type: ir.BufferType,
+    dims: []const i64,
+    byte_size: usize,
+};
+
+pub const ExecutionCompletionKind = enum {
+    completed,
+    pending,
+};
+
+pub const ExecutionCompletion = struct {
+    kind: ExecutionCompletionKind = .completed,
+    backend_event: ?ExecutionEventHandle = null,
+
+    pub fn completed() ExecutionCompletion {
+        return .{ .kind = .completed };
+    }
+
+    pub fn pending(event: ExecutionEventHandle) ExecutionCompletion {
+        return .{ .kind = .pending, .backend_event = event };
+    }
+};
+
+pub const ExecutionEventState = enum {
+    pending,
+    ready,
+    failed,
+};
+
+pub const ExecutionEventStatus = struct {
+    state: ExecutionEventState,
+    message: []const u8 = "",
+};
+
+pub const ExecutionResult = struct {
+    outputs: []ExecutableOutput,
+    completion: ExecutionCompletion = .{},
+};
+
+/// Runtime-visible execution counters for one compiled MLX/Metal executable.
+pub const ExecutableStats = executable_mod.Stats;
+
+/// Classifies the backend execution role of an executable-plan instruction.
+pub const ProgramNodeKind = program_mod.NodeKind;
+/// Captures one scheduled backend graph node and its value/subprogram relationships.
+pub const ProgramNode = program_mod.Node;
+/// Classifies a group of nodes that the backend may execute as one fused graph segment.
+pub const FusionGroupKind = program_mod.FusionGroupKind;
+/// Owns metadata for a contiguous fusion group in the backend program schedule.
+pub const FusionGroup = program_mod.FusionGroup;
+/// Explains why the backend must materialize a program value at a schedule boundary.
+pub const MaterializationReason = program_mod.MaterializationReason;
+/// Marks one value that must be materialized during backend execution.
+pub const MaterializationBoundary = program_mod.MaterializationBoundary;
+/// Records producer, last-use, size, and materialization metadata for one program value.
+pub const ProgramValue = program_mod.Value;
+/// Represents one producer-to-consumer value dependency in the backend graph.
+pub const ProgramEdge = program_mod.Edge;
+/// Describes the kind of scheduled backend work item.
+pub const ProgramScheduleKind = program_mod.ScheduleKind;
+/// Describes one scheduled backend work item.
+pub const ProgramScheduleItem = program_mod.ScheduleItem;
+/// Owns cloned region metadata for backend control-flow execution.
+pub const ProgramSubprogram = program_mod.Subprogram;
+/// Describes the supported backend control-flow family.
+pub const ProgramControlFlowKind = program_mod.ControlFlowKind;
+/// Owns backend while-loop metadata and state mapping.
+pub const ProgramControlFlow = program_mod.ControlFlow;
+/// Reports liveness planning results for a backend program.
+pub const ProgramLivenessStats = program_mod.LivenessStats;
+/// Owns the backend graph, schedule, regions, fusion groups, and materialization boundaries.
+pub const Program = program_mod.Program;
+
+pub const Capabilities = struct {
+    name: []const u8,
+    supports_device_buffers: bool,
+    supports_unified_memory: bool,
+    supports_async_execution: bool = false,
+};
+
+pub const Backend = struct {
+    pub fn capabilities(self: Backend) Capabilities {
+        return backend.capabilities(self);
+    }
+
+    pub fn enumerateDevices(self: Backend, allocator: std.mem.Allocator, device_count_hint: usize) Error![]ir.DeviceDescriptor {
+        return backend.enumerateDevices(self, allocator, device_count_hint);
+    }
+
+    pub fn releaseDeviceDescriptors(self: Backend, allocator: std.mem.Allocator, descriptors: []ir.DeviceDescriptor) void {
+        backend.releaseDeviceDescriptors(self, allocator, descriptors);
+    }
+
+    pub fn bufferFromHost(self: Backend, device_local_hardware_id: i32, element_type: ir.BufferType, dims: []const i64, src: []const u8) Error!?BufferHandle {
+        return backend.bufferFromHost(self, device_local_hardware_id, element_type, dims, src);
+    }
+
+    pub fn beginAsyncHostToDeviceTransfer(self: Backend, device_local_hardware_id: i32, element_type: ir.BufferType, dims: []const i64, byte_size: usize) Error!?AsyncHostToDeviceTransferHandle {
+        return backend.beginAsyncHostToDeviceTransfer(self, device_local_hardware_id, element_type, dims, byte_size);
+    }
+
+    pub fn writeAsyncHostToDeviceTransfer(self: Backend, transfer: AsyncHostToDeviceTransferHandle, offset: usize, src: []const u8) Error!void {
+        return backend.writeAsyncHostToDeviceTransfer(self, transfer, offset, src);
+    }
+
+    pub fn finishAsyncHostToDeviceTransfer(self: Backend, transfer: AsyncHostToDeviceTransferHandle) Error!?BufferHandle {
+        return backend.finishAsyncHostToDeviceTransfer(self, transfer);
+    }
+
+    pub fn destroyAsyncHostToDeviceTransfer(self: Backend, transfer: AsyncHostToDeviceTransferHandle) void {
+        backend.destroyAsyncHostToDeviceTransfer(self, transfer);
+    }
+
+    pub fn allocateBuffer(self: Backend, device_local_hardware_id: i32, element_type: ir.BufferType, dims: []const i64) Error!?BufferHandle {
+        return backend.allocateBuffer(self, device_local_hardware_id, element_type, dims);
+    }
+
+    pub fn iota(self: Backend, device_local_hardware_id: i32, element_type: ir.BufferType, dims: []const i64, iota_dimension: i64) Error!?BufferHandle {
+        return backend.iota(self, device_local_hardware_id, element_type, dims, iota_dimension);
+    }
+
+    pub fn partitionId(self: Backend, device_local_hardware_id: i32, element_type: ir.BufferType, partition_id: u32) Error!?BufferHandle {
+        return backend.partitionId(self, device_local_hardware_id, element_type, partition_id);
+    }
+
+    pub fn cloneBuffer(self: Backend, src: BufferHandle) Error!?BufferHandle {
+        return backend.cloneBuffer(self, src);
+    }
+
+    pub fn complex(self: Backend, real: BufferHandle, imag: BufferHandle, output_dims: []const i64) Error!?BufferHandle {
+        return backend.complex(self, real, imag, output_dims);
+    }
+
+    pub fn realPart(self: Backend, src: BufferHandle, output_dims: []const i64) Error!?BufferHandle {
+        return backend.realPart(self, src, output_dims);
+    }
+
+    pub fn imagPart(self: Backend, src: BufferHandle, output_dims: []const i64) Error!?BufferHandle {
+        return backend.imagPart(self, src, output_dims);
+    }
+
+    pub fn convert(self: Backend, src: BufferHandle, output_type: ir.BufferType) Error!?BufferHandle {
+        return backend.convert(self, src, output_type);
+    }
+
+    pub fn bitcast(self: Backend, src: BufferHandle, output_type: ir.BufferType, output_dims: []const i64) Error!?BufferHandle {
+        return backend.bitcast(self, src, output_type, output_dims);
+    }
+
+    pub fn binary(self: Backend, lhs: BufferHandle, rhs: BufferHandle, op: ir.ElementwiseBinaryOp) Error!?BufferHandle {
+        return backend.binary(self, lhs, rhs, op);
+    }
+
+    pub fn unary(self: Backend, src: BufferHandle, op: ir.ElementwiseUnaryOp) Error!?BufferHandle {
+        return backend.unary(self, src, op);
+    }
+
+    pub fn reshape(self: Backend, src: BufferHandle, dims: []const i64) Error!?BufferHandle {
+        return backend.reshape(self, src, dims);
+    }
+
+    pub fn transpose(self: Backend, src: BufferHandle, permutation: []const i64) Error!?BufferHandle {
+        return backend.transpose(self, src, permutation);
+    }
+
+    pub fn broadcastInDim(self: Backend, src: BufferHandle, broadcast_dimensions: []const i64, output_dims: []const i64) Error!?BufferHandle {
+        return backend.broadcastInDim(self, src, broadcast_dimensions, output_dims);
+    }
+
+    pub fn slice(self: Backend, src: BufferHandle, start_indices: []const i64, limit_indices: []const i64, strides: []const i64, output_dims: []const i64) Error!?BufferHandle {
+        return backend.slice(self, src, start_indices, limit_indices, strides, output_dims);
+    }
+
+    pub fn dynamicSlice(self: Backend, src: BufferHandle, start_buffers: []const BufferHandle, slice_sizes: []const i64, output_dims: []const i64) Error!?BufferHandle {
+        return backend.dynamicSlice(self, src, start_buffers, slice_sizes, output_dims);
+    }
+
+    pub fn dynamicUpdateSlice(self: Backend, src: BufferHandle, update: BufferHandle, start_buffers: []const BufferHandle, output_dims: []const i64) Error!?BufferHandle {
+        return backend.dynamicUpdateSlice(self, src, update, start_buffers, output_dims);
+    }
+
+    pub fn pad(self: Backend, src: BufferHandle, padding_value: BufferHandle, edge_padding_low: []const i64, edge_padding_high: []const i64, interior_padding: []const i64, output_dims: []const i64) Error!?BufferHandle {
+        return backend.pad(self, src, padding_value, edge_padding_low, edge_padding_high, interior_padding, output_dims);
+    }
+
+    pub fn reverse(self: Backend, src: BufferHandle, dimensions: []const i64, output_dims: []const i64) Error!?BufferHandle {
+        return backend.reverse(self, src, dimensions, output_dims);
+    }
+
+    pub fn concatenate(self: Backend, lhs: BufferHandle, rhs: BufferHandle, dimension: i64, output_dims: []const i64) Error!?BufferHandle {
+        return backend.concatenate(self, lhs, rhs, dimension, output_dims);
+    }
+
+    pub fn gather(self: Backend, operand: BufferHandle, indices: BufferHandle, start_index_map: []const i64, collapsed_slice_dims: []const i64, operand_batching_dims: []const i64, start_indices_batching_dims: []const i64, index_vector_dim: i64, slice_sizes: []const i64, offset_dims: []const i64, output_dims: []const i64) Error!?BufferHandle {
+        return backend.gather(self, operand, indices, start_index_map, collapsed_slice_dims, operand_batching_dims, start_indices_batching_dims, index_vector_dim, slice_sizes, offset_dims, output_dims);
+    }
+
+    pub fn gatherAxis(self: Backend, operand: BufferHandle, indices: BufferHandle, axis: i64, index_vector_dim: i64, output_dims: []const i64) Error!?BufferHandle {
+        return backend.gatherAxis(self, operand, indices, axis, index_vector_dim, output_dims);
+    }
+
+    pub fn scatter(self: Backend, operand: BufferHandle, indices: BufferHandle, updates: BufferHandle, scatter_dims_to_operand_dims: []const i64, inserted_window_dims: []const i64, update_window_dims: []const i64, input_batching_dims: []const i64, scatter_indices_batching_dims: []const i64, index_vector_dim: i64, update_kind: ir.ScatterUpdateKind, output_dims: []const i64) Error!?BufferHandle {
+        return backend.scatter(self, operand, indices, updates, scatter_dims_to_operand_dims, inserted_window_dims, update_window_dims, input_batching_dims, scatter_indices_batching_dims, index_vector_dim, update_kind, output_dims);
+    }
+
+    pub fn scatterAxis(self: Backend, operand: BufferHandle, indices: BufferHandle, updates: BufferHandle, axis: i64, index_vector_dim: i64, update_kind: ir.ScatterUpdateKind, output_dims: []const i64) Error!?BufferHandle {
+        return backend.scatterAxis(self, operand, indices, updates, axis, index_vector_dim, update_kind, output_dims);
+    }
+
+    pub fn sort(self: Backend, src: BufferHandle, dimension: i64, output_dims: []const i64) Error!?BufferHandle {
+        return backend.sort(self, src, dimension, output_dims);
+    }
+
+    pub fn argsort(self: Backend, src: BufferHandle, dimension: i64, output_type: ir.BufferType, output_dims: []const i64) Error!?BufferHandle {
+        return backend.argsort(self, src, dimension, output_type, output_dims);
+    }
+
+    pub fn takeAlongAxis(self: Backend, src: BufferHandle, indices: BufferHandle, dimension: i64, output_dims: []const i64) Error!?BufferHandle {
+        return backend.takeAlongAxis(self, src, indices, dimension, output_dims);
+    }
+
+    pub fn dotGeneral(self: Backend, lhs: BufferHandle, rhs: BufferHandle, lhs_batch_dimensions: []const i64, rhs_batch_dimensions: []const i64, lhs_contracting_dimensions: []const i64, rhs_contracting_dimensions: []const i64, output_dims: []const i64) Error!?BufferHandle {
+        return backend.dotGeneral(self, lhs, rhs, lhs_batch_dimensions, rhs_batch_dimensions, lhs_contracting_dimensions, rhs_contracting_dimensions, output_dims);
+    }
+
+    pub fn convolution(self: Backend, lhs: BufferHandle, rhs: BufferHandle, window_strides: []const i64, padding_low: []const i64, padding_high: []const i64, lhs_dilation: []const i64, rhs_dilation: []const i64, window_reversal: []const bool, feature_group_count: i64, output_dims: []const i64) Error!?BufferHandle {
+        return backend.convolution(self, lhs, rhs, window_strides, padding_low, padding_high, lhs_dilation, rhs_dilation, window_reversal, feature_group_count, output_dims);
+    }
+
+    pub fn cholesky(self: Backend, src: BufferHandle, lower: bool, output_dims: []const i64) Error!?BufferHandle {
+        return backend.cholesky(self, src, lower, output_dims);
+    }
+
+    pub fn triangularSolve(self: Backend, a: BufferHandle, b: BufferHandle, left_side: bool, lower: bool, unit_diagonal: bool, transpose_a: ir.TriangularSolveTranspose, output_dims: []const i64) Error!?BufferHandle {
+        return backend.triangularSolve(self, a, b, left_side, lower, unit_diagonal, transpose_a, output_dims);
+    }
+
+    pub fn fft(self: Backend, src: BufferHandle, fft_kind: ir.FftKind, fft_lengths: []const i64, output_dims: []const i64) Error!?BufferHandle {
+        return backend.fft(self, src, fft_kind, fft_lengths, output_dims);
+    }
+
+    pub fn rngBitGenerator(self: Backend, state: BufferHandle, output_type: ir.BufferType, output_dims: []const i64) Error!?RngBitGeneratorResult {
+        return backend.rngBitGenerator(self, state, output_type, output_dims);
+    }
+
+    pub fn rng(self: Backend, a: BufferHandle, b: BufferHandle, distribution: ir.RngDistribution, output_type: ir.BufferType, output_dims: []const i64) Error!?BufferHandle {
+        return backend.rng(self, a, b, distribution, output_type, output_dims);
+    }
+
+    pub fn reduce(self: Backend, src: BufferHandle, op: ir.PlanInstructionKind, dimensions: []const i64, output_dims: []const i64) Error!?BufferHandle {
+        return backend.reduce(self, src, op, dimensions, output_dims);
+    }
+
+    pub fn reduceMaxWithIndices(self: Backend, values: BufferHandle, indices: BufferHandle, dimensions: []const i64, output_dims: []const i64) Error!?ReduceMaxWithIndicesResult {
+        return backend.reduceMaxWithIndices(self, values, indices, dimensions, output_dims);
+    }
+
+    pub fn reduceWindow(self: Backend, src: BufferHandle, op: ir.PlanInstructionKind, window_dimensions: []const i64, window_strides: []const i64, base_dilations: []const i64, window_dilations: []const i64, padding_low: []const i64, padding_high: []const i64, output_dims: []const i64) Error!?BufferHandle {
+        return backend.reduceWindow(self, src, op, window_dimensions, window_strides, base_dilations, window_dilations, padding_low, padding_high, output_dims);
+    }
+
+    pub fn reduceWindowMaxWithIndices(self: Backend, values: BufferHandle, indices: BufferHandle, window_dimensions: []const i64, window_strides: []const i64, base_dilations: []const i64, window_dilations: []const i64, padding_low: []const i64, padding_high: []const i64, output_dims: []const i64) Error!?ReduceWindowMaxWithIndicesResult {
+        return backend.reduceWindowMaxWithIndices(self, values, indices, window_dimensions, window_strides, base_dilations, window_dilations, padding_low, padding_high, output_dims);
+    }
+
+    pub fn compare(self: Backend, lhs: BufferHandle, rhs: BufferHandle, direction: ir.CompareOp, output_dims: []const i64) Error!?BufferHandle {
+        return backend.compare(self, lhs, rhs, direction, output_dims);
+    }
+
+    pub fn select(self: Backend, pred: BufferHandle, on_true: BufferHandle, on_false: BufferHandle, output_dims: []const i64) Error!?BufferHandle {
+        return backend.select(self, pred, on_true, on_false, output_dims);
+    }
+
+    pub fn clamp(self: Backend, min: BufferHandle, value: BufferHandle, max: BufferHandle, output_dims: []const i64) Error!?BufferHandle {
+        return backend.clamp(self, min, value, max, output_dims);
+    }
+
+    pub fn compileExecutable(self: Backend, allocator: std.mem.Allocator, plan: *const ir.ExecutablePlan, device_local_hardware_ids: []const i32) Error!?ExecutableHandle {
+        return backend.compileExecutable(self, allocator, plan, device_local_hardware_ids);
+    }
+
+    pub fn writeExecutableLoweringDiagnostic(self: Backend, plan: *const ir.ExecutablePlan, device_local_hardware_ids: []const i32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        return backend.writeExecutableLoweringDiagnostic(self, plan, device_local_hardware_ids, writer);
+    }
+
+    pub fn executeExecutable(self: Backend, allocator: std.mem.Allocator, executable: ExecutableHandle, device_index: usize, arguments: []const BufferHandle) Error!?ExecutionResult {
+        return backend.executeExecutable(self, allocator, executable, device_index, arguments);
+    }
+
+    pub fn executionEventStatus(self: Backend, event: ExecutionEventHandle) Error!ExecutionEventStatus {
+        return backend.executionEventStatus(self, event);
+    }
+
+    pub fn destroyExecutionEvent(self: Backend, event: ExecutionEventHandle) void {
+        backend.destroyExecutionEvent(self, event);
+    }
+
+    pub fn executableStats(self: Backend, executable: ExecutableHandle) ExecutableStats {
+        return backend.executableStats(self, executable);
+    }
+
+    pub fn destroyExecutable(self: Backend, executable: ExecutableHandle) void {
+        backend.destroyExecutable(self, executable);
+    }
+
+    pub fn registerCustomCall(self: Backend, registration: CustomCallRegistration) Error!void {
+        return backend.registerCustomCall(self, registration);
+    }
+
+    pub fn unregisterCustomCall(self: Backend, target: []const u8) void {
+        backend.unregisterCustomCall(self, target);
+    }
+
+    pub fn customCallRegistryVersion(self: Backend) u64 {
+        return backend.customCallRegistryVersion(self);
+    }
+
+    pub fn copyToHost(self: Backend, src: BufferHandle, dst: []u8) Error!void {
+        return backend.copyToHost(self, src, dst);
+    }
+
+    pub fn destroyBuffer(self: Backend, buffer: BufferHandle) void {
+        backend.destroyBuffer(self, buffer);
+    }
+};
+
+pub fn create() Backend {
+    return .{};
 }
 
 fn capabilities(_: backend.Backend) backend.Capabilities {
     return .{
-        .kind = .metal_mlx,
         .name = "metal_mlx",
         .supports_device_buffers = true,
         .supports_unified_memory = true,
     };
 }
 
-fn enumerateDevices(_: backend.Backend, allocator: std.mem.Allocator, _: usize) backend.Error![]core.DeviceDescriptor {
-    var metal_devices: [core.MAX_DEVICES]c.PjrtxMlxMetalDeviceInfo = undefined;
-    const copied = c.pjrtx_mlx_metal_copy_devices(&metal_devices, core.MAX_DEVICES);
-    const count: usize = if (copied <= 0) 1 else @intCast(copied);
-    const devices = try allocator.alloc(core.DeviceDescriptor, count);
-    errdefer allocator.free(devices);
-
-    for (devices, 0..) |*device, i| {
-        const metal_device = if (copied > 0) metal_devices[i] else std.mem.zeroes(c.PjrtxMlxMetalDeviceInfo);
-        const name_bytes = if (copied > 0) cNameBytes(&metal_device.name) else "Metal/MLX device";
-        const name = try allocator.dupe(u8, name_bytes);
-        errdefer allocator.free(name);
-
-        var debug_buffer: [256]u8 = undefined;
-        var debug_writer = std.Io.Writer.fixed(&debug_buffer);
-        debug_writer.print("PjRTx Metal/MLX device {d}: {s}", .{ i, name }) catch return error.BufferAllocationFailed;
-        const debug_string = try allocator.dupe(u8, debug_writer.buffered());
-        errdefer allocator.free(debug_string);
-
-        const id: i32 = @intCast(i);
-        device.* = .{
-            .id = id,
-            .local_hardware_id = if (copied > 0) metal_device.ordinal else id,
-            .registry_id = if (copied > 0) metal_device.registry_id else 0,
-            .name = name,
-            .debug_string = debug_string,
-            .memory_bytes = if (copied > 0) metal_device.recommended_max_working_set_size else 0,
-            .has_unified_memory = copied <= 0 or metal_device.has_unified_memory != 0,
-            .default_memory_id = id,
-        };
-    }
-    return devices;
+fn enumerateDevices(_: backend.Backend, allocator: std.mem.Allocator, _: usize) backend.Error![]ir.DeviceDescriptor {
+    return device_mod.DeviceList.enumerate(allocator);
 }
 
-fn releaseDeviceDescriptors(_: backend.Backend, allocator: std.mem.Allocator, descriptors: []core.DeviceDescriptor) void {
-    for (descriptors) |descriptor| {
-        allocator.free(descriptor.name);
-        allocator.free(descriptor.debug_string);
-    }
-    allocator.free(descriptors);
+fn releaseDeviceDescriptors(_: backend.Backend, allocator: std.mem.Allocator, descriptors: []ir.DeviceDescriptor) void {
+    device_mod.DeviceList.release(allocator, descriptors);
 }
 
-fn bufferFromHost(_: backend.Backend, device_local_hardware_id: i32, element_type: core.BufferType, dims: []const i64, src: []const u8) backend.Error!?backend.BufferHandle {
-    if (src.len == 0) return null;
-    const dtype = mlxDtype(element_type) orelse return error.UnsupportedElementType;
-    const handle = c.pjrtx_mlx_metal_buffer_from_host_typed(device_local_hardware_id, src.ptr, src.len, dtype, dims.ptr, dims.len) orelse return error.BufferAllocationFailed;
-    return @ptrCast(handle);
+fn bufferFromHost(_: backend.Backend, device_local_hardware_id: i32, element_type: ir.BufferType, dims: []const i64, src: []const u8) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try buffer_mod.Buffer.fromHost(device_local_hardware_id, element_type, dims, src));
 }
 
-fn beginAsyncHostToDeviceTransfer(_: backend.Backend, device_local_hardware_id: i32, element_type: core.BufferType, dims: []const i64, byte_size: usize) backend.Error!?backend.AsyncHostToDeviceTransferHandle {
-    if (byte_size == 0) return null;
-    const dtype = mlxDtype(element_type) orelse return error.UnsupportedElementType;
-    const handle = c.pjrtx_mlx_metal_async_h2d_create(device_local_hardware_id, dtype, dims.ptr, dims.len, byte_size) orelse return error.BufferAllocationFailed;
-    return @ptrCast(handle);
+fn beginAsyncHostToDeviceTransfer(_: backend.Backend, device_local_hardware_id: i32, element_type: ir.BufferType, dims: []const i64, byte_size: usize) backend.Error!?backend.AsyncHostToDeviceTransferHandle {
+    const transfer = try async_transfer_mod.AsyncTransfer.begin(device_local_hardware_id, element_type, dims, byte_size);
+    return if (transfer) |value| value.toHandle() else null;
 }
 
 fn writeAsyncHostToDeviceTransfer(_: backend.Backend, transfer: backend.AsyncHostToDeviceTransferHandle, offset: usize, src: []const u8) backend.Error!void {
-    const ok = c.pjrtx_mlx_metal_async_h2d_write(@ptrCast(@alignCast(transfer)), offset, src.ptr, src.len);
-    if (ok == 0) return error.BufferCopyFailed;
+    try async_transfer_mod.AsyncTransfer.fromHandle(transfer).write(offset, src);
 }
 
 fn finishAsyncHostToDeviceTransfer(_: backend.Backend, transfer: backend.AsyncHostToDeviceTransferHandle) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_async_h2d_finish(@ptrCast(@alignCast(transfer))) orelse return error.BufferAllocationFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try async_transfer_mod.AsyncTransfer.fromHandle(transfer).finish());
 }
 
 fn destroyAsyncHostToDeviceTransfer(_: backend.Backend, transfer: backend.AsyncHostToDeviceTransferHandle) void {
-    c.pjrtx_mlx_metal_async_h2d_destroy(@ptrCast(@alignCast(transfer)));
+    async_transfer_mod.AsyncTransfer.fromHandle(transfer).destroy();
 }
 
-fn allocateBuffer(_: backend.Backend, device_local_hardware_id: i32, element_type: core.BufferType, dims: []const i64) backend.Error!?backend.BufferHandle {
-    const dtype = mlxDtype(element_type) orelse return error.UnsupportedElementType;
-    const handle = c.pjrtx_mlx_metal_buffer_zeros(device_local_hardware_id, dtype, dims.ptr, dims.len) orelse return error.BufferAllocationFailed;
-    return @ptrCast(handle);
+fn allocateBuffer(_: backend.Backend, device_local_hardware_id: i32, element_type: ir.BufferType, dims: []const i64) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try buffer_mod.Buffer.zeros(device_local_hardware_id, element_type, dims));
 }
 
-fn iota(_: backend.Backend, device_local_hardware_id: i32, element_type: core.BufferType, dims: []const i64, iota_dimension: i64) backend.Error!?backend.BufferHandle {
-    const dtype = mlxDtype(element_type) orelse return error.UnsupportedElementType;
-    const handle = c.pjrtx_mlx_metal_buffer_iota(device_local_hardware_id, dtype, dims.ptr, dims.len, iota_dimension) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+fn iota(_: backend.Backend, device_local_hardware_id: i32, element_type: ir.BufferType, dims: []const i64, iota_dimension: i64) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try buffer_mod.Buffer.iota(device_local_hardware_id, element_type, dims, iota_dimension));
 }
 
-fn partitionId(_: backend.Backend, device_local_hardware_id: i32, element_type: core.BufferType, partition_id: u32) backend.Error!?backend.BufferHandle {
-    const dtype = mlxDtype(element_type) orelse return error.UnsupportedElementType;
-    const handle = c.pjrtx_mlx_metal_buffer_partition_id(device_local_hardware_id, dtype, partition_id) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+fn partitionId(_: backend.Backend, device_local_hardware_id: i32, element_type: ir.BufferType, partition_id: u32) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try buffer_mod.Buffer.partitionId(device_local_hardware_id, element_type, partition_id));
 }
 
 fn cloneBuffer(_: backend.Backend, src: backend.BufferHandle) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_clone(@ptrCast(@alignCast(src))) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try bufferRef(src).clone());
 }
 
 fn zeroLike(_: backend.Backend, src: backend.BufferHandle) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_zero_like(@ptrCast(@alignCast(src))) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try bufferRef(src).zeroLike());
 }
 
 fn complex(_: backend.Backend, real: backend.BufferHandle, imag: backend.BufferHandle, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_complex(
-        @ptrCast(@alignCast(real)),
-        @ptrCast(@alignCast(imag)),
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try buffer_mod.Buffer.complex(bufferRef(real), bufferRef(imag), output_dims));
 }
 
 fn realPart(_: backend.Backend, src: backend.BufferHandle, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_real(
-        @ptrCast(@alignCast(src)),
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try bufferRef(src).realPart(output_dims));
 }
 
 fn imagPart(_: backend.Backend, src: backend.BufferHandle, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_imag(
-        @ptrCast(@alignCast(src)),
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try bufferRef(src).imagPart(output_dims));
 }
 
-fn convert(_: backend.Backend, src: backend.BufferHandle, output_type: core.BufferType) backend.Error!?backend.BufferHandle {
-    const dtype = mlxDtype(output_type) orelse return error.UnsupportedElementType;
-    const handle = c.pjrtx_mlx_metal_buffer_astype(@ptrCast(@alignCast(src)), dtype) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+fn convert(_: backend.Backend, src: backend.BufferHandle, output_type: ir.BufferType) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try bufferRef(src).convert(output_type));
 }
 
-fn bitcast(_: backend.Backend, src: backend.BufferHandle, output_type: core.BufferType, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const dtype = mlxDtype(output_type) orelse return error.UnsupportedElementType;
-    const handle = c.pjrtx_mlx_metal_buffer_view_dtype(@ptrCast(@alignCast(src)), dtype, output_dims.ptr, output_dims.len) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+fn bitcast(_: backend.Backend, src: backend.BufferHandle, output_type: ir.BufferType, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try bufferRef(src).bitcast(output_type, output_dims));
 }
 
-fn binary(_: backend.Backend, lhs: backend.BufferHandle, rhs: backend.BufferHandle, op: core.ElementwiseBinaryOp) backend.Error!?backend.BufferHandle {
-    const op_code = mlxBinaryOpCode(op) orelse return error.CommandSubmissionFailed;
-    const handle = c.pjrtx_mlx_metal_buffer_binary(@ptrCast(@alignCast(lhs)), @ptrCast(@alignCast(rhs)), op_code) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+fn binary(_: backend.Backend, lhs: backend.BufferHandle, rhs: backend.BufferHandle, op: ir.ElementwiseBinaryOp) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try buffer_mod.Buffer.binary(bufferRef(lhs), bufferRef(rhs), op));
 }
 
-fn binaryWithOutputDims(_: backend.Backend, lhs: backend.BufferHandle, rhs: backend.BufferHandle, op: core.ElementwiseBinaryOp, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const op_code = mlxBinaryOpCode(op) orelse return error.CommandSubmissionFailed;
-    const handle = c.pjrtx_mlx_metal_buffer_binary_out(@ptrCast(@alignCast(lhs)), @ptrCast(@alignCast(rhs)), op_code, output_dims.ptr, output_dims.len) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+fn binaryWithOutputDims(_: backend.Backend, lhs: backend.BufferHandle, rhs: backend.BufferHandle, op: ir.ElementwiseBinaryOp, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try buffer_mod.Buffer.binaryWithOutputDims(bufferRef(lhs), bufferRef(rhs), op, output_dims));
 }
 
-fn unary(_: backend.Backend, src: backend.BufferHandle, op: core.ElementwiseUnaryOp) backend.Error!?backend.BufferHandle {
-    const op_code = mlxUnaryOpCode(op) orelse return error.CommandSubmissionFailed;
-    const handle = c.pjrtx_mlx_metal_buffer_unary(@ptrCast(@alignCast(src)), op_code) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+fn unary(_: backend.Backend, src: backend.BufferHandle, op: ir.ElementwiseUnaryOp) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try bufferRef(src).unary(op));
 }
 
 fn reshape(_: backend.Backend, src: backend.BufferHandle, dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_reshape(@ptrCast(@alignCast(src)), dims.ptr, dims.len) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try bufferRef(src).reshape(dims));
 }
 
 fn transpose(_: backend.Backend, src: backend.BufferHandle, permutation: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_transpose(@ptrCast(@alignCast(src)), permutation.ptr, permutation.len) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try bufferRef(src).transpose(permutation));
 }
 
 fn broadcastInDim(_: backend.Backend, src: backend.BufferHandle, broadcast_dimensions: []const i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_broadcast_in_dim(@ptrCast(@alignCast(src)), broadcast_dimensions.ptr, broadcast_dimensions.len, output_dims.ptr, output_dims.len) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try bufferRef(src).broadcastInDim(broadcast_dimensions, output_dims));
 }
 
 fn slice(_: backend.Backend, src: backend.BufferHandle, start_indices: []const i64, limit_indices: []const i64, strides: []const i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_slice(@ptrCast(@alignCast(src)), start_indices.ptr, limit_indices.ptr, strides.ptr, start_indices.len, output_dims.ptr, output_dims.len) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try bufferRef(src).slice(start_indices, limit_indices, strides, output_dims));
 }
 
 fn dynamicSlice(_: backend.Backend, src: backend.BufferHandle, start_buffers: []const backend.BufferHandle, slice_sizes: []const i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    if (start_buffers.len != slice_sizes.len) return error.ShapeMismatch;
-    const handle = c.pjrtx_mlx_metal_buffer_dynamic_slice(
-        @ptrCast(@alignCast(src)),
-        @ptrCast(start_buffers.ptr),
-        start_buffers.len,
-        slice_sizes.ptr,
-        slice_sizes.len,
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try bufferRef(src).dynamicSlice(bufferRefs(start_buffers), slice_sizes, output_dims));
 }
 
 fn dynamicUpdateSlice(_: backend.Backend, src: backend.BufferHandle, update: backend.BufferHandle, start_buffers: []const backend.BufferHandle, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_dynamic_update_slice(
-        @ptrCast(@alignCast(src)),
-        @ptrCast(@alignCast(update)),
-        @ptrCast(start_buffers.ptr),
-        start_buffers.len,
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try bufferRef(src).dynamicUpdateSlice(bufferRef(update), bufferRefs(start_buffers), output_dims));
 }
 
 fn pad(_: backend.Backend, src: backend.BufferHandle, padding_value: backend.BufferHandle, edge_padding_low: []const i64, edge_padding_high: []const i64, interior_padding: []const i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_pad(
-        @ptrCast(@alignCast(src)),
-        @ptrCast(@alignCast(padding_value)),
-        edge_padding_low.ptr,
-        edge_padding_high.ptr,
-        interior_padding.ptr,
-        edge_padding_low.len,
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try bufferRef(src).pad(bufferRef(padding_value), edge_padding_low, edge_padding_high, interior_padding, output_dims));
 }
 
 fn reverse(_: backend.Backend, src: backend.BufferHandle, dimensions: []const i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_reverse(
-        @ptrCast(@alignCast(src)),
-        dimensions.ptr,
-        dimensions.len,
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try bufferRef(src).reverse(dimensions, output_dims));
 }
 
 fn concatenate(_: backend.Backend, lhs: backend.BufferHandle, rhs: backend.BufferHandle, dimension: i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_concatenate(@ptrCast(@alignCast(lhs)), @ptrCast(@alignCast(rhs)), dimension, output_dims.ptr, output_dims.len) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try buffer_mod.Buffer.concatenate(bufferRef(lhs), bufferRef(rhs), dimension, output_dims));
 }
 
 fn gatherAxis(_: backend.Backend, operand: backend.BufferHandle, indices: backend.BufferHandle, axis: i64, index_vector_dim: i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_gather_axis(
-        @ptrCast(@alignCast(operand)),
-        @ptrCast(@alignCast(indices)),
-        axis,
-        index_vector_dim,
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try buffer_mod.Buffer.gatherAxis(bufferRef(operand), bufferRef(indices), axis, index_vector_dim, output_dims));
 }
 
 fn gather(_: backend.Backend, operand: backend.BufferHandle, indices: backend.BufferHandle, start_index_map: []const i64, collapsed_slice_dims: []const i64, operand_batching_dims: []const i64, start_indices_batching_dims: []const i64, index_vector_dim: i64, slice_sizes: []const i64, offset_dims: []const i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_gather(
-        @ptrCast(@alignCast(operand)),
-        @ptrCast(@alignCast(indices)),
-        start_index_map.ptr,
-        start_index_map.len,
-        collapsed_slice_dims.ptr,
-        collapsed_slice_dims.len,
-        operand_batching_dims.ptr,
-        operand_batching_dims.len,
-        start_indices_batching_dims.ptr,
-        start_indices_batching_dims.len,
-        index_vector_dim,
-        slice_sizes.ptr,
-        slice_sizes.len,
-        offset_dims.ptr,
-        offset_dims.len,
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try buffer_mod.Buffer.gather(bufferRef(operand), bufferRef(indices), start_index_map, collapsed_slice_dims, operand_batching_dims, start_indices_batching_dims, index_vector_dim, slice_sizes, offset_dims, output_dims));
 }
 
-fn scatterAxis(_: backend.Backend, operand: backend.BufferHandle, indices: backend.BufferHandle, updates: backend.BufferHandle, axis: i64, index_vector_dim: i64, update_kind: core.ScatterUpdateKind, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_scatter_axis(
-        @ptrCast(@alignCast(operand)),
-        @ptrCast(@alignCast(indices)),
-        @ptrCast(@alignCast(updates)),
-        axis,
-        index_vector_dim,
-        mlxScatterUpdateCode(update_kind),
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+fn scatterAxis(_: backend.Backend, operand: backend.BufferHandle, indices: backend.BufferHandle, updates: backend.BufferHandle, axis: i64, index_vector_dim: i64, update_kind: ir.ScatterUpdateKind, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try buffer_mod.Buffer.scatterAxis(bufferRef(operand), bufferRef(indices), bufferRef(updates), axis, index_vector_dim, update_kind, output_dims));
 }
 
-fn scatter(_: backend.Backend, operand: backend.BufferHandle, indices: backend.BufferHandle, updates: backend.BufferHandle, scatter_dims_to_operand_dims: []const i64, inserted_window_dims: []const i64, update_window_dims: []const i64, input_batching_dims: []const i64, scatter_indices_batching_dims: []const i64, index_vector_dim: i64, update_kind: core.ScatterUpdateKind, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_scatter(
-        @ptrCast(@alignCast(operand)),
-        @ptrCast(@alignCast(indices)),
-        @ptrCast(@alignCast(updates)),
-        scatter_dims_to_operand_dims.ptr,
-        scatter_dims_to_operand_dims.len,
-        inserted_window_dims.ptr,
-        inserted_window_dims.len,
-        update_window_dims.ptr,
-        update_window_dims.len,
-        input_batching_dims.ptr,
-        input_batching_dims.len,
-        scatter_indices_batching_dims.ptr,
-        scatter_indices_batching_dims.len,
-        index_vector_dim,
-        mlxScatterUpdateCode(update_kind),
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+fn scatter(_: backend.Backend, operand: backend.BufferHandle, indices: backend.BufferHandle, updates: backend.BufferHandle, scatter_dims_to_operand_dims: []const i64, inserted_window_dims: []const i64, update_window_dims: []const i64, input_batching_dims: []const i64, scatter_indices_batching_dims: []const i64, index_vector_dim: i64, update_kind: ir.ScatterUpdateKind, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try buffer_mod.Buffer.scatter(bufferRef(operand), bufferRef(indices), bufferRef(updates), scatter_dims_to_operand_dims, inserted_window_dims, update_window_dims, input_batching_dims, scatter_indices_batching_dims, index_vector_dim, update_kind, output_dims));
 }
 
 fn sort(_: backend.Backend, src: backend.BufferHandle, dimension: i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_sort(
-        @ptrCast(@alignCast(src)),
-        dimension,
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try bufferRef(src).sort(dimension, output_dims));
 }
 
-fn argsort(_: backend.Backend, src: backend.BufferHandle, dimension: i64, output_type: core.BufferType, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const dtype = mlxDtype(output_type) orelse return error.UnsupportedElementType;
-    const handle = c.pjrtx_mlx_metal_buffer_argsort(
-        @ptrCast(@alignCast(src)),
-        dimension,
-        dtype,
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+fn argsort(_: backend.Backend, src: backend.BufferHandle, dimension: i64, output_type: ir.BufferType, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try bufferRef(src).argsort(dimension, output_type, output_dims));
 }
 
 fn takeAlongAxis(_: backend.Backend, src: backend.BufferHandle, indices: backend.BufferHandle, dimension: i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_take_along_axis(
-        @ptrCast(@alignCast(src)),
-        @ptrCast(@alignCast(indices)),
-        dimension,
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try bufferRef(src).takeAlongAxis(bufferRef(indices), dimension, output_dims));
 }
 
 fn dotGeneral(_: backend.Backend, lhs: backend.BufferHandle, rhs: backend.BufferHandle, lhs_batch_dimensions: []const i64, rhs_batch_dimensions: []const i64, lhs_contracting_dimensions: []const i64, rhs_contracting_dimensions: []const i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_dot_general(
-        @ptrCast(@alignCast(lhs)),
-        @ptrCast(@alignCast(rhs)),
-        lhs_batch_dimensions.ptr,
-        lhs_batch_dimensions.len,
-        rhs_batch_dimensions.ptr,
-        rhs_batch_dimensions.len,
-        lhs_contracting_dimensions.ptr,
-        lhs_contracting_dimensions.len,
-        rhs_contracting_dimensions.ptr,
-        rhs_contracting_dimensions.len,
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try buffer_mod.Buffer.dotGeneral(bufferRef(lhs), bufferRef(rhs), lhs_batch_dimensions, rhs_batch_dimensions, lhs_contracting_dimensions, rhs_contracting_dimensions, output_dims));
 }
 
 fn convolution(_: backend.Backend, lhs: backend.BufferHandle, rhs: backend.BufferHandle, window_strides: []const i64, padding_low: []const i64, padding_high: []const i64, lhs_dilation: []const i64, rhs_dilation: []const i64, window_reversal: []const bool, feature_group_count: i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const reversal_bytes: [*]const u8 = @ptrCast(window_reversal.ptr);
-    const handle = c.pjrtx_mlx_metal_buffer_convolution(
-        @ptrCast(@alignCast(lhs)),
-        @ptrCast(@alignCast(rhs)),
-        window_strides.ptr,
-        padding_low.ptr,
-        padding_high.ptr,
-        lhs_dilation.ptr,
-        rhs_dilation.ptr,
-        reversal_bytes,
-        window_strides.len,
-        feature_group_count,
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try buffer_mod.Buffer.convolution(bufferRef(lhs), bufferRef(rhs), window_strides, padding_low, padding_high, lhs_dilation, rhs_dilation, window_reversal, feature_group_count, output_dims));
 }
 
-fn fft(_: backend.Backend, src: backend.BufferHandle, kind_: core.FftKind, fft_lengths: []const i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_fft(
-        @ptrCast(@alignCast(src)),
-        mlxFftKindCode(kind_),
-        fft_lengths.ptr,
-        fft_lengths.len,
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+fn fft(_: backend.Backend, src: backend.BufferHandle, kind_: ir.FftKind, fft_lengths: []const i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try bufferRef(src).fft(kind_, fft_lengths, output_dims));
 }
 
-fn rng(_: backend.Backend, a: backend.BufferHandle, b: backend.BufferHandle, distribution: core.RngDistribution, output_type: core.BufferType, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const dtype = mlxDtype(output_type) orelse return error.UnsupportedElementType;
-    const handle = c.pjrtx_mlx_metal_buffer_rng(
-        @ptrCast(@alignCast(a)),
-        @ptrCast(@alignCast(b)),
-        mlxRngDistributionCode(distribution),
-        dtype,
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+fn rng(_: backend.Backend, a: backend.BufferHandle, b: backend.BufferHandle, distribution: ir.RngDistribution, output_type: ir.BufferType, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try buffer_mod.Buffer.rng(bufferRef(a), bufferRef(b), distribution, output_type, output_dims));
 }
 
-fn rngBitGenerator(_: backend.Backend, state: backend.BufferHandle, output_type: core.BufferType, output_dims: []const i64) backend.Error!?backend.RngBitGeneratorResult {
-    const dtype = mlxDtype(output_type) orelse return error.UnsupportedElementType;
-    var out_state: ?*c.PjrtxMlxMetalBuffer = null;
-    var out_bits: ?*c.PjrtxMlxMetalBuffer = null;
-    if (c.pjrtx_mlx_metal_buffer_rng_bit_generator(
-        @ptrCast(@alignCast(state)),
-        dtype,
-        output_dims.ptr,
-        output_dims.len,
-        &out_state,
-        &out_bits,
-    ) == 0) return error.CommandSubmissionFailed;
-    return .{
-        .state = @ptrCast(out_state orelse return error.CommandSubmissionFailed),
-        .bits = @ptrCast(out_bits orelse return error.CommandSubmissionFailed),
-    };
+fn rngBitGenerator(_: backend.Backend, state: backend.BufferHandle, output_type: ir.BufferType, output_dims: []const i64) backend.Error!?backend.RngBitGeneratorResult {
+    const pair = (try buffer_mod.Buffer.rngBitGenerator(bufferRef(state), output_type, output_dims)) orelse return null;
+    return .{ .state = pair.first.toHandle(), .bits = pair.second.toHandle() };
 }
 
 fn cholesky(_: backend.Backend, src: backend.BufferHandle, lower: bool, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_cholesky(
-        @ptrCast(@alignCast(src)),
-        if (lower) 1 else 0,
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try bufferRef(src).cholesky(lower, output_dims));
 }
 
-fn triangularSolve(_: backend.Backend, a: backend.BufferHandle, b: backend.BufferHandle, left_side: bool, lower: bool, unit_diagonal: bool, transpose_a: core.TriangularSolveTranspose, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_triangular_solve(
-        @ptrCast(@alignCast(a)),
-        @ptrCast(@alignCast(b)),
-        if (left_side) 1 else 0,
-        if (lower) 1 else 0,
-        if (unit_diagonal) 1 else 0,
-        triangularTransposeCode(transpose_a),
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+fn triangularSolve(_: backend.Backend, a: backend.BufferHandle, b: backend.BufferHandle, left_side: bool, lower: bool, unit_diagonal: bool, transpose_a: ir.TriangularSolveTranspose, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try buffer_mod.Buffer.triangularSolve(bufferRef(a), bufferRef(b), left_side, lower, unit_diagonal, transpose_a, output_dims));
 }
 
-fn reduce(_: backend.Backend, src: backend.BufferHandle, op: core.PlanInstructionKind, dimensions: []const i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const code: c_int = switch (op) {
-        .reduce_sum => c.PJRTX_MLX_METAL_REDUCE_SUM,
-        .reduce_max => c.PJRTX_MLX_METAL_REDUCE_MAX,
-        .reduce_min => c.PJRTX_MLX_METAL_REDUCE_MIN,
-        .reduce_and => c.PJRTX_MLX_METAL_REDUCE_AND,
-        .reduce_or => c.PJRTX_MLX_METAL_REDUCE_OR,
-        else => return error.CommandSubmissionFailed,
-    };
-    const handle = c.pjrtx_mlx_metal_buffer_reduce(@ptrCast(@alignCast(src)), code, dimensions.ptr, dimensions.len, output_dims.ptr, output_dims.len) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+fn reduce(_: backend.Backend, src: backend.BufferHandle, op: ir.PlanInstructionKind, dimensions: []const i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try bufferRef(src).reduce(op, dimensions, output_dims));
 }
 
 fn reduceMaxWithIndices(_: backend.Backend, values: backend.BufferHandle, indices: backend.BufferHandle, dimensions: []const i64, output_dims: []const i64) backend.Error!?backend.ReduceMaxWithIndicesResult {
-    var out_values: ?*c.PjrtxMlxMetalBuffer = null;
-    var out_indices: ?*c.PjrtxMlxMetalBuffer = null;
-    if (c.pjrtx_mlx_metal_buffer_reduce_max_with_indices(
-        @ptrCast(@alignCast(values)),
-        @ptrCast(@alignCast(indices)),
-        dimensions.ptr,
-        dimensions.len,
-        output_dims.ptr,
-        output_dims.len,
-        &out_values,
-        &out_indices,
-    ) == 0) return error.CommandSubmissionFailed;
-    return .{
-        .values = @ptrCast(out_values orelse return error.CommandSubmissionFailed),
-        .indices = @ptrCast(out_indices orelse return error.CommandSubmissionFailed),
-    };
+    const pair = (try buffer_mod.Buffer.reduceMaxWithIndices(bufferRef(values), bufferRef(indices), dimensions, output_dims)) orelse return null;
+    return .{ .values = pair.first.toHandle(), .indices = pair.second.toHandle() };
 }
 
-fn reduceWindow(_: backend.Backend, src: backend.BufferHandle, op: core.PlanInstructionKind, window_dimensions: []const i64, window_strides: []const i64, base_dilations: []const i64, window_dilations: []const i64, padding_low: []const i64, padding_high: []const i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const code: c_int = switch (op) {
-        .reduce_window_sum => c.PJRTX_MLX_METAL_REDUCE_SUM,
-        .reduce_window_max => c.PJRTX_MLX_METAL_REDUCE_MAX,
-        else => return error.CommandSubmissionFailed,
-    };
-    const handle = c.pjrtx_mlx_metal_buffer_reduce_window(
-        @ptrCast(@alignCast(src)),
-        code,
-        window_dimensions.ptr,
-        window_strides.ptr,
-        base_dilations.ptr,
-        window_dilations.ptr,
-        padding_low.ptr,
-        padding_high.ptr,
-        output_dims.len,
-        output_dims.ptr,
-        output_dims.len,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+fn reduceWindow(_: backend.Backend, src: backend.BufferHandle, op: ir.PlanInstructionKind, window_dimensions: []const i64, window_strides: []const i64, base_dilations: []const i64, window_dilations: []const i64, padding_low: []const i64, padding_high: []const i64, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try bufferRef(src).reduceWindow(op, window_dimensions, window_strides, base_dilations, window_dilations, padding_low, padding_high, output_dims));
 }
 
 fn reduceWindowMaxWithIndices(_: backend.Backend, values: backend.BufferHandle, indices: backend.BufferHandle, window_dimensions: []const i64, window_strides: []const i64, base_dilations: []const i64, window_dilations: []const i64, padding_low: []const i64, padding_high: []const i64, output_dims: []const i64) backend.Error!?backend.ReduceWindowMaxWithIndicesResult {
-    var out_values: ?*c.PjrtxMlxMetalBuffer = null;
-    var out_indices: ?*c.PjrtxMlxMetalBuffer = null;
-    if (c.pjrtx_mlx_metal_buffer_reduce_window_max_with_indices(
-        @ptrCast(@alignCast(values)),
-        @ptrCast(@alignCast(indices)),
-        window_dimensions.ptr,
-        window_strides.ptr,
-        base_dilations.ptr,
-        window_dilations.ptr,
-        padding_low.ptr,
-        padding_high.ptr,
-        output_dims.len,
-        output_dims.ptr,
-        output_dims.len,
-        &out_values,
-        &out_indices,
-    ) == 0) return error.CommandSubmissionFailed;
-    return .{
-        .values = @ptrCast(out_values orelse return error.CommandSubmissionFailed),
-        .indices = @ptrCast(out_indices orelse return error.CommandSubmissionFailed),
-    };
+    const pair = (try buffer_mod.Buffer.reduceWindowMaxWithIndices(bufferRef(values), bufferRef(indices), window_dimensions, window_strides, base_dilations, window_dilations, padding_low, padding_high, output_dims)) orelse return null;
+    return .{ .values = pair.first.toHandle(), .indices = pair.second.toHandle() };
 }
 
-fn compare(_: backend.Backend, lhs: backend.BufferHandle, rhs: backend.BufferHandle, direction: core.CompareOp, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_compare(@ptrCast(@alignCast(lhs)), @ptrCast(@alignCast(rhs)), mlxCompareOpCode(direction), output_dims.ptr, output_dims.len) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+fn compare(_: backend.Backend, lhs: backend.BufferHandle, rhs: backend.BufferHandle, direction: ir.CompareOp, output_dims: []const i64) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try buffer_mod.Buffer.compare(bufferRef(lhs), bufferRef(rhs), direction, output_dims));
 }
 
 fn select(_: backend.Backend, pred: backend.BufferHandle, on_true: backend.BufferHandle, on_false: backend.BufferHandle, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_select(@ptrCast(@alignCast(pred)), @ptrCast(@alignCast(on_true)), @ptrCast(@alignCast(on_false)), output_dims.ptr, output_dims.len) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try buffer_mod.Buffer.select(bufferRef(pred), bufferRef(on_true), bufferRef(on_false), output_dims));
 }
 
 fn clamp(_: backend.Backend, min: backend.BufferHandle, value: backend.BufferHandle, max: backend.BufferHandle, output_dims: []const i64) backend.Error!?backend.BufferHandle {
-    const handle = c.pjrtx_mlx_metal_buffer_clamp(@ptrCast(@alignCast(min)), @ptrCast(@alignCast(value)), @ptrCast(@alignCast(max)), output_dims.ptr, output_dims.len) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+    return maybeBufferHandle(try buffer_mod.Buffer.clamp(bufferRef(min), bufferRef(value), bufferRef(max), output_dims));
 }
 
-fn whileF32CompareAdd(_: backend.Backend, state: backend.BufferHandle, limit: backend.BufferHandle, step: backend.BufferHandle, compare_direction: core.CompareOp, update_op: core.ElementwiseBinaryOp, output_dims: []const i64, max_iterations: u64) backend.Error!?backend.BufferHandle {
-    const update_code = mlxBinaryOpCode(update_op) orelse return error.CommandSubmissionFailed;
-    const handle = c.pjrtx_mlx_metal_buffer_while_f32_compare_add(
-        @ptrCast(@alignCast(state)),
-        @ptrCast(@alignCast(limit)),
-        @ptrCast(@alignCast(step)),
-        mlxCompareOpCode(compare_direction),
-        update_code,
-        output_dims.ptr,
-        output_dims.len,
-        max_iterations,
-    ) orelse return error.CommandSubmissionFailed;
-    return @ptrCast(handle);
+fn whileF32CompareAdd(_: backend.Backend, state: backend.BufferHandle, limit: backend.BufferHandle, step: backend.BufferHandle, compare_direction: ir.CompareOp, update_op: ir.ElementwiseBinaryOp, output_dims: []const i64, max_iterations: u64) backend.Error!?backend.BufferHandle {
+    return maybeBufferHandle(try buffer_mod.Buffer.whileF32CompareAdd(bufferRef(state), bufferRef(limit), bufferRef(step), compare_direction, update_op, output_dims, max_iterations));
 }
 
 fn evalBuffer(buffer: backend.BufferHandle) backend.Error!void {
-    const ok = c.pjrtx_mlx_metal_buffer_eval(@ptrCast(@alignCast(buffer)));
-    if (ok == 0) return error.CommandSubmissionFailed;
+    try bufferRef(buffer).eval();
 }
 
 fn evalBuffers(buffers: []const backend.BufferHandle) backend.Error!void {
-    if (buffers.len == 0) return;
-    const ok = c.pjrtx_mlx_metal_buffer_eval_many(@ptrCast(buffers.ptr), buffers.len);
-    if (ok == 0) return error.CommandSubmissionFailed;
+    try buffer_mod.evalMany(bufferRefs(buffers));
+}
+
+fn copyToHost(_: backend.Backend, src: backend.BufferHandle, dst: []u8) backend.Error!void {
+    try bufferRef(src).copyToHost(dst);
+}
+
+fn destroyBuffer(_: backend.Backend, buffer: backend.BufferHandle) void {
+    bufferRef(buffer).destroy();
+}
+
+fn bufferRef(handle: backend.BufferHandle) buffer_mod.Buffer {
+    return buffer_mod.Buffer.fromHandle(handle);
+}
+
+fn bufferRefs(handles: []const backend.BufferHandle) []const buffer_mod.Buffer {
+    return @ptrCast(handles);
+}
+
+fn maybeBufferHandle(buffer: ?buffer_mod.Buffer) ?backend.BufferHandle {
+    return if (buffer) |value| value.toHandle() else null;
 }
 
 fn envFlag(comptime name: [:0]const u8) bool {
@@ -595,13 +631,11 @@ fn envFlag(comptime name: [:0]const u8) bool {
 }
 
 fn profileEnabled() bool {
-    return envFlag("PJRTX_PROFILE");
+    return profiling_mod.enabled();
 }
 
 fn profileVerbose() bool {
-    const value = std.c.getenv("PJRTX_PROFILE") orelse return false;
-    const text = std.mem.span(value);
-    return std.ascii.eqlIgnoreCase(text, "verbose") or std.ascii.eqlIgnoreCase(text, "2");
+    return profiling_mod.verbose();
 }
 
 fn programCompileEnabled() bool {
@@ -610,7 +644,7 @@ fn programCompileEnabled() bool {
     return text.len == 0 or (!std.mem.eql(u8, text, "0") and !std.ascii.eqlIgnoreCase(text, "false"));
 }
 
-fn planSupportsCompiledProgram(plan: *const core.ExecutablePlan) bool {
+fn planSupportsCompiledProgram(plan: *const ir.ExecutablePlan) bool {
     for (plan.instructions) |instruction| {
         switch (instruction.kind) {
             // The RNG path is device-native, but it uses a custom Metal kernel under MLX
@@ -622,89 +656,41 @@ fn planSupportsCompiledProgram(plan: *const core.ExecutablePlan) bool {
     return true;
 }
 
-fn profileStart(enabled: bool) i128 {
-    return if (enabled) @intCast(nowNs()) else 0;
+fn profileStart(enabled: bool) std.Io.Timestamp {
+    return profiling_mod.start(enabled);
 }
 
-fn profileElapsedUs(start_ns: i128) u64 {
-    if (start_ns == 0) return 0;
-    const elapsed_ns: i128 = @as(i128, @intCast(nowNs())) - start_ns;
-    if (elapsed_ns <= 0) return 0;
-    return @intCast(@divTrunc(elapsed_ns, 1000));
+fn profileElapsedUs(start: std.Io.Timestamp) u64 {
+    return profiling_mod.elapsedUs(start);
 }
 
-fn nowNs() u64 {
-    var info: MachTimebaseInfo = undefined;
-    if (mach_timebase_info(&info) != 0 or info.denom == 0) return mach_absolute_time();
-    const ticks: u128 = mach_absolute_time();
-    return @intCast((ticks * info.numer) / info.denom);
-}
+const ExecuteProfile = profiling_mod.Execute;
 
-const ExecuteProfile = struct {
-    wall_us: u64 = 0,
-    schedule_us: u64 = 0,
-    schedule_peak_us: u64 = 0,
-    node_us: u64 = 0,
-    node_peak_us: u64 = 0,
-    fusion_group_us: u64 = 0,
-    fusion_group_peak_us: u64 = 0,
-    materialization_eval_us: u64 = 0,
-    materialization_eval_peak_us: u64 = 0,
-    output_clone_us: u64 = 0,
-    output_clone_peak_us: u64 = 0,
-    compiled_program_us: u64 = 0,
-    compiled_program_peak_us: u64 = 0,
-};
-
-fn copyToHost(_: backend.Backend, src: backend.BufferHandle, dst: []u8) backend.Error!void {
-    const ok = c.pjrtx_mlx_metal_buffer_copy_to_host(@ptrCast(@alignCast(src)), dst.ptr, dst.len);
-    if (ok == 0) return error.BufferCopyFailed;
-}
-
-fn destroyBuffer(_: backend.Backend, buffer: backend.BufferHandle) void {
-    c.pjrtx_mlx_metal_buffer_destroy(@ptrCast(@alignCast(buffer)));
-}
-
-const CompiledExecutable = struct {
-    allocator: std.mem.Allocator,
-    plan: *const core.ExecutablePlan,
-    device_local_hardware_ids: []i32,
-    constant_handles: []?backend.BufferHandle,
-    while_constant_handles: []?backend.BufferHandle,
-    compiled_program_contexts: []CompiledProgramContext,
-    compiled_program_handles: []?*c.PjrtxMlxMetalProgram,
-    argument_capture_states: []ArgumentCaptureState,
-    argument_capture_mutex: std.atomic.Mutex = .unlocked,
-    program: backend.Program,
-    stats_mutex: std.atomic.Mutex = .unlocked,
-    stats: backend.ExecutableStats = .{},
-};
+const CompiledExecutable = executable_mod.Executable;
 
 const LoweringIssue = struct {
     instruction_index: ?usize = null,
-    value_id: ?core.ValueId = null,
-    op: ?core.PlanInstructionKind = null,
+    value_id: ?ir.ValueId = null,
+    op: ?ir.PlanInstructionKind = null,
     detail: []const u8,
     feature: []const u8 = "mlx-backend-executable",
 };
 
-const BuiltinCustomCallTarget = "pjrtx.mlx_metal.custom_binary_add_f32";
-const ScaledDotProductAttentionCustomCallTarget = "pjrtx.mlx_metal.scaled_dot_product_attention";
 const DefaultWhileMaxIterations: u64 = 1_000_000;
 const InitialCaptureSmallControlBytes: usize = 4096;
 
 const WhileF32LtAddPattern = struct {
-    limit: core.RegionValue,
+    limit: ir.RegionValue,
     step: WhilePatternOperand,
     state_index: usize = 0,
-    compare_direction: core.CompareOp = .lt,
-    update_op: core.ElementwiseBinaryOp = .add,
+    compare_direction: ir.CompareOp = .lt,
+    update_op: ir.ElementwiseBinaryOp = .add,
     state_count: usize = 1,
     max_iterations: u64 = DefaultWhileMaxIterations,
 };
 
 const WhilePatternOperand = struct {
-    value: core.RegionValue,
+    value: ir.RegionValue,
     producer_instruction_index: ?usize = null,
 };
 
@@ -713,109 +699,26 @@ const WhileOperandHandle = struct {
     owned: bool = false,
 };
 
-const CompiledProgramContext = struct {
-    executable: *CompiledExecutable,
-    device_index: usize,
-};
-
-const ArgumentCaptureState = struct {
-    previous_arguments: []?backend.BufferHandle = &.{},
-    dynamic_indices: []u64 = &.{},
-    program_handle: ?*c.PjrtxMlxMetalProgram = null,
-};
-
-const CustomCallSpecKind = enum {
-    identity,
-    unary,
-    binary,
-    metal_kernel_binary_add_f32,
-    scaled_dot_product_attention,
-};
-
-const CustomCallSpec = struct {
-    kind: CustomCallSpecKind,
-    unary_op: ?core.ElementwiseUnaryOp = null,
-    binary_op: ?core.ElementwiseBinaryOp = null,
-};
-
-const CustomCallEntry = struct {
-    target: []const u8,
-    spec: CustomCallSpec,
-};
-
-var custom_call_mutex: std.atomic.Mutex = .unlocked;
-var custom_call_registry: std.StringHashMapUnmanaged(CustomCallEntry) = .empty;
-var custom_call_registry_version: u64 = 0;
-
-fn lockCustomCallRegistry() void {
-    while (!custom_call_mutex.tryLock()) std.atomic.spinLoopHint();
-}
-
-fn unlockCustomCallRegistry() void {
-    custom_call_mutex.unlock();
-}
-
-fn validateCustomCallRegistration(registration: backend.CustomCallRegistration) backend.Error!CustomCallSpec {
-    if (registration.target.len == 0) return error.InvalidCustomCall;
-    return switch (registration.kind) {
-        .identity => .{ .kind = .identity },
-        .unary => .{
-            .kind = .unary,
-            .unary_op = registration.unary_op orelse return error.InvalidCustomCall,
-        },
-        .binary => .{
-            .kind = .binary,
-            .binary_op = registration.binary_op orelse return error.InvalidCustomCall,
-        },
-    };
-}
+const CompiledProgramContext = executable_mod.CompiledProgramContext;
+const ArgumentCaptureState = executable_mod.ArgumentCaptureState;
 
 fn registerCustomCall(_: backend.Backend, registration: backend.CustomCallRegistration) backend.Error!void {
-    const spec = try validateCustomCallRegistration(registration);
-    const target = std.heap.page_allocator.dupe(u8, registration.target) catch return error.OutOfMemory;
-    errdefer std.heap.page_allocator.free(target);
-
-    lockCustomCallRegistry();
-    defer unlockCustomCallRegistry();
-
-    if (custom_call_registry.fetchRemove(registration.target)) |removed| {
-        std.heap.page_allocator.free(removed.value.target);
-    }
-    custom_call_registry.put(std.heap.page_allocator, target, .{
-        .target = target,
-        .spec = spec,
-    }) catch return error.OutOfMemory;
-    custom_call_registry_version +|= 1;
+    return custom_call_mod.register(registration);
 }
 
 fn unregisterCustomCall(_: backend.Backend, target: []const u8) void {
-    lockCustomCallRegistry();
-    defer unlockCustomCallRegistry();
-
-    if (custom_call_registry.fetchRemove(target)) |removed| {
-        std.heap.page_allocator.free(removed.value.target);
-        custom_call_registry_version +|= 1;
-    }
+    custom_call_mod.unregister(target);
 }
 
 fn customCallRegistryVersion(_: backend.Backend) u64 {
-    lockCustomCallRegistry();
-    defer unlockCustomCallRegistry();
-    return custom_call_registry_version;
+    return custom_call_mod.version();
 }
 
-fn lookupCustomCall(target: []const u8) ?CustomCallSpec {
-    if (std.mem.eql(u8, target, "annotate_device_placement")) return .{ .kind = .identity };
-    if (std.mem.eql(u8, target, BuiltinCustomCallTarget)) return .{ .kind = .metal_kernel_binary_add_f32 };
-    if (std.mem.eql(u8, target, ScaledDotProductAttentionCustomCallTarget)) return .{ .kind = .scaled_dot_product_attention };
-
-    lockCustomCallRegistry();
-    defer unlockCustomCallRegistry();
-    const entry = custom_call_registry.get(target) orelse return null;
-    return entry.spec;
+fn lookupCustomCall(target: []const u8) ?custom_call_mod.Spec {
+    return custom_call_mod.lookup(target);
 }
 
-fn buildBackendProgram(allocator: std.mem.Allocator, plan: *const core.ExecutablePlan, diagnostic_writer: ?*std.Io.Writer) !backend.Program {
+fn buildBackendProgram(allocator: std.mem.Allocator, plan: *const ir.ExecutablePlan, diagnostic_writer: ?*std.Io.Writer) !backend.Program {
     var nodes = try allocator.alloc(backend.ProgramNode, plan.instructions.len);
     errdefer allocator.free(nodes);
     var initialized_nodes: usize = 0;
@@ -907,7 +810,7 @@ fn buildBackendProgram(allocator: std.mem.Allocator, plan: *const core.Executabl
         const node_inputs = try programNodeInputs(allocator, plan, instruction);
         var node_inputs_owned = true;
         errdefer if (node_inputs_owned) allocator.free(node_inputs);
-        const node_outputs = try allocator.dupe(core.ValueId, instruction.outputs);
+        const node_outputs = try allocator.dupe(ir.ValueId, instruction.outputs);
         var node_outputs_owned = true;
         errdefer if (node_outputs_owned) allocator.free(node_outputs);
         const node_subprograms = try buildNodeSubprograms(allocator, plan, instruction, instruction_index, subprograms, &initialized_subprograms);
@@ -952,7 +855,7 @@ fn buildBackendProgram(allocator: std.mem.Allocator, plan: *const core.Executabl
     for (plan.values, 0..) |value, value_index| {
         values[value_index] = .{
             .value_id = value.id,
-            .byte_size = core.denseByteSize(value.descriptor.element_type, value.descriptor.dims),
+            .byte_size = ir.denseByteSize(value.descriptor.element_type, value.descriptor.dims),
             .producer_node = value_producers[value_index],
             .last_use_node = last_uses[value_index],
             .is_output = output_values[value_index],
@@ -1048,7 +951,7 @@ fn buildBackendProgram(allocator: std.mem.Allocator, plan: *const core.Executabl
     return program;
 }
 
-fn countPlanSubprograms(plan: *const core.ExecutablePlan) !usize {
+fn countPlanSubprograms(plan: *const ir.ExecutablePlan) !usize {
     var count: usize = 0;
     for (plan.instructions) |instruction| {
         if (instruction.kind != .while_) continue;
@@ -1057,7 +960,7 @@ fn countPlanSubprograms(plan: *const core.ExecutablePlan) !usize {
     return count;
 }
 
-fn countPlanControlFlows(plan: *const core.ExecutablePlan) !usize {
+fn countPlanControlFlows(plan: *const ir.ExecutablePlan) !usize {
     var count: usize = 0;
     for (plan.instructions) |instruction| {
         if (instruction.kind == .while_) count += 1;
@@ -1067,8 +970,8 @@ fn countPlanControlFlows(plan: *const core.ExecutablePlan) !usize {
 
 fn buildNodeSubprograms(
     allocator: std.mem.Allocator,
-    plan: *const core.ExecutablePlan,
-    instruction: core.PlanInstruction,
+    plan: *const ir.ExecutablePlan,
+    instruction: ir.PlanInstruction,
     instruction_index: usize,
     subprograms: []backend.ProgramSubprogram,
     initialized_subprograms: *usize,
@@ -1093,7 +996,7 @@ fn buildNodeSubprograms(
 
 fn buildNodeControlFlow(
     allocator: std.mem.Allocator,
-    instruction: core.PlanInstruction,
+    instruction: ir.PlanInstruction,
     instruction_index: usize,
     node_subprograms: []const usize,
     subprograms: []const backend.ProgramSubprogram,
@@ -1105,9 +1008,9 @@ fn buildNodeControlFlow(
     if (node_subprograms[0] >= subprograms.len) return error.InvalidProgram;
     const condition = subprograms[node_subprograms[0]];
     if (condition.terminator_operands.len != 1) return error.InvalidProgram;
-    const state_inputs = try allocator.dupe(core.ValueId, instruction.inputs);
+    const state_inputs = try allocator.dupe(ir.ValueId, instruction.inputs);
     errdefer allocator.free(state_inputs);
-    const state_outputs = try allocator.dupe(core.ValueId, instruction.outputs);
+    const state_outputs = try allocator.dupe(ir.ValueId, instruction.outputs);
     errdefer allocator.free(state_outputs);
     const control_flow_index = initialized_control_flows.*;
     control_flows[control_flow_index] = .{
@@ -1126,22 +1029,22 @@ fn buildNodeControlFlow(
 
 fn cloneProgramSubprogram(
     allocator: std.mem.Allocator,
-    region: core.PlanRegion,
+    region: ir.PlanRegion,
     subprogram_id: usize,
     parent_node: usize,
 ) !backend.ProgramSubprogram {
     const values = try cloneRegionValueList(allocator, region.values);
-    errdefer freeRegionValueList(allocator, values);
+    errdefer program_mod.freeRegionValueList(allocator, values);
     const arguments = try cloneDescriptorList(allocator, region.argument_descriptors);
-    errdefer freeDescriptorList(allocator, arguments);
+    errdefer program_mod.freeDescriptorList(allocator, arguments);
     const instructions = try cloneRegionInstructionList(allocator, region.instructions);
-    errdefer freeRegionInstructionList(allocator, instructions);
+    errdefer program_mod.freeRegionInstructionList(allocator, instructions);
     const returns = try cloneDescriptorList(allocator, region.return_descriptors);
-    errdefer freeDescriptorList(allocator, returns);
-    const terminator_operand_ids = try allocator.dupe(core.RegionValueId, region.terminator_operands);
+    errdefer program_mod.freeDescriptorList(allocator, returns);
+    const terminator_operand_ids = try allocator.dupe(ir.RegionValueId, region.terminator_operands);
     errdefer allocator.free(terminator_operand_ids);
     const terminator_operand_descriptors = try cloneDescriptorList(allocator, region.terminator_operand_descriptors);
-    errdefer freeDescriptorList(allocator, terminator_operand_descriptors);
+    errdefer program_mod.freeDescriptorList(allocator, terminator_operand_descriptors);
     return .{
         .id = subprogram_id,
         .parent_node = parent_node,
@@ -1156,8 +1059,8 @@ fn cloneProgramSubprogram(
     };
 }
 
-fn cloneDescriptorList(allocator: std.mem.Allocator, source: []const core.BufferDescriptor) ![]const core.BufferDescriptor {
-    const descriptors = try allocator.alloc(core.BufferDescriptor, source.len);
+fn cloneDescriptorList(allocator: std.mem.Allocator, source: []const ir.BufferDescriptor) ![]const ir.BufferDescriptor {
+    const descriptors = try allocator.alloc(ir.BufferDescriptor, source.len);
     var initialized: usize = 0;
     errdefer {
         for (descriptors[0..initialized]) |descriptor| {
@@ -1180,8 +1083,8 @@ fn cloneDescriptorList(allocator: std.mem.Allocator, source: []const core.Buffer
     return descriptors;
 }
 
-fn cloneRegionValueList(allocator: std.mem.Allocator, source: []const core.RegionValue) ![]const core.RegionValue {
-    const values = try allocator.alloc(core.RegionValue, source.len);
+fn cloneRegionValueList(allocator: std.mem.Allocator, source: []const ir.RegionValue) ![]const ir.RegionValue {
+    const values = try allocator.alloc(ir.RegionValue, source.len);
     var initialized: usize = 0;
     errdefer {
         for (values[0..initialized]) |value| {
@@ -1217,27 +1120,27 @@ fn cloneRegionValueList(allocator: std.mem.Allocator, source: []const core.Regio
     return values;
 }
 
-fn cloneRegionInstructionList(allocator: std.mem.Allocator, source: []const core.RegionInstruction) ![]const core.RegionInstruction {
-    const instructions = try allocator.alloc(core.RegionInstruction, source.len);
+fn cloneRegionInstructionList(allocator: std.mem.Allocator, source: []const ir.RegionInstruction) ![]const ir.RegionInstruction {
+    const instructions = try allocator.alloc(ir.RegionInstruction, source.len);
     var initialized: usize = 0;
     errdefer {
         for (instructions[0..initialized]) |instruction| {
             if (instruction.inputs.len != 0) allocator.free(instruction.inputs);
             if (instruction.outputs.len != 0) allocator.free(instruction.outputs);
-            freeDescriptorList(allocator, instruction.operand_descriptors);
-            freeDescriptorList(allocator, instruction.result_descriptors);
+            program_mod.freeDescriptorList(allocator, instruction.operand_descriptors);
+            program_mod.freeDescriptorList(allocator, instruction.result_descriptors);
         }
         allocator.free(instructions);
     }
     for (source, instructions) |src, *dst| {
-        const inputs = try allocator.dupe(core.RegionValueId, src.inputs);
+        const inputs = try allocator.dupe(ir.RegionValueId, src.inputs);
         errdefer allocator.free(inputs);
-        const outputs = try allocator.dupe(core.RegionValueId, src.outputs);
+        const outputs = try allocator.dupe(ir.RegionValueId, src.outputs);
         errdefer allocator.free(outputs);
         const operands = try cloneDescriptorList(allocator, src.operand_descriptors);
-        errdefer freeDescriptorList(allocator, operands);
+        errdefer program_mod.freeDescriptorList(allocator, operands);
         const results = try cloneDescriptorList(allocator, src.result_descriptors);
-        errdefer freeDescriptorList(allocator, results);
+        errdefer program_mod.freeDescriptorList(allocator, results);
         dst.* = .{
             .kind = src.kind,
             .line = src.line,
@@ -1253,39 +1156,14 @@ fn cloneRegionInstructionList(allocator: std.mem.Allocator, source: []const core
     return instructions;
 }
 
-fn freeDescriptorList(allocator: std.mem.Allocator, descriptors: []const core.BufferDescriptor) void {
-    for (descriptors) |descriptor| {
-        if (descriptor.dims.len != 0) allocator.free(descriptor.dims);
-    }
-    if (descriptors.len != 0) allocator.free(descriptors);
-}
-
-fn freeRegionValueList(allocator: std.mem.Allocator, values: []const core.RegionValue) void {
-    for (values) |value| {
-        if (value.descriptor.dims.len != 0) allocator.free(value.descriptor.dims);
-        if (value.literal) |literal| allocator.free(literal);
-    }
-    if (values.len != 0) allocator.free(values);
-}
-
-fn freeRegionInstructionList(allocator: std.mem.Allocator, instructions: []const core.RegionInstruction) void {
-    for (instructions) |instruction| {
-        if (instruction.inputs.len != 0) allocator.free(instruction.inputs);
-        if (instruction.outputs.len != 0) allocator.free(instruction.outputs);
-        freeDescriptorList(allocator, instruction.operand_descriptors);
-        freeDescriptorList(allocator, instruction.result_descriptors);
-    }
-    if (instructions.len != 0) allocator.free(instructions);
-}
-
 fn deinitProgramSubprograms(allocator: std.mem.Allocator, subprograms: []backend.ProgramSubprogram) void {
     for (subprograms) |subprogram| {
-        freeRegionValueList(allocator, subprogram.values);
-        freeDescriptorList(allocator, subprogram.argument_descriptors);
-        freeRegionInstructionList(allocator, subprogram.instructions);
-        freeDescriptorList(allocator, subprogram.return_descriptors);
+        program_mod.freeRegionValueList(allocator, subprogram.values);
+        program_mod.freeDescriptorList(allocator, subprogram.argument_descriptors);
+        program_mod.freeRegionInstructionList(allocator, subprogram.instructions);
+        program_mod.freeDescriptorList(allocator, subprogram.return_descriptors);
         if (subprogram.terminator_operands.len != 0) allocator.free(subprogram.terminator_operands);
-        freeDescriptorList(allocator, subprogram.terminator_operand_descriptors);
+        program_mod.freeDescriptorList(allocator, subprogram.terminator_operand_descriptors);
     }
     if (subprograms.len != 0) allocator.free(subprograms);
 }
@@ -1298,19 +1176,19 @@ fn deinitProgramControlFlows(allocator: std.mem.Allocator, control_flows: []back
     if (control_flows.len != 0) allocator.free(control_flows);
 }
 
-fn programNodeInputs(allocator: std.mem.Allocator, plan: *const core.ExecutablePlan, instruction: core.PlanInstruction) ![]const core.ValueId {
+fn programNodeInputs(allocator: std.mem.Allocator, plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction) ![]const ir.ValueId {
     if (instruction.kind != .get_tuple_element or instruction.inputs.len == 0) {
-        return allocator.dupe(core.ValueId, instruction.inputs);
+        return allocator.dupe(ir.ValueId, instruction.inputs);
     }
     const tuple_id = instruction.inputs[0];
-    if (tuple_id.index >= plan.values.len) return allocator.dupe(core.ValueId, instruction.inputs);
+    if (tuple_id.index >= plan.values.len) return allocator.dupe(ir.ValueId, instruction.inputs);
     const tuple_value = plan.values[tuple_id.index];
-    if (tuple_value.storage != .tuple) return allocator.dupe(core.ValueId, instruction.inputs);
-    const tuple_index = instruction.tuple_index orelse return allocator.dupe(core.ValueId, instruction.inputs);
+    if (tuple_value.storage != .tuple) return allocator.dupe(ir.ValueId, instruction.inputs);
+    const tuple_index = instruction.tuple_index orelse return allocator.dupe(ir.ValueId, instruction.inputs);
     if (tuple_index < 0 or tuple_index >= @as(i64, @intCast(tuple_value.elements.len))) {
-        return allocator.dupe(core.ValueId, instruction.inputs);
+        return allocator.dupe(ir.ValueId, instruction.inputs);
     }
-    return allocator.dupe(core.ValueId, &.{ tuple_id, tuple_value.elements[@intCast(tuple_index)] });
+    return allocator.dupe(ir.ValueId, &.{ tuple_id, tuple_value.elements[@intCast(tuple_index)] });
 }
 
 fn buildFusionGroups(
@@ -1408,12 +1286,12 @@ fn groupMarkIndex(value_count: usize, group_id: usize, value_index: usize) usize
     return group_id * value_count + value_index;
 }
 
-fn markedValueIds(allocator: std.mem.Allocator, values: []const backend.ProgramValue, marks: []const bool) ![]const core.ValueId {
+fn markedValueIds(allocator: std.mem.Allocator, values: []const backend.ProgramValue, marks: []const bool) ![]const ir.ValueId {
     var count: usize = 0;
     for (marks) |mark| {
         if (mark) count += 1;
     }
-    const ids = try allocator.alloc(core.ValueId, count);
+    const ids = try allocator.alloc(ir.ValueId, count);
     var index: usize = 0;
     for (values, marks) |value, mark| {
         if (!mark) continue;
@@ -1423,7 +1301,7 @@ fn markedValueIds(allocator: std.mem.Allocator, values: []const backend.ProgramV
     return ids;
 }
 
-fn programNodeKind(instruction_kind: core.PlanInstructionKind) backend.ProgramNodeKind {
+fn programNodeKind(instruction_kind: ir.PlanInstructionKind) backend.ProgramNodeKind {
     return switch (instruction_kind) {
         .constant => .constant,
         .copy_arg0 => .parameter,
@@ -1438,7 +1316,7 @@ fn programNodeKind(instruction_kind: core.PlanInstructionKind) backend.ProgramNo
     };
 }
 
-fn instructionMaterializes(instruction_kind: core.PlanInstructionKind) bool {
+fn instructionMaterializes(instruction_kind: ir.PlanInstructionKind) bool {
     return switch (instruction_kind) {
         .tuple, .get_tuple_element, .reshape, .transpose, .broadcast_in_dim, .slice => false,
         else => true,
@@ -1452,7 +1330,7 @@ fn programNodeFusible(node_kind: backend.ProgramNodeKind) bool {
     };
 }
 
-fn compileExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator, plan: *const core.ExecutablePlan, device_local_hardware_ids: []const i32) backend.Error!?backend.ExecutableHandle {
+fn compileExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator, plan: *const ir.ExecutablePlan, device_local_hardware_ids: []const i32) backend.Error!?backend.ExecutableHandle {
     if (executableLoweringIssue(plan, device_local_hardware_ids)) |_| return null;
 
     const executable = try allocator.create(CompiledExecutable);
@@ -1482,7 +1360,7 @@ fn compileExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
     errdefer destroyConstantHandles(backend_impl, while_constant_handles);
     const compiled_program_contexts = try allocator.alloc(CompiledProgramContext, device_local_hardware_ids.len);
     errdefer allocator.free(compiled_program_contexts);
-    const compiled_program_handles = try allocator.alloc(?*c.PjrtxMlxMetalProgram, device_local_hardware_ids.len);
+    const compiled_program_handles = try allocator.alloc(?mlx_call.ProgramHandle, device_local_hardware_ids.len);
     errdefer allocator.free(compiled_program_handles);
     @memset(compiled_program_handles, null);
     errdefer destroyCompiledPrograms(compiled_program_handles);
@@ -1578,7 +1456,7 @@ fn compileExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
     }
     if (programCompileEnabled() and planSupportsCompiledProgram(plan)) {
         for (compiled_program_handles, 0..) |*handle_slot, device_index| {
-            handle_slot.* = c.pjrtx_mlx_metal_program_create(
+            handle_slot.* = mlx_call.programCreate(
                 &compiled_program_contexts[device_index],
                 plan.parameter_shardings.len,
                 plan.output_ids.len,
@@ -1589,7 +1467,7 @@ fn compileExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
     return @ptrCast(executable);
 }
 
-fn writeExecutableLoweringDiagnostic(_: backend.Backend, plan: *const core.ExecutablePlan, device_local_hardware_ids: []const i32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+fn writeExecutableLoweringDiagnostic(_: backend.Backend, plan: *const ir.ExecutablePlan, device_local_hardware_ids: []const i32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     if (executableLoweringIssue(plan, device_local_hardware_ids)) |issue| {
         try writeLoweringIssue(plan, issue, writer);
         return;
@@ -1764,7 +1642,7 @@ fn executeExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
             .handle = handle,
             .element_type = descriptor.element_type,
             .dims = descriptor.dims,
-            .byte_size = core.denseByteSize(descriptor.element_type, descriptor.dims),
+            .byte_size = ir.denseByteSize(descriptor.element_type, descriptor.dims),
         };
         initialized += 1;
     }
@@ -1790,29 +1668,18 @@ fn executeCompiledProgram(
     backend_impl: backend.Backend,
     allocator: std.mem.Allocator,
     executable: *CompiledExecutable,
-    compiled_program: *c.PjrtxMlxMetalProgram,
+    compiled_program: mlx_call.ProgramHandle,
     arguments: []const backend.BufferHandle,
     donated_input_indices: []const u64,
     profile: *ExecuteProfile,
 ) backend.Error![]backend.ExecutableOutput {
     const profile_enabled = profileEnabled();
     const execute_start_ns = profileStart(profile_enabled);
-    var raw_outputs: [*c]?*c.PjrtxMlxMetalBuffer = null;
-    var raw_output_count: u64 = 0;
-    const ok = c.pjrtx_mlx_metal_program_execute_with_donation(
-        compiled_program,
-        @ptrCast(arguments.ptr),
-        arguments.len,
-        if (donated_input_indices.len == 0) null else donated_input_indices.ptr,
-        donated_input_indices.len,
-        &raw_outputs,
-        &raw_output_count,
-    );
-    if (ok == 0 or raw_outputs == null or raw_output_count != executable.plan.output_ids.len) {
-        if (raw_outputs != null) c.pjrtx_mlx_metal_program_output_array_destroy(raw_outputs);
+    const program_outputs = mlx_call.programExecuteWithDonation(compiled_program, arguments, donated_input_indices) orelse return error.CommandSubmissionFailed;
+    defer program_outputs.deinit();
+    if (program_outputs.len() != executable.plan.output_ids.len) {
         return error.CommandSubmissionFailed;
     }
-    defer c.pjrtx_mlx_metal_program_output_array_destroy(raw_outputs);
 
     const outputs = try allocator.alloc(backend.ExecutableOutput, executable.plan.output_ids.len);
     errdefer allocator.free(outputs);
@@ -1822,17 +1689,16 @@ fn executeCompiledProgram(
     }
 
     for (outputs, 0..) |*output, output_index| {
-        const raw = raw_outputs[output_index] orelse return error.CommandSubmissionFailed;
+        const handle = program_outputs.take(output_index) orelse return error.CommandSubmissionFailed;
         const output_id = executable.plan.output_ids[output_index];
         if (output_id.index >= executable.plan.values.len) return error.CommandSubmissionFailed;
         const descriptor = executable.plan.values[output_id.index].descriptor;
         output.* = .{
-            .handle = @ptrCast(raw),
+            .handle = @ptrCast(handle),
             .element_type = descriptor.element_type,
             .dims = descriptor.dims,
-            .byte_size = core.denseByteSize(descriptor.element_type, descriptor.dims),
+            .byte_size = ir.denseByteSize(descriptor.element_type, descriptor.dims),
         };
-        raw_outputs[output_index] = null;
         initialized += 1;
     }
     if (profile_enabled) {
@@ -1848,7 +1714,7 @@ fn executeCompiledProgram(
 
 fn donatedProgramInputIndices(
     allocator: std.mem.Allocator,
-    plan: *const core.ExecutablePlan,
+    plan: *const ir.ExecutablePlan,
     dynamic_indices: ?[]const u64,
 ) backend.Error![]const u64 {
     var donated: std.ArrayList(u64) = .empty;
@@ -1869,7 +1735,7 @@ fn donatedProgramInputIndices(
     return try donated.toOwnedSlice(allocator);
 }
 
-fn parameterFeedsIdentityOutput(plan: *const core.ExecutablePlan, parameter_index: u32) bool {
+fn parameterFeedsIdentityOutput(plan: *const ir.ExecutablePlan, parameter_index: u32) bool {
     for (plan.output_aliases) |alias| {
         if (alias.parameter_index == parameter_index and alias.kind == .identity) return true;
     }
@@ -1909,14 +1775,13 @@ fn maybeCreateInitialArgumentCapturedProgram(
         return;
     }
 
-    const program = c.pjrtx_mlx_metal_program_create_with_captures(
+    const program = mlx_call.programCreateWithCaptures(
         &executable.compiled_program_contexts[device_index],
         arguments.len,
         executable.plan.output_ids.len,
         compiledProgramBuildCallback,
-        @ptrCast(arguments.ptr),
-        dynamic_indices.ptr,
-        dynamic_indices.len,
+        arguments,
+        dynamic_indices,
     ) orelse {
         executable.allocator.free(dynamic_indices);
         return;
@@ -1930,7 +1795,7 @@ fn maybeCreateInitialArgumentCapturedProgram(
     };
 }
 
-fn initialArgumentCaptureDynamicIndices(allocator: std.mem.Allocator, plan: *const core.ExecutablePlan) ![]u64 {
+fn initialArgumentCaptureDynamicIndices(allocator: std.mem.Allocator, plan: *const ir.ExecutablePlan) ![]u64 {
     var dynamic: std.ArrayList(u64) = .empty;
     errdefer dynamic.deinit(allocator);
 
@@ -1945,12 +1810,12 @@ fn initialArgumentCaptureDynamicIndices(allocator: std.mem.Allocator, plan: *con
     return try dynamic.toOwnedSlice(allocator);
 }
 
-fn initiallyDynamicParameter(plan: *const core.ExecutablePlan, parameter_index: u32, descriptor: core.BufferDescriptor) bool {
+fn initiallyDynamicParameter(plan: *const ir.ExecutablePlan, parameter_index: u32, descriptor: ir.BufferDescriptor) bool {
     for (plan.donated_parameter_indices) |donated_index| {
         if (donated_index == parameter_index) return true;
     }
 
-    const byte_size = core.denseByteSize(descriptor.element_type, descriptor.dims);
+    const byte_size = ir.denseByteSize(descriptor.element_type, descriptor.dims);
     if (byte_size == 0 or byte_size > InitialCaptureSmallControlBytes) return false;
     return switch (descriptor.element_type) {
         .pred, .s8, .s16, .s32, .s64, .u8, .u16, .u32, .u64 => true,
@@ -2044,14 +1909,13 @@ fn updateArgumentCaptureState(
         }
     }
 
-    const program = c.pjrtx_mlx_metal_program_create_with_captures(
+    const program = mlx_call.programCreateWithCaptures(
         &executable.compiled_program_contexts[device_index],
         arguments.len,
         executable.plan.output_ids.len,
         compiledProgramBuildCallback,
-        @ptrCast(arguments.ptr),
-        dynamic_indices.ptr,
-        dynamic_indices.len,
+        arguments,
+        dynamic_indices,
     ) orelse {
         executable.allocator.free(dynamic_indices);
         try rememberArgumentCaptureBaseline(executable.allocator, state, arguments);
@@ -2079,7 +1943,7 @@ fn rememberArgumentCaptureBaseline(
 }
 
 fn resetArgumentCaptureState(allocator: std.mem.Allocator, state: *ArgumentCaptureState) void {
-    if (state.program_handle) |program| c.pjrtx_mlx_metal_program_destroy(program);
+    if (state.program_handle) |program| mlx_call.programDestroy(program);
     state.program_handle = null;
     allocator.free(state.previous_arguments);
     state.previous_arguments = &.{};
@@ -2089,21 +1953,17 @@ fn resetArgumentCaptureState(allocator: std.mem.Allocator, state: *ArgumentCaptu
 
 fn compiledProgramBuildCallback(
     user_data: ?*anyopaque,
-    raw_inputs: [*c]const ?*c.PjrtxMlxMetalBuffer,
-    input_count: u64,
-    raw_outputs: [*c]?*c.PjrtxMlxMetalBuffer,
-    output_count: u64,
-) callconv(.c) c_int {
-    const context: *CompiledProgramContext = @ptrCast(@alignCast(user_data orelse return 0));
+    call: mlx_call.ProgramBuildCall,
+) bool {
+    const context: *CompiledProgramContext = @ptrCast(@alignCast(user_data orelse return false));
     const executable = context.executable;
     const allocator = executable.allocator;
-    if (input_count != executable.plan.parameter_shardings.len or output_count != executable.plan.output_ids.len) return 0;
+    if (call.inputCount() != executable.plan.parameter_shardings.len or call.outputCount() != executable.plan.output_ids.len) return false;
 
-    const arguments = allocator.alloc(backend.BufferHandle, @intCast(input_count)) catch return 0;
+    const arguments = allocator.alloc(backend.BufferHandle, call.inputCount()) catch return false;
     defer allocator.free(arguments);
     for (arguments, 0..) |*argument, index| {
-        const raw = raw_inputs[index] orelse return 0;
-        argument.* = @ptrCast(raw);
+        argument.* = call.input(index) orelse return false;
     }
 
     const outputs = buildExecutableOutputHandlesForCompiledTrace(
@@ -2112,16 +1972,16 @@ fn compiledProgramBuildCallback(
         executable,
         context.device_index,
         arguments,
-    ) catch return 0;
+    ) catch return false;
     defer allocator.free(outputs);
-    if (outputs.len != output_count) {
+    if (outputs.len != call.outputCount()) {
         for (outputs) |output| destroyBuffer(create(), output.handle);
-        return 0;
+        return false;
     }
     for (outputs, 0..) |output, index| {
-        raw_outputs[index] = @ptrCast(@alignCast(output.handle));
+        if (!call.setOutput(index, output.handle)) return false;
     }
-    return 1;
+    return true;
 }
 
 fn buildExecutableOutputHandlesForCompiledTrace(
@@ -2189,7 +2049,7 @@ fn buildExecutableOutputHandlesForCompiledTrace(
             .handle = handle,
             .element_type = descriptor.element_type,
             .dims = descriptor.dims,
-            .byte_size = core.denseByteSize(descriptor.element_type, descriptor.dims),
+            .byte_size = ir.denseByteSize(descriptor.element_type, descriptor.dims),
         };
         initialized += 1;
     }
@@ -2752,7 +2612,7 @@ fn executeControlFlowNode(
     value_handles: []?backend.BufferHandle,
     value_owned: []bool,
     node: backend.ProgramNode,
-    instruction: core.PlanInstruction,
+    instruction: ir.PlanInstruction,
     release_inputs: bool,
 ) backend.Error!?void {
     const control_flow_index = node.control_flow orelse return error.CommandSubmissionFailed;
@@ -2824,10 +2684,10 @@ fn executeControlFlowNode(
 fn whilePatternOperandHandle(
     executable: *CompiledExecutable,
     value_handles: []const ?backend.BufferHandle,
-    instruction: core.PlanInstruction,
+    instruction: ir.PlanInstruction,
     device_index: usize,
     control_flow_index: usize,
-    value: core.RegionValue,
+    value: ir.RegionValue,
     constant_slot: usize,
 ) backend.Error!backend.BufferHandle {
     return switch (value.role) {
@@ -2847,7 +2707,7 @@ fn whileStepOperandHandle(
     backend_impl: backend.Backend,
     executable: *CompiledExecutable,
     value_handles: []const ?backend.BufferHandle,
-    instruction: core.PlanInstruction,
+    instruction: ir.PlanInstruction,
     device_index: usize,
     control_flow_index: usize,
     body: backend.ProgramSubprogram,
@@ -2875,9 +2735,9 @@ fn whileStepOperandHandle(
 fn executeLoopInvariantRegionInstruction(
     backend_impl: backend.Backend,
     value_handles: []const ?backend.BufferHandle,
-    parent_instruction: core.PlanInstruction,
+    parent_instruction: ir.PlanInstruction,
     subprogram: backend.ProgramSubprogram,
-    instruction: core.RegionInstruction,
+    instruction: ir.RegionInstruction,
 ) backend.Error!?backend.BufferHandle {
     if (instruction.outputs.len != 1 or instruction.result_descriptors.len != 1) return null;
     const output_dims = instruction.result_descriptors[0].dims;
@@ -2895,9 +2755,9 @@ fn executeLoopInvariantRegionInstruction(
 
 fn loopInvariantRegionOperandHandle(
     value_handles: []const ?backend.BufferHandle,
-    parent_instruction: core.PlanInstruction,
+    parent_instruction: ir.PlanInstruction,
     subprogram: backend.ProgramSubprogram,
-    value_id: core.RegionValueId,
+    value_id: ir.RegionValueId,
 ) backend.Error!backend.BufferHandle {
     const value = regionValueById(subprogram, value_id) orelse return error.CommandSubmissionFailed;
     if (value.role != .argument) return error.CommandSubmissionFailed;
@@ -3081,7 +2941,7 @@ fn releaseDeadInputs(
     program: *const backend.Program,
     value_handles: []?backend.BufferHandle,
     value_owned: []bool,
-    input_ids: []const core.ValueId,
+    input_ids: []const ir.ValueId,
     instruction_index: usize,
 ) usize {
     var released: usize = 0;
@@ -3184,9 +3044,9 @@ fn destroyConstantHandles(backend_impl: backend.Backend, constant_handles: []?ba
     }
 }
 
-fn destroyCompiledPrograms(handles: []?*c.PjrtxMlxMetalProgram) void {
+fn destroyCompiledPrograms(handles: []?mlx_call.ProgramHandle) void {
     for (handles) |maybe_handle| {
-        if (maybe_handle) |handle| c.pjrtx_mlx_metal_program_destroy(handle);
+        if (maybe_handle) |handle| mlx_call.programDestroy(handle);
     }
 }
 
@@ -3195,14 +3055,14 @@ fn destroyArgumentCaptureStates(allocator: std.mem.Allocator, states: []Argument
 }
 
 fn constantIndex(instruction_count: usize, device_index: usize, instruction_index: usize) usize {
-    return device_index * instruction_count + instruction_index;
+    return executable_mod.constantIndex(instruction_count, device_index, instruction_index);
 }
 
 fn whileConstantIndex(control_flow_count: usize, device_index: usize, control_flow_index: usize, constant_index: usize) usize {
-    return ((device_index * control_flow_count) + control_flow_index) * 2 + constant_index;
+    return executable_mod.whileConstantIndex(control_flow_count, device_index, control_flow_index, constant_index);
 }
 
-fn executableSupportsInstruction(kind_: core.PlanInstructionKind) bool {
+fn executableSupportsInstruction(kind_: ir.PlanInstructionKind) bool {
     return switch (kind_) {
         .constant,
         .iota,
@@ -3291,7 +3151,7 @@ fn executableSupportsInstruction(kind_: core.PlanInstructionKind) bool {
     };
 }
 
-fn executableLoweringIssue(plan: *const core.ExecutablePlan, device_local_hardware_ids: []const i32) ?LoweringIssue {
+fn executableLoweringIssue(plan: *const ir.ExecutablePlan, device_local_hardware_ids: []const i32) ?LoweringIssue {
     if (device_local_hardware_ids.len == 0) return .{
         .detail = "backend executable requires at least one device",
         .feature = "mlx-device-assignment",
@@ -3343,7 +3203,7 @@ fn executableLoweringIssue(plan: *const core.ExecutablePlan, device_local_hardwa
     return null;
 }
 
-fn instructionLoweringIssue(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn instructionLoweringIssue(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const output_descriptor = plan.values[output_id.index].descriptor;
     return switch (instruction.kind) {
         .constant => if (instruction.literal == null) .{
@@ -3444,7 +3304,7 @@ fn instructionLoweringIssue(plan: *const core.ExecutablePlan, instruction: core.
     };
 }
 
-fn validateBitcastConvertLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateBitcastConvertLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     if (instruction.inputs.len != 1 or instruction.outputs.len != 1) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
@@ -3460,14 +3320,14 @@ fn validateBitcastConvertLowering(plan: *const core.ExecutablePlan, instruction:
         .feature = "mlx-bitcast",
     };
     const output = plan.values[output_id.index].descriptor;
-    if (mlxDtype(input.element_type) == null or mlxDtype(output.element_type) == null) return .{
+    if (!buffer_mod.supportsElementType(input.element_type) or !buffer_mod.supportsElementType(output.element_type)) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
         .op = instruction.kind,
         .detail = "bitcast_convert lowering requires MLX-supported input and output dtypes",
         .feature = "mlx-bitcast-dtype",
     };
-    if (core.denseByteSize(input.element_type, input.dims) != core.denseByteSize(output.element_type, output.dims)) return .{
+    if (ir.denseByteSize(input.element_type, input.dims) != ir.denseByteSize(output.element_type, output.dims)) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
         .op = instruction.kind,
@@ -3477,7 +3337,7 @@ fn validateBitcastConvertLowering(plan: *const core.ExecutablePlan, instruction:
     return null;
 }
 
-fn validatePartitionIdLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validatePartitionIdLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const output = plan.values[output_id.index].descriptor;
     if (instruction.inputs.len != 0 or instruction.outputs.len != 1) return .{
         .instruction_index = instruction_index,
@@ -3503,7 +3363,7 @@ fn validatePartitionIdLowering(plan: *const core.ExecutablePlan, instruction: co
     return null;
 }
 
-fn validateRngLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateRngLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     if (instruction.inputs.len != 2 or instruction.outputs.len != 1) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
@@ -3557,7 +3417,7 @@ fn validateRngLowering(plan: *const core.ExecutablePlan, instruction: core.PlanI
     return null;
 }
 
-fn validateCustomCallLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateCustomCallLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const target = instruction.custom_call_target orelse return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
@@ -3581,7 +3441,7 @@ fn validateCustomCallLowering(plan: *const core.ExecutablePlan, instruction: cor
     };
 }
 
-fn validateIdentityCustomCallLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId, target: []const u8) ?LoweringIssue {
+fn validateIdentityCustomCallLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId, target: []const u8) ?LoweringIssue {
     if (instruction.inputs.len != 1 or instruction.outputs.len != 1) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
@@ -3607,7 +3467,7 @@ fn validateIdentityCustomCallLowering(plan: *const core.ExecutablePlan, instruct
     return null;
 }
 
-fn validateUnaryCustomCallLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId, target: []const u8, op: core.ElementwiseUnaryOp) ?LoweringIssue {
+fn validateUnaryCustomCallLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId, target: []const u8, op: ir.ElementwiseUnaryOp) ?LoweringIssue {
     if (instruction.inputs.len != 1 or instruction.outputs.len != 1) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
@@ -3615,7 +3475,7 @@ fn validateUnaryCustomCallLowering(plan: *const core.ExecutablePlan, instruction
         .detail = "unary custom_call lowering requires exactly one input and one output",
         .feature = target,
     };
-    if (mlxUnaryOpCode(op) == null) return .{
+    if (!buffer_mod.supportsUnaryOp(op)) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
         .op = instruction.kind,
@@ -3684,7 +3544,7 @@ fn validateUnaryCustomCallLowering(plan: *const core.ExecutablePlan, instruction
     return null;
 }
 
-fn validateBinaryCustomCallLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId, target: []const u8, op: core.ElementwiseBinaryOp) ?LoweringIssue {
+fn validateBinaryCustomCallLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId, target: []const u8, op: ir.ElementwiseBinaryOp) ?LoweringIssue {
     if (instruction.inputs.len != 2 or instruction.outputs.len != 1) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
@@ -3741,7 +3601,7 @@ fn validateBinaryCustomCallLowering(plan: *const core.ExecutablePlan, instructio
     return null;
 }
 
-fn validateMetalKernelBinaryAddF32CustomCallLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId, target: []const u8) ?LoweringIssue {
+fn validateMetalKernelBinaryAddF32CustomCallLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId, target: []const u8) ?LoweringIssue {
     const issue = validateBinaryCustomCallLowering(plan, instruction, instruction_index, output_id, target, .add);
     if (issue) |found| return found;
     const lhs = inputDescriptor(plan, instruction, 0).?;
@@ -3756,7 +3616,7 @@ fn validateMetalKernelBinaryAddF32CustomCallLowering(plan: *const core.Executabl
     return null;
 }
 
-fn validateScaledDotProductAttentionCustomCallLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId, target: []const u8) ?LoweringIssue {
+fn validateScaledDotProductAttentionCustomCallLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId, target: []const u8) ?LoweringIssue {
     if (instruction.inputs.len != 4 or instruction.outputs.len != 1) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
@@ -3841,7 +3701,7 @@ fn validateScaledDotProductAttentionCustomCallLowering(plan: *const core.Executa
     return null;
 }
 
-fn validateOptimizationBarrierLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize) ?LoweringIssue {
+fn validateOptimizationBarrierLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize) ?LoweringIssue {
     if (instruction.inputs.len == 0 or instruction.inputs.len != instruction.outputs.len) return .{
         .instruction_index = instruction_index,
         .op = instruction.kind,
@@ -3876,7 +3736,7 @@ fn validateOptimizationBarrierLowering(plan: *const core.ExecutablePlan, instruc
     return null;
 }
 
-fn validateBinaryElementwiseLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateBinaryElementwiseLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const lhs = inputDescriptor(plan, instruction, 0) orelse return .{
         .instruction_index = instruction_index,
         .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
@@ -3926,7 +3786,7 @@ fn validateBinaryElementwiseLowering(plan: *const core.ExecutablePlan, instructi
     return null;
 }
 
-fn validateUnaryElementwiseLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateUnaryElementwiseLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const input = inputDescriptor(plan, instruction, 0) orelse return .{
         .instruction_index = instruction_index,
         .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
@@ -3996,7 +3856,7 @@ fn validateUnaryElementwiseLowering(plan: *const core.ExecutablePlan, instructio
     return null;
 }
 
-fn validateComplexLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateComplexLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const real = inputDescriptor(plan, instruction, 0) orelse return .{
         .instruction_index = instruction_index,
         .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
@@ -4029,7 +3889,7 @@ fn validateComplexLowering(plan: *const core.ExecutablePlan, instruction: core.P
     return null;
 }
 
-fn validateRealImagLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateRealImagLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const input = inputDescriptor(plan, instruction, 0) orelse return .{
         .instruction_index = instruction_index,
         .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
@@ -4056,7 +3916,7 @@ fn validateRealImagLowering(plan: *const core.ExecutablePlan, instruction: core.
     };
 }
 
-fn validatePadLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validatePadLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const low = instruction.edge_padding_low orelse return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
@@ -4134,7 +3994,7 @@ fn validatePadLowering(plan: *const core.ExecutablePlan, instruction: core.PlanI
     return null;
 }
 
-fn validateGatherLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateGatherLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const operand = inputDescriptor(plan, instruction, 0) orelse return .{
         .instruction_index = instruction_index,
         .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
@@ -4192,7 +4052,7 @@ fn validateGatherLowering(plan: *const core.ExecutablePlan, instruction: core.Pl
     return null;
 }
 
-fn validateScatterLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateScatterLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const operand = inputDescriptor(plan, instruction, 0) orelse return .{
         .instruction_index = instruction_index,
         .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
@@ -4267,7 +4127,7 @@ fn validateScatterLowering(plan: *const core.ExecutablePlan, instruction: core.P
     return null;
 }
 
-fn validateTupleLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateTupleLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const output = plan.values[output_id.index];
     if (output.storage != .tuple) return .{
         .instruction_index = instruction_index,
@@ -4295,7 +4155,7 @@ fn validateTupleLowering(plan: *const core.ExecutablePlan, instruction: core.Pla
     return null;
 }
 
-fn validateGetTupleElementLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateGetTupleElementLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     if (instruction.inputs.len != 1 or instruction.outputs.len != 1) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
@@ -4360,7 +4220,7 @@ fn validateGetTupleElementLowering(plan: *const core.ExecutablePlan, instruction
     return null;
 }
 
-fn validateSortLowering(instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateSortLowering(instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     if (instruction.dimension == null) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
@@ -4387,7 +4247,7 @@ fn validateSortLowering(instruction: core.PlanInstruction, instruction_index: us
     }
 }
 
-fn validateTopKLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateTopKLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     if (instruction.inputs.len != 1 or instruction.outputs.len != 2) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
@@ -4419,7 +4279,7 @@ fn validateTopKLowering(plan: *const core.ExecutablePlan, instruction: core.Plan
     return null;
 }
 
-fn validateDotGeneralLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateDotGeneralLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const lhs = inputDescriptor(plan, instruction, 0) orelse return .{
         .instruction_index = instruction_index,
         .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
@@ -4460,7 +4320,7 @@ fn validateDotGeneralLowering(plan: *const core.ExecutablePlan, instruction: cor
     return null;
 }
 
-fn validateConvolutionLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateConvolutionLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const lhs = inputDescriptor(plan, instruction, 0) orelse return .{
         .instruction_index = instruction_index,
         .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
@@ -4574,7 +4434,7 @@ fn defaultSpatialDims(rank: usize) []const i64 {
     };
 }
 
-fn validateCholeskyLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateCholeskyLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const input = inputDescriptor(plan, instruction, 0) orelse return .{
         .instruction_index = instruction_index,
         .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
@@ -4608,7 +4468,7 @@ fn validateCholeskyLowering(plan: *const core.ExecutablePlan, instruction: core.
     return null;
 }
 
-fn validateTriangularSolveLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateTriangularSolveLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const a = inputDescriptor(plan, instruction, 0) orelse return .{
         .instruction_index = instruction_index,
         .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
@@ -4673,7 +4533,7 @@ fn validateTriangularSolveLowering(plan: *const core.ExecutablePlan, instruction
     return null;
 }
 
-fn validateFftLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateFftLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const input = inputDescriptor(plan, instruction, 0) orelse return .{
         .instruction_index = instruction_index,
         .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
@@ -4780,7 +4640,7 @@ fn validateFftLowering(plan: *const core.ExecutablePlan, instruction: core.PlanI
     return null;
 }
 
-fn validateRngBitGeneratorLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateRngBitGeneratorLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     if (instruction.inputs.len != 1 or instruction.outputs.len != 2) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
@@ -4828,21 +4688,21 @@ fn validateRngBitGeneratorLowering(plan: *const core.ExecutablePlan, instruction
     return null;
 }
 
-fn descriptorsEqual(a: core.BufferDescriptor, b: core.BufferDescriptor) bool {
+fn descriptorsEqual(a: ir.BufferDescriptor, b: ir.BufferDescriptor) bool {
     return a.element_type == b.element_type and std.mem.eql(i64, a.dims, b.dims);
 }
 
-fn regionValueById(subprogram: backend.ProgramSubprogram, id: core.RegionValueId) ?core.RegionValue {
+fn regionValueById(subprogram: backend.ProgramSubprogram, id: ir.RegionValueId) ?ir.RegionValue {
     if (id.index >= subprogram.values.len) return null;
     return subprogram.values[id.index];
 }
 
-fn regionValueIsArgumentIndex(subprogram: backend.ProgramSubprogram, id: core.RegionValueId, index: usize) bool {
+fn regionValueIsArgumentIndex(subprogram: backend.ProgramSubprogram, id: ir.RegionValueId, index: usize) bool {
     const value = regionValueById(subprogram, id) orelse return false;
     return value.role == .argument and id.index == index;
 }
 
-fn constantCompatibleWithState(value: core.RegionValue, state: core.BufferDescriptor) bool {
+fn constantCompatibleWithState(value: ir.RegionValue, state: ir.BufferDescriptor) bool {
     if (value.role != .constant or value.literal == null) return false;
     if (value.descriptor.element_type != state.element_type) return false;
     if (value.descriptor.element_type != .f32 and value.descriptor.element_type != .bf16) return false;
@@ -4850,7 +4710,7 @@ fn constantCompatibleWithState(value: core.RegionValue, state: core.BufferDescri
     return std.mem.eql(i64, value.descriptor.dims, state.dims);
 }
 
-fn whileOperandCompatibleWithState(value: core.RegionValue, state: core.BufferDescriptor) bool {
+fn whileOperandCompatibleWithState(value: ir.RegionValue, state: ir.BufferDescriptor) bool {
     if (value.role != .constant and value.role != .argument and value.role != .instruction_result) return false;
     if (value.role == .constant and value.literal == null) return false;
     if (value.descriptor.element_type != state.element_type) return false;
@@ -4859,7 +4719,7 @@ fn whileOperandCompatibleWithState(value: core.RegionValue, state: core.BufferDe
     return std.mem.eql(i64, value.descriptor.dims, state.dims);
 }
 
-fn addInstructionStepOperand(subprogram: backend.ProgramSubprogram, instruction: core.RegionInstruction, state: core.BufferDescriptor, state_index: usize, update_instruction_index: usize) ?WhilePatternOperand {
+fn addInstructionStepOperand(subprogram: backend.ProgramSubprogram, instruction: ir.RegionInstruction, state: ir.BufferDescriptor, state_index: usize, update_instruction_index: usize) ?WhilePatternOperand {
     if (instruction.inputs.len != 2) return null;
     if (regionValueIsArgumentIndex(subprogram, instruction.inputs[0], state_index)) {
         const rhs = regionValueById(subprogram, instruction.inputs[1]) orelse return null;
@@ -4872,7 +4732,7 @@ fn addInstructionStepOperand(subprogram: backend.ProgramSubprogram, instruction:
     return null;
 }
 
-fn whileStepOperandFromRegionValue(subprogram: backend.ProgramSubprogram, value: core.RegionValue, state: core.BufferDescriptor, state_index: usize, update_instruction_index: usize) ?WhilePatternOperand {
+fn whileStepOperandFromRegionValue(subprogram: backend.ProgramSubprogram, value: ir.RegionValue, state: ir.BufferDescriptor, state_index: usize, update_instruction_index: usize) ?WhilePatternOperand {
     if (!whileOperandCompatibleWithState(value, state)) return null;
     switch (value.role) {
         .constant, .argument => return .{ .value = value },
@@ -4883,7 +4743,7 @@ fn whileStepOperandFromRegionValue(subprogram: backend.ProgramSubprogram, value:
     }
 }
 
-fn loopInvariantProducerInstructionIndex(subprogram: backend.ProgramSubprogram, output_id: core.RegionValueId, state: core.BufferDescriptor, state_index: usize, update_instruction_index: usize) ?usize {
+fn loopInvariantProducerInstructionIndex(subprogram: backend.ProgramSubprogram, output_id: ir.RegionValueId, state: ir.BufferDescriptor, state_index: usize, update_instruction_index: usize) ?usize {
     var instruction_index: usize = 0;
     while (instruction_index < update_instruction_index) : (instruction_index += 1) {
         const instruction = subprogram.instructions[instruction_index];
@@ -4902,7 +4762,7 @@ fn loopInvariantProducerInstructionIndex(subprogram: backend.ProgramSubprogram, 
     return null;
 }
 
-fn compareDirectionSupportedInWhile(direction: core.CompareOp) bool {
+fn compareDirectionSupportedInWhile(direction: ir.CompareOp) bool {
     return switch (direction) {
         .lt, .le, .gt, .ge => true,
         .eq, .ne => false,
@@ -4968,11 +4828,11 @@ fn matchWhileF32LtAddPattern(cond: backend.ProgramSubprogram, body: backend.Prog
         if (invariant_index == state_index) continue;
         if (!regionValueIsArgumentIndex(body, body.terminator_operands[invariant_index], invariant_index)) return null;
     }
-    const update_op: core.ElementwiseBinaryOp = if (update_instruction.kind == .subtract) .subtract else .add;
+    const update_op: ir.ElementwiseBinaryOp = if (update_instruction.kind == .subtract) .subtract else .add;
     return .{ .limit = limit, .step = step, .state_index = state_index, .compare_direction = compare_direction, .update_op = update_op, .state_count = cond.argument_descriptors.len };
 }
 
-fn validateWhileLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateWhileLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     if (instruction.inputs.len == 0 or instruction.outputs.len != instruction.inputs.len or instruction.region_ids.len != 2) return .{
         .instruction_index = instruction_index,
         .value_id = output_id,
@@ -5076,7 +4936,7 @@ fn validateWhileLowering(plan: *const core.ExecutablePlan, instruction: core.Pla
     };
 }
 
-fn validateReduceLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateReduceLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     if (instruction.inputs.len == 2 and instruction.outputs.len == 2 and instruction.kind == .reduce_max) {
         const values = inputDescriptor(plan, instruction, 0) orelse return .{
             .instruction_index = instruction_index,
@@ -5154,7 +5014,7 @@ fn validateReduceLowering(plan: *const core.ExecutablePlan, instruction: core.Pl
     return null;
 }
 
-fn validateReduceWindowLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateReduceWindowLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     if (instruction.inputs.len == 2 and instruction.outputs.len == 2 and instruction.kind == .reduce_window_max) {
         const values = inputDescriptor(plan, instruction, 0) orelse return .{
             .instruction_index = instruction_index,
@@ -5252,7 +5112,7 @@ fn validateReduceWindowLowering(plan: *const core.ExecutablePlan, instruction: c
     return null;
 }
 
-fn validateCompareLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateCompareLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const lhs = inputDescriptor(plan, instruction, 0) orelse return .{
         .instruction_index = instruction_index,
         .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
@@ -5278,7 +5138,7 @@ fn validateCompareLowering(plan: *const core.ExecutablePlan, instruction: core.P
     return null;
 }
 
-fn validateSelectLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateSelectLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const pred = inputDescriptor(plan, instruction, 0) orelse return .{
         .instruction_index = instruction_index,
         .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
@@ -5311,7 +5171,7 @@ fn validateSelectLowering(plan: *const core.ExecutablePlan, instruction: core.Pl
     return null;
 }
 
-fn validateClampLowering(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, instruction_index: usize, output_id: core.ValueId) ?LoweringIssue {
+fn validateClampLowering(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, instruction_index: usize, output_id: ir.ValueId) ?LoweringIssue {
     const min = inputDescriptor(plan, instruction, 0) orelse return .{
         .instruction_index = instruction_index,
         .value_id = if (instruction.inputs.len > 0) instruction.inputs[0] else output_id,
@@ -5358,7 +5218,7 @@ fn validateClampLowering(plan: *const core.ExecutablePlan, instruction: core.Pla
     return null;
 }
 
-fn inputDescriptor(plan: *const core.ExecutablePlan, instruction: core.PlanInstruction, input_index: usize) ?core.BufferDescriptor {
+fn inputDescriptor(plan: *const ir.ExecutablePlan, instruction: ir.PlanInstruction, input_index: usize) ?ir.BufferDescriptor {
     if (input_index >= instruction.inputs.len) return null;
     const id = instruction.inputs[input_index];
     if (id.index >= plan.values.len) return null;
@@ -5409,7 +5269,7 @@ fn validReduceWindowShape(input_dims: []const i64, window_dimensions: []const i6
 
 fn executeRegisteredCustomCall(
     backend_impl: backend.Backend,
-    instruction: core.PlanInstruction,
+    instruction: ir.PlanInstruction,
     value_handles: []?backend.BufferHandle,
 ) backend.Error!?backend.BufferHandle {
     const target = instruction.custom_call_target orelse return null;
@@ -5445,8 +5305,7 @@ fn executeRegisteredCustomCall(
             if (lhs_id.index >= value_handles.len or rhs_id.index >= value_handles.len) return error.CommandSubmissionFailed;
             const lhs = value_handles[lhs_id.index] orelse return error.CommandSubmissionFailed;
             const rhs = value_handles[rhs_id.index] orelse return error.CommandSubmissionFailed;
-            const handle = c.pjrtx_mlx_metal_custom_call_binary_add_f32(@ptrCast(@alignCast(lhs)), @ptrCast(@alignCast(rhs))) orelse return error.CommandSubmissionFailed;
-            break :blk @ptrCast(handle);
+            break :blk maybeBufferHandle((try buffer_mod.Buffer.customBinaryAddF32(bufferRef(lhs), bufferRef(rhs))) orelse return error.CommandSubmissionFailed).?;
         },
         .scaled_dot_product_attention => blk: {
             if (instruction.inputs.len != 4) return null;
@@ -5459,32 +5318,26 @@ fn executeRegisteredCustomCall(
             const k = value_handles[k_id.index] orelse return error.CommandSubmissionFailed;
             const v = value_handles[v_id.index] orelse return error.CommandSubmissionFailed;
             const token_index = value_handles[token_index_id.index] orelse return error.CommandSubmissionFailed;
-            const handle = c.pjrtx_mlx_metal_custom_call_scaled_dot_product_attention(
-                @ptrCast(@alignCast(q)),
-                @ptrCast(@alignCast(k)),
-                @ptrCast(@alignCast(v)),
-                @ptrCast(@alignCast(token_index)),
-            ) orelse return error.CommandSubmissionFailed;
-            break :blk @ptrCast(handle);
+            break :blk maybeBufferHandle((try buffer_mod.Buffer.customScaledDotProductAttention(bufferRef(q), bufferRef(k), bufferRef(v), bufferRef(token_index))) orelse return error.CommandSubmissionFailed).?;
         },
     };
 }
 
-fn isSupportedFloat(element_type: core.BufferType) bool {
+fn isSupportedFloat(element_type: ir.BufferType) bool {
     return switch (element_type) {
         .f16, .f32, .bf16 => true,
         else => false,
     };
 }
 
-fn isSupportedInteger(element_type: core.BufferType) bool {
+fn isSupportedInteger(element_type: ir.BufferType) bool {
     return switch (element_type) {
         .s8, .s32, .u8, .u16, .u32, .u64 => true,
         else => false,
     };
 }
 
-fn isSupportedComparable(element_type: core.BufferType) bool {
+fn isSupportedComparable(element_type: ir.BufferType) bool {
     return element_type == .pred or isSupportedFloat(element_type) or isSupportedInteger(element_type);
 }
 
@@ -5532,7 +5385,7 @@ fn dotGeneralIsMatmulLike(lhs_dims: []const i64, rhs_dims: []const i64, lhs_batc
     return std.mem.eql(i64, expected.items, output_dims);
 }
 
-fn writeLoweringIssue(plan: *const core.ExecutablePlan, issue: LoweringIssue, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+fn writeLoweringIssue(plan: *const ir.ExecutablePlan, issue: LoweringIssue, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll("invalid executable plan: pass=mlx-backend-legalization");
     if (issue.instruction_index) |index| try writer.print(" instruction={d}", .{index});
     if (issue.op) |op| try writer.print(" op={s}", .{@tagName(op)});
@@ -5557,7 +5410,7 @@ fn writeDims(writer: *std.Io.Writer, dims: []const i64) std.Io.Writer.Error!void
     try writer.writeAll("]");
 }
 
-fn shardingLabel(plan: *const core.ExecutablePlan, value_id: core.ValueId) []const u8 {
+fn shardingLabel(plan: *const ir.ExecutablePlan, value_id: ir.ValueId) []const u8 {
     for (plan.output_ids, 0..) |output_id, index| {
         if (output_id.index == value_id.index and index < plan.output_shardings.len) return @tagName(plan.output_shardings[index].kind);
     }
@@ -5580,7 +5433,7 @@ fn destroyOwnedValueHandles(backend_impl: backend.Backend, value_handles: []?bac
     }
 }
 
-fn startHandles(allocator: std.mem.Allocator, value_handles: []const ?backend.BufferHandle, ids: []const core.ValueId) ![]backend.BufferHandle {
+fn startHandles(allocator: std.mem.Allocator, value_handles: []const ?backend.BufferHandle, ids: []const ir.ValueId) ![]backend.BufferHandle {
     const handles = try allocator.alloc(backend.BufferHandle, ids.len);
     errdefer allocator.free(handles);
     for (ids, 0..) |id, index| {
@@ -5594,7 +5447,7 @@ fn storeOwnedValueHandle(
     backend_impl: backend.Backend,
     value_handles: []?backend.BufferHandle,
     value_owned: []bool,
-    value_id: core.ValueId,
+    value_id: ir.ValueId,
     handle: backend.BufferHandle,
 ) backend.Error!void {
     if (value_id.index >= value_handles.len) return error.CommandSubmissionFailed;
@@ -5609,7 +5462,7 @@ fn storeBorrowedValueHandle(
     backend_impl: backend.Backend,
     value_handles: []?backend.BufferHandle,
     value_owned: []bool,
-    value_id: core.ValueId,
+    value_id: ir.ValueId,
     handle: backend.BufferHandle,
 ) backend.Error!void {
     if (value_id.index >= value_handles.len) return error.CommandSubmissionFailed;
@@ -5625,7 +5478,7 @@ fn reverseIfDescending(
     handle: backend.BufferHandle,
     dimension: i64,
     output_dims: []const i64,
-    direction: core.CompareOp,
+    direction: ir.CompareOp,
 ) backend.Error!?backend.BufferHandle {
     return switch (direction) {
         .lt, .le => handle,
@@ -5645,7 +5498,7 @@ fn reverseIfDescending(
     };
 }
 
-fn supportedGatherAxis(instruction: core.PlanInstruction) ?i64 {
+fn supportedGatherAxis(instruction: ir.PlanInstruction) ?i64 {
     const start_index_map = instruction.start_index_map orelse return null;
     const slice_sizes = instruction.slice_sizes orelse return null;
     const collapsed_slice_dims = instruction.collapsed_slice_dims orelse return null;
@@ -5726,7 +5579,7 @@ fn validGatherShape(operand_dims: []const i64, indices_dims: []const i64, start_
     return true;
 }
 
-fn supportedScatterAxis(instruction: core.PlanInstruction) ?i64 {
+fn supportedScatterAxis(instruction: ir.PlanInstruction) ?i64 {
     const scatter_dims_to_operand_dims = instruction.scatter_dims_to_operand_dims orelse return null;
     const inserted_window_dims = instruction.inserted_window_dims orelse return null;
     const input_batching_dims = instruction.input_batching_dims orelse &.{};
@@ -5836,7 +5689,7 @@ fn gatherOutputShapeMatchesTake(operand_dims: []const i64, indices_dims: []const
     return out_index == output_dims.len;
 }
 
-fn executableBinaryOp(instruction_kind: core.PlanInstructionKind) ?core.ElementwiseBinaryOp {
+fn executableBinaryOp(instruction_kind: ir.PlanInstructionKind) ?ir.ElementwiseBinaryOp {
     return switch (instruction_kind) {
         .add => .add,
         .subtract => .subtract,
@@ -5856,7 +5709,7 @@ fn executableBinaryOp(instruction_kind: core.PlanInstructionKind) ?core.Elementw
     };
 }
 
-fn executableUnaryOp(instruction_kind: core.PlanInstructionKind) ?core.ElementwiseUnaryOp {
+fn executableUnaryOp(instruction_kind: ir.PlanInstructionKind) ?ir.ElementwiseUnaryOp {
     return switch (instruction_kind) {
         .negate => .negate,
         .exp => .exp,
@@ -5884,183 +5737,9 @@ fn executableUnaryOp(instruction_kind: core.PlanInstructionKind) ?core.Elementwi
     };
 }
 
-fn cNameBytes(name: *const [128]u8) []const u8 {
-    const end = std.mem.indexOfScalar(u8, name, 0) orelse name.len;
-    return name[0..end];
-}
-
-fn mlxDtype(element_type: core.BufferType) ?c_int {
-    return switch (element_type) {
-        .pred => c.PJRTX_MLX_METAL_DTYPE_PRED,
-        .s8 => c.PJRTX_MLX_METAL_DTYPE_S8,
-        .s32 => c.PJRTX_MLX_METAL_DTYPE_S32,
-        .u8 => c.PJRTX_MLX_METAL_DTYPE_U8,
-        .u16 => c.PJRTX_MLX_METAL_DTYPE_U16,
-        .u32 => c.PJRTX_MLX_METAL_DTYPE_U32,
-        .u64 => c.PJRTX_MLX_METAL_DTYPE_U64,
-        .f16 => c.PJRTX_MLX_METAL_DTYPE_F16,
-        .f32 => c.PJRTX_MLX_METAL_DTYPE_F32,
-        .bf16 => c.PJRTX_MLX_METAL_DTYPE_BF16,
-        .c64 => c.PJRTX_MLX_METAL_DTYPE_C64,
-        else => null,
-    };
-}
-
-fn mlxFftKindCode(kind_: core.FftKind) c_int {
-    return switch (kind_) {
-        .fft => c.PJRTX_MLX_METAL_FFT,
-        .ifft => c.PJRTX_MLX_METAL_IFFT,
-        .rfft => c.PJRTX_MLX_METAL_RFFT,
-        .irfft => c.PJRTX_MLX_METAL_IRFFT,
-    };
-}
-
-fn mlxRngDistributionCode(distribution: core.RngDistribution) c_int {
-    return switch (distribution) {
-        .uniform => c.PJRTX_MLX_METAL_RNG_UNIFORM,
-        .normal => c.PJRTX_MLX_METAL_RNG_NORMAL,
-    };
-}
-
-fn triangularTransposeCode(transpose_kind: core.TriangularSolveTranspose) c_int {
-    return switch (transpose_kind) {
-        .no_transpose => 0,
-        .transpose, .adjoint => 1,
-    };
-}
-
-fn mlxBinaryOpCode(op: core.ElementwiseBinaryOp) ?c_int {
-    return switch (op) {
-        .add => c.PJRTX_MLX_METAL_U8_BINARY_ADD,
-        .subtract => c.PJRTX_MLX_METAL_U8_BINARY_SUBTRACT,
-        .multiply => c.PJRTX_MLX_METAL_U8_BINARY_MULTIPLY,
-        .divide => c.PJRTX_MLX_METAL_U8_BINARY_DIVIDE,
-        .maximum => c.PJRTX_MLX_METAL_BINARY_MAXIMUM,
-        .minimum => c.PJRTX_MLX_METAL_BINARY_MINIMUM,
-        .power => c.PJRTX_MLX_METAL_BINARY_POWER,
-        .atan2 => c.PJRTX_MLX_METAL_BINARY_ATAN2,
-        .remainder => c.PJRTX_MLX_METAL_BINARY_REMAINDER,
-        .and_ => c.PJRTX_MLX_METAL_BINARY_AND,
-        .or_ => c.PJRTX_MLX_METAL_BINARY_OR,
-        .xor => c.PJRTX_MLX_METAL_BINARY_XOR,
-        .shift_left => c.PJRTX_MLX_METAL_BINARY_SHIFT_LEFT,
-        .shift_right_arithmetic, .shift_right_logical => c.PJRTX_MLX_METAL_BINARY_SHIFT_RIGHT,
-    };
-}
-
-fn mlxUnaryOpCode(op: core.ElementwiseUnaryOp) ?c_int {
-    return switch (op) {
-        .negate => c.PJRTX_MLX_METAL_U8_UNARY_NEGATE,
-        .exp => c.PJRTX_MLX_METAL_UNARY_EXP,
-        .expm1 => c.PJRTX_MLX_METAL_UNARY_EXPM1,
-        .tanh => c.PJRTX_MLX_METAL_UNARY_TANH,
-        .sqrt => c.PJRTX_MLX_METAL_UNARY_SQRT,
-        .rsqrt => c.PJRTX_MLX_METAL_UNARY_RSQRT,
-        .abs => c.PJRTX_MLX_METAL_UNARY_ABS,
-        .cbrt => c.PJRTX_MLX_METAL_UNARY_CBRT,
-        .ceil => c.PJRTX_MLX_METAL_UNARY_CEIL,
-        .floor => c.PJRTX_MLX_METAL_UNARY_FLOOR,
-        .log => c.PJRTX_MLX_METAL_UNARY_LOG,
-        .log1p => c.PJRTX_MLX_METAL_UNARY_LOG1P,
-        .logistic => c.PJRTX_MLX_METAL_UNARY_LOGISTIC,
-        .sine => c.PJRTX_MLX_METAL_UNARY_SIN,
-        .cosine => c.PJRTX_MLX_METAL_UNARY_COS,
-        .not_ => c.PJRTX_MLX_METAL_UNARY_NOT,
-        .sign => c.PJRTX_MLX_METAL_UNARY_SIGN,
-        .is_finite => c.PJRTX_MLX_METAL_UNARY_ISFINITE,
-        .round_nearest_afz => c.PJRTX_MLX_METAL_UNARY_ROUND_AFZ,
-        .round_nearest_even => c.PJRTX_MLX_METAL_UNARY_ROUND,
-        .popcnt => c.PJRTX_MLX_METAL_UNARY_POPCNT,
-        .count_leading_zeros => c.PJRTX_MLX_METAL_UNARY_CLZ,
-    };
-}
-
-fn mlxCompareOpCode(op: core.CompareOp) c_int {
-    return switch (op) {
-        .eq => c.PJRTX_MLX_METAL_COMPARE_EQ,
-        .ne => c.PJRTX_MLX_METAL_COMPARE_NE,
-        .ge => c.PJRTX_MLX_METAL_COMPARE_GE,
-        .gt => c.PJRTX_MLX_METAL_COMPARE_GT,
-        .le => c.PJRTX_MLX_METAL_COMPARE_LE,
-        .lt => c.PJRTX_MLX_METAL_COMPARE_LT,
-    };
-}
-
-fn mlxScatterUpdateCode(update_kind: core.ScatterUpdateKind) c_int {
-    return switch (update_kind) {
-        .set => c.PJRTX_MLX_METAL_SCATTER_SET,
-        .add => c.PJRTX_MLX_METAL_SCATTER_ADD,
-    };
-}
-
-const vtable: backend.Backend.VTable = .{
-    .kind = kind,
-    .capabilities = capabilities,
-    .enumerateDevices = enumerateDevices,
-    .releaseDeviceDescriptors = releaseDeviceDescriptors,
-    .bufferFromHost = bufferFromHost,
-    .beginAsyncHostToDeviceTransfer = beginAsyncHostToDeviceTransfer,
-    .writeAsyncHostToDeviceTransfer = writeAsyncHostToDeviceTransfer,
-    .finishAsyncHostToDeviceTransfer = finishAsyncHostToDeviceTransfer,
-    .destroyAsyncHostToDeviceTransfer = destroyAsyncHostToDeviceTransfer,
-    .allocateBuffer = allocateBuffer,
-    .iota = iota,
-    .partitionId = partitionId,
-    .cloneBuffer = cloneBuffer,
-    .complex = complex,
-    .realPart = realPart,
-    .imagPart = imagPart,
-    .convert = convert,
-    .bitcast = bitcast,
-    .binary = binary,
-    .unary = unary,
-    .reshape = reshape,
-    .transpose = transpose,
-    .broadcastInDim = broadcastInDim,
-    .slice = slice,
-    .dynamicSlice = dynamicSlice,
-    .dynamicUpdateSlice = dynamicUpdateSlice,
-    .pad = pad,
-    .reverse = reverse,
-    .concatenate = concatenate,
-    .gather = gather,
-    .gatherAxis = gatherAxis,
-    .scatter = scatter,
-    .scatterAxis = scatterAxis,
-    .sort = sort,
-    .argsort = argsort,
-    .takeAlongAxis = takeAlongAxis,
-    .dotGeneral = dotGeneral,
-    .convolution = convolution,
-    .cholesky = cholesky,
-    .triangularSolve = triangularSolve,
-    .fft = fft,
-    .rng = rng,
-    .rngBitGenerator = rngBitGenerator,
-    .reduce = reduce,
-    .reduceMaxWithIndices = reduceMaxWithIndices,
-    .reduceWindow = reduceWindow,
-    .reduceWindowMaxWithIndices = reduceWindowMaxWithIndices,
-    .compare = compare,
-    .select = select,
-    .clamp = clamp,
-    .compileExecutable = compileExecutable,
-    .writeExecutableLoweringDiagnostic = writeExecutableLoweringDiagnostic,
-    .executeExecutable = executeExecutable,
-    .executionEventStatus = executionEventStatus,
-    .destroyExecutionEvent = destroyExecutionEvent,
-    .executableStats = executableStats,
-    .destroyExecutable = destroyExecutable,
-    .registerCustomCall = registerCustomCall,
-    .unregisterCustomCall = unregisterCustomCall,
-    .customCallRegistryVersion = customCallRegistryVersion,
-    .copyToHost = copyToHost,
-    .destroyBuffer = destroyBuffer,
-};
-
 test "mlx metal backend exposes opaque backend interface" {
     const b = create();
-    try std.testing.expectEqual(core.BackendKind.metal_mlx, b.kind());
+    try std.testing.expectEqualStrings("metal_mlx", b.capabilities().name);
     const devices = try b.enumerateDevices(std.testing.allocator, 1);
     defer b.releaseDeviceDescriptors(std.testing.allocator, devices);
     try std.testing.expect(devices.len >= 1);
@@ -6075,7 +5754,7 @@ test "mlx metal backend executable bitcast_convert reinterprets resident bytes" 
     const dims = [_]i64{2};
     const assignment = [_]i32{0};
 
-    const values = try allocator.alloc(core.Value, 2);
+    const values = try allocator.alloc(ir.Value, 2);
     errdefer allocator.free(values);
     values[0] = .{
         .id = .{ .index = 0 },
@@ -6100,20 +5779,20 @@ test "mlx metal backend executable bitcast_convert reinterprets resident bytes" 
         },
     };
 
-    var parameter_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    var parameter_shardings = try allocator.alloc(ir.ShardingPlan, 1);
     parameter_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
-    var output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    var output_shardings = try allocator.alloc(ir.ShardingPlan, 1);
     output_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
 
-    var plan = core.ExecutablePlan{
+    var plan = ir.ExecutablePlan{
         .allocator = allocator,
         .options = .{
             .num_replicas = 1,
@@ -6123,12 +5802,12 @@ test "mlx metal backend executable bitcast_convert reinterprets resident bytes" 
         .values = values,
         .parameter_shardings = parameter_shardings,
         .output_shardings = output_shardings,
-        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 1 }}),
-        .instructions = try allocator.dupe(core.PlanInstruction, &.{
+        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
+        .instructions = try allocator.dupe(ir.PlanInstruction, &.{
             .{
                 .kind = .bitcast_convert,
-                .inputs = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }}),
-                .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 1 }}),
+                .inputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 0 }}),
+                .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
             },
         }),
     };
@@ -6166,7 +5845,7 @@ test "mlx metal backend executable lowers reduce_window sum on device" {
     const output_dims = [_]i64{3};
     const assignment = [_]i32{0};
 
-    const values = try allocator.alloc(core.Value, 2);
+    const values = try allocator.alloc(ir.Value, 2);
     errdefer allocator.free(values);
     values[0] = .{
         .id = .{ .index = 0 },
@@ -6191,20 +5870,20 @@ test "mlx metal backend executable lowers reduce_window sum on device" {
         },
     };
 
-    var parameter_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    var parameter_shardings = try allocator.alloc(ir.ShardingPlan, 1);
     parameter_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
-    var output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    var output_shardings = try allocator.alloc(ir.ShardingPlan, 1);
     output_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
 
-    var plan = core.ExecutablePlan{
+    var plan = ir.ExecutablePlan{
         .allocator = allocator,
         .options = .{
             .num_replicas = 1,
@@ -6214,11 +5893,11 @@ test "mlx metal backend executable lowers reduce_window sum on device" {
         .values = values,
         .parameter_shardings = parameter_shardings,
         .output_shardings = output_shardings,
-        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 1 }}),
-        .instructions = try allocator.dupe(core.PlanInstruction, &.{.{
+        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
+        .instructions = try allocator.dupe(ir.PlanInstruction, &.{.{
             .kind = .reduce_window_sum,
-            .inputs = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }}),
-            .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 1 }}),
+            .inputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 0 }}),
+            .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
             .window_dimensions = try allocator.dupe(i64, &.{2}),
             .window_strides = try allocator.dupe(i64, &.{1}),
             .base_dilations = try allocator.dupe(i64, &.{1}),
@@ -6253,14 +5932,14 @@ test "mlx metal backend program owns while cond body subprogram descriptors" {
     const allocator = std.testing.allocator;
     const assignment = [_]i32{0};
 
-    const scalar_f32 = core.BufferDescriptor{
+    const scalar_f32 = ir.BufferDescriptor{
         .element_type = .f32,
         .dims = &.{},
         .device_id = 0,
         .memory_id = 0,
         .shard_index = 0,
     };
-    const scalar_pred = core.BufferDescriptor{
+    const scalar_pred = ir.BufferDescriptor{
         .element_type = .pred,
         .dims = &.{},
         .device_id = 0,
@@ -6268,7 +5947,7 @@ test "mlx metal backend program owns while cond body subprogram descriptors" {
         .shard_index = 0,
     };
 
-    const values = try allocator.alloc(core.Value, 2);
+    const values = try allocator.alloc(ir.Value, 2);
     errdefer allocator.free(values);
     values[0] = .{
         .id = .{ .index = 0 },
@@ -6281,60 +5960,60 @@ test "mlx metal backend program owns while cond body subprogram descriptors" {
         .descriptor = scalar_f32,
     };
 
-    var parameter_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    var parameter_shardings = try allocator.alloc(ir.ShardingPlan, 1);
     parameter_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
-    var output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    var output_shardings = try allocator.alloc(ir.ShardingPlan, 1);
     output_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
 
-    const cond_args = try allocator.dupe(core.BufferDescriptor, &.{scalar_f32});
-    const cond_returns = try allocator.dupe(core.BufferDescriptor, &.{scalar_pred});
-    const cond_terminator_ids = try allocator.dupe(core.RegionValueId, &.{.{ .index = 1 }});
-    const cond_terminator = try allocator.dupe(core.BufferDescriptor, &.{scalar_pred});
-    const cond_instruction_operands = try allocator.dupe(core.BufferDescriptor, &.{ scalar_f32, scalar_f32 });
-    const cond_instruction_results = try allocator.dupe(core.BufferDescriptor, &.{scalar_pred});
-    const cond_instruction_inputs = try allocator.dupe(core.RegionValueId, &.{ .{ .index = 0 }, .{ .index = 0 } });
-    const cond_instruction_outputs = try allocator.dupe(core.RegionValueId, &.{.{ .index = 1 }});
-    const cond_instructions = try allocator.dupe(core.RegionInstruction, &.{.{
+    const cond_args = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32});
+    const cond_returns = try allocator.dupe(ir.BufferDescriptor, &.{scalar_pred});
+    const cond_terminator_ids = try allocator.dupe(ir.RegionValueId, &.{.{ .index = 1 }});
+    const cond_terminator = try allocator.dupe(ir.BufferDescriptor, &.{scalar_pred});
+    const cond_instruction_operands = try allocator.dupe(ir.BufferDescriptor, &.{ scalar_f32, scalar_f32 });
+    const cond_instruction_results = try allocator.dupe(ir.BufferDescriptor, &.{scalar_pred});
+    const cond_instruction_inputs = try allocator.dupe(ir.RegionValueId, &.{ .{ .index = 0 }, .{ .index = 0 } });
+    const cond_instruction_outputs = try allocator.dupe(ir.RegionValueId, &.{.{ .index = 1 }});
+    const cond_instructions = try allocator.dupe(ir.RegionInstruction, &.{.{
         .kind = .compare,
         .inputs = cond_instruction_inputs,
         .outputs = cond_instruction_outputs,
         .operand_descriptors = cond_instruction_operands,
         .result_descriptors = cond_instruction_results,
     }});
-    const cond_values = try allocator.dupe(core.RegionValue, &.{
+    const cond_values = try allocator.dupe(ir.RegionValue, &.{
         .{ .id = .{ .index = 0 }, .role = .argument, .descriptor = scalar_f32 },
         .{ .id = .{ .index = 1 }, .role = .instruction_result, .descriptor = scalar_pred },
     });
 
-    const body_args = try allocator.dupe(core.BufferDescriptor, &.{scalar_f32});
-    const body_returns = try allocator.dupe(core.BufferDescriptor, &.{scalar_f32});
-    const body_terminator_ids = try allocator.dupe(core.RegionValueId, &.{.{ .index = 1 }});
-    const body_terminator = try allocator.dupe(core.BufferDescriptor, &.{scalar_f32});
-    const body_instruction_operands = try allocator.dupe(core.BufferDescriptor, &.{ scalar_f32, scalar_f32 });
-    const body_instruction_results = try allocator.dupe(core.BufferDescriptor, &.{scalar_f32});
-    const body_instruction_inputs = try allocator.dupe(core.RegionValueId, &.{ .{ .index = 0 }, .{ .index = 0 } });
-    const body_instruction_outputs = try allocator.dupe(core.RegionValueId, &.{.{ .index = 1 }});
-    const body_instructions = try allocator.dupe(core.RegionInstruction, &.{.{
+    const body_args = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32});
+    const body_returns = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32});
+    const body_terminator_ids = try allocator.dupe(ir.RegionValueId, &.{.{ .index = 1 }});
+    const body_terminator = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32});
+    const body_instruction_operands = try allocator.dupe(ir.BufferDescriptor, &.{ scalar_f32, scalar_f32 });
+    const body_instruction_results = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32});
+    const body_instruction_inputs = try allocator.dupe(ir.RegionValueId, &.{ .{ .index = 0 }, .{ .index = 0 } });
+    const body_instruction_outputs = try allocator.dupe(ir.RegionValueId, &.{.{ .index = 1 }});
+    const body_instructions = try allocator.dupe(ir.RegionInstruction, &.{.{
         .kind = .add,
         .inputs = body_instruction_inputs,
         .outputs = body_instruction_outputs,
         .operand_descriptors = body_instruction_operands,
         .result_descriptors = body_instruction_results,
     }});
-    const body_values = try allocator.dupe(core.RegionValue, &.{
+    const body_values = try allocator.dupe(ir.RegionValue, &.{
         .{ .id = .{ .index = 0 }, .role = .argument, .descriptor = scalar_f32 },
         .{ .id = .{ .index = 1 }, .role = .instruction_result, .descriptor = scalar_f32 },
     });
 
-    var regions = try allocator.alloc(core.PlanRegion, 2);
+    var regions = try allocator.alloc(ir.PlanRegion, 2);
     regions[0] = .{
         .id = .{ .index = 0 },
         .parent_instruction_index = 0,
@@ -6358,7 +6037,7 @@ test "mlx metal backend program owns while cond body subprogram descriptors" {
         .terminator_operand_descriptors = body_terminator,
     };
 
-    var plan = core.ExecutablePlan{
+    var plan = ir.ExecutablePlan{
         .allocator = allocator,
         .options = .{
             .num_replicas = 1,
@@ -6369,12 +6048,12 @@ test "mlx metal backend program owns while cond body subprogram descriptors" {
         .regions = regions,
         .parameter_shardings = parameter_shardings,
         .output_shardings = output_shardings,
-        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 1 }}),
-        .instructions = try allocator.dupe(core.PlanInstruction, &.{.{
+        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
+        .instructions = try allocator.dupe(ir.PlanInstruction, &.{.{
             .kind = .while_,
-            .inputs = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }}),
-            .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 1 }}),
-            .region_ids = try allocator.dupe(core.RegionId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+            .inputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 0 }}),
+            .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
+            .region_ids = try allocator.dupe(ir.RegionId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
         }}),
     };
     defer plan.deinit();
@@ -6398,22 +6077,22 @@ test "mlx metal backend program owns while cond body subprogram descriptors" {
     try std.testing.expectEqual(@as(u32, 1), control_flow.predicate_output.index);
     const cond = program.subprograms[program.nodes[0].subprograms[0]];
     const body = program.subprograms[program.nodes[0].subprograms[1]];
-    try std.testing.expectEqual(core.RegionKind.while_cond, cond.kind);
-    try std.testing.expectEqual(core.RegionKind.while_body, body.kind);
+    try std.testing.expectEqual(ir.RegionKind.while_cond, cond.kind);
+    try std.testing.expectEqual(ir.RegionKind.while_body, body.kind);
     try std.testing.expectEqual(@as(usize, 2), cond.values.len);
-    try std.testing.expectEqual(core.RegionValueRole.argument, cond.values[0].role);
-    try std.testing.expectEqual(core.RegionValueRole.instruction_result, cond.values[1].role);
+    try std.testing.expectEqual(ir.RegionValueRole.argument, cond.values[0].role);
+    try std.testing.expectEqual(ir.RegionValueRole.instruction_result, cond.values[1].role);
     try std.testing.expectEqual(@as(usize, 1), cond.instructions.len);
-    try std.testing.expectEqual(core.PlanInstructionKind.compare, cond.instructions[0].kind);
+    try std.testing.expectEqual(ir.PlanInstructionKind.compare, cond.instructions[0].kind);
     try std.testing.expectEqual(@as(usize, 2), cond.instructions[0].inputs.len);
     try std.testing.expectEqual(@as(u32, 0), cond.instructions[0].inputs[0].index);
     try std.testing.expectEqual(@as(u32, 1), cond.instructions[0].outputs[0].index);
     try std.testing.expectEqual(@as(u32, 1), cond.terminator_operands[0].index);
     try std.testing.expectEqual(@as(usize, 1), body.instructions.len);
-    try std.testing.expectEqual(core.PlanInstructionKind.add, body.instructions[0].kind);
+    try std.testing.expectEqual(ir.PlanInstructionKind.add, body.instructions[0].kind);
     try std.testing.expectEqual(@as(u32, 1), body.terminator_operands[0].index);
-    try std.testing.expectEqual(core.BufferType.pred, cond.return_descriptors[0].element_type);
-    try std.testing.expectEqual(core.BufferType.f32, body.return_descriptors[0].element_type);
+    try std.testing.expectEqual(ir.BufferType.pred, cond.return_descriptors[0].element_type);
+    try std.testing.expectEqual(ir.BufferType.f32, body.return_descriptors[0].element_type);
 }
 
 test "mlx metal backend executes f32 lt/add while loop on device" {
@@ -6424,14 +6103,14 @@ test "mlx metal backend executes f32 lt/add while loop on device" {
     const local_hardware_id = devices[0].local_hardware_id;
     const assignment = [_]i32{0};
 
-    const scalar_f32 = core.BufferDescriptor{
+    const scalar_f32 = ir.BufferDescriptor{
         .element_type = .f32,
         .dims = &.{},
         .device_id = 0,
         .memory_id = 0,
         .shard_index = 0,
     };
-    const scalar_pred = core.BufferDescriptor{
+    const scalar_pred = ir.BufferDescriptor{
         .element_type = .pred,
         .dims = &.{},
         .device_id = 0,
@@ -6439,18 +6118,18 @@ test "mlx metal backend executes f32 lt/add while loop on device" {
         .shard_index = 0,
     };
 
-    const values = try allocator.alloc(core.Value, 2);
+    const values = try allocator.alloc(ir.Value, 2);
     errdefer allocator.free(values);
     values[0] = .{ .id = .{ .index = 0 }, .role = .parameter, .descriptor = scalar_f32 };
     values[1] = .{ .id = .{ .index = 1 }, .role = .instruction_result, .descriptor = scalar_f32 };
 
-    var parameter_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    var parameter_shardings = try allocator.alloc(ir.ShardingPlan, 1);
     parameter_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
-    var output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    var output_shardings = try allocator.alloc(ir.ShardingPlan, 1);
     output_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
@@ -6459,55 +6138,55 @@ test "mlx metal backend executes f32 lt/add while loop on device" {
 
     var limit_value: f32 = 4.0;
     var step_value: f32 = 1.0;
-    const cond_values = try allocator.dupe(core.RegionValue, &.{
+    const cond_values = try allocator.dupe(ir.RegionValue, &.{
         .{ .id = .{ .index = 0 }, .role = .argument, .descriptor = scalar_f32 },
         .{ .id = .{ .index = 1 }, .role = .constant, .descriptor = scalar_f32, .literal = try allocator.dupe(u8, std.mem.asBytes(&limit_value)) },
         .{ .id = .{ .index = 2 }, .role = .instruction_result, .descriptor = scalar_pred },
     });
-    const body_values = try allocator.dupe(core.RegionValue, &.{
+    const body_values = try allocator.dupe(ir.RegionValue, &.{
         .{ .id = .{ .index = 0 }, .role = .argument, .descriptor = scalar_f32 },
         .{ .id = .{ .index = 1 }, .role = .constant, .descriptor = scalar_f32, .literal = try allocator.dupe(u8, std.mem.asBytes(&step_value)) },
         .{ .id = .{ .index = 2 }, .role = .instruction_result, .descriptor = scalar_f32 },
     });
 
-    var regions = try allocator.alloc(core.PlanRegion, 2);
+    var regions = try allocator.alloc(ir.PlanRegion, 2);
     regions[0] = .{
         .id = .{ .index = 0 },
         .parent_instruction_index = 0,
         .kind = .while_cond,
         .values = cond_values,
-        .argument_descriptors = try allocator.dupe(core.BufferDescriptor, &.{scalar_f32}),
-        .instructions = try allocator.dupe(core.RegionInstruction, &.{.{
+        .argument_descriptors = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32}),
+        .instructions = try allocator.dupe(ir.RegionInstruction, &.{.{
             .kind = .compare,
-            .inputs = try allocator.dupe(core.RegionValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
-            .outputs = try allocator.dupe(core.RegionValueId, &.{.{ .index = 2 }}),
-            .operand_descriptors = try allocator.dupe(core.BufferDescriptor, &.{ scalar_f32, scalar_f32 }),
-            .result_descriptors = try allocator.dupe(core.BufferDescriptor, &.{scalar_pred}),
+            .inputs = try allocator.dupe(ir.RegionValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+            .outputs = try allocator.dupe(ir.RegionValueId, &.{.{ .index = 2 }}),
+            .operand_descriptors = try allocator.dupe(ir.BufferDescriptor, &.{ scalar_f32, scalar_f32 }),
+            .result_descriptors = try allocator.dupe(ir.BufferDescriptor, &.{scalar_pred}),
             .compare_direction = .lt,
         }}),
-        .return_descriptors = try allocator.dupe(core.BufferDescriptor, &.{scalar_pred}),
-        .terminator_operands = try allocator.dupe(core.RegionValueId, &.{.{ .index = 2 }}),
-        .terminator_operand_descriptors = try allocator.dupe(core.BufferDescriptor, &.{scalar_pred}),
+        .return_descriptors = try allocator.dupe(ir.BufferDescriptor, &.{scalar_pred}),
+        .terminator_operands = try allocator.dupe(ir.RegionValueId, &.{.{ .index = 2 }}),
+        .terminator_operand_descriptors = try allocator.dupe(ir.BufferDescriptor, &.{scalar_pred}),
     };
     regions[1] = .{
         .id = .{ .index = 1 },
         .parent_instruction_index = 0,
         .kind = .while_body,
         .values = body_values,
-        .argument_descriptors = try allocator.dupe(core.BufferDescriptor, &.{scalar_f32}),
-        .instructions = try allocator.dupe(core.RegionInstruction, &.{.{
+        .argument_descriptors = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32}),
+        .instructions = try allocator.dupe(ir.RegionInstruction, &.{.{
             .kind = .add,
-            .inputs = try allocator.dupe(core.RegionValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
-            .outputs = try allocator.dupe(core.RegionValueId, &.{.{ .index = 2 }}),
-            .operand_descriptors = try allocator.dupe(core.BufferDescriptor, &.{ scalar_f32, scalar_f32 }),
-            .result_descriptors = try allocator.dupe(core.BufferDescriptor, &.{scalar_f32}),
+            .inputs = try allocator.dupe(ir.RegionValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+            .outputs = try allocator.dupe(ir.RegionValueId, &.{.{ .index = 2 }}),
+            .operand_descriptors = try allocator.dupe(ir.BufferDescriptor, &.{ scalar_f32, scalar_f32 }),
+            .result_descriptors = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32}),
         }}),
-        .return_descriptors = try allocator.dupe(core.BufferDescriptor, &.{scalar_f32}),
-        .terminator_operands = try allocator.dupe(core.RegionValueId, &.{.{ .index = 2 }}),
-        .terminator_operand_descriptors = try allocator.dupe(core.BufferDescriptor, &.{scalar_f32}),
+        .return_descriptors = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32}),
+        .terminator_operands = try allocator.dupe(ir.RegionValueId, &.{.{ .index = 2 }}),
+        .terminator_operand_descriptors = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32}),
     };
 
-    var plan = core.ExecutablePlan{
+    var plan = ir.ExecutablePlan{
         .allocator = allocator,
         .options = .{
             .num_replicas = 1,
@@ -6518,12 +6197,12 @@ test "mlx metal backend executes f32 lt/add while loop on device" {
         .regions = regions,
         .parameter_shardings = parameter_shardings,
         .output_shardings = output_shardings,
-        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 1 }}),
-        .instructions = try allocator.dupe(core.PlanInstruction, &.{.{
+        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
+        .instructions = try allocator.dupe(ir.PlanInstruction, &.{.{
             .kind = .while_,
-            .inputs = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }}),
-            .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 1 }}),
-            .region_ids = try allocator.dupe(core.RegionId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+            .inputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 0 }}),
+            .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
+            .region_ids = try allocator.dupe(ir.RegionId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
         }}),
     };
     defer plan.deinit();
@@ -6552,7 +6231,7 @@ test "mlx metal backend executable runs resident device buffers" {
     const dims = [_]i64{4};
     const assignment = [_]i32{0};
 
-    const values = try allocator.alloc(core.Value, 4);
+    const values = try allocator.alloc(ir.Value, 4);
     errdefer allocator.free(values);
     for (values, 0..) |*value, i| {
         value.* = .{
@@ -6568,20 +6247,20 @@ test "mlx metal backend executable runs resident device buffers" {
         };
     }
 
-    var parameter_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    var parameter_shardings = try allocator.alloc(ir.ShardingPlan, 1);
     parameter_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
-    var output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    var output_shardings = try allocator.alloc(ir.ShardingPlan, 1);
     output_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
 
-    var plan = core.ExecutablePlan{
+    var plan = ir.ExecutablePlan{
         .allocator = allocator,
         .options = .{
             .num_replicas = 1,
@@ -6591,22 +6270,22 @@ test "mlx metal backend executable runs resident device buffers" {
         .values = values,
         .parameter_shardings = parameter_shardings,
         .output_shardings = output_shardings,
-        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 3 }}),
-        .instructions = try allocator.dupe(core.PlanInstruction, &.{
+        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 3 }}),
+        .instructions = try allocator.dupe(ir.PlanInstruction, &.{
             .{
                 .kind = .constant,
-                .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 1 }}),
+                .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
                 .literal = try allocator.dupe(u8, &.{ 2, 3, 4, 5 }),
             },
             .{
                 .kind = .add,
-                .inputs = try allocator.dupe(core.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
-                .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
+                .inputs = try allocator.dupe(ir.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+                .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 2 }}),
             },
             .{
                 .kind = .multiply,
-                .inputs = try allocator.dupe(core.ValueId, &.{ .{ .index = 2 }, .{ .index = 1 } }),
-                .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 3 }}),
+                .inputs = try allocator.dupe(ir.ValueId, &.{ .{ .index = 2 }, .{ .index = 1 } }),
+                .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 3 }}),
             },
         }),
     };
@@ -6720,9 +6399,9 @@ test "mlx metal backend executable runs resident device buffers" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), outputs.len);
-    try std.testing.expectEqual(core.BufferType.u8, outputs[0].element_type);
+    try std.testing.expectEqual(ir.BufferType.u8, outputs[0].element_type);
     try std.testing.expectEqualSlices(i64, &dims, outputs[0].dims);
-    try std.testing.expectEqual(@as(c_int, 0), c.pjrtx_mlx_metal_buffer_has_host_shadow(@ptrCast(@alignCast(outputs[0].handle))));
+    try std.testing.expectEqual(@as(u1, 0), @intFromBool(bufferRef(outputs[0].handle).hasHostShadow()));
     var actual: [4]u8 = undefined;
     try b.copyToHost(outputs[0].handle, &actual);
     try std.testing.expectEqualSlices(u8, &.{ 6, 15, 28, 45 }, &actual);
@@ -6762,7 +6441,7 @@ test "mlx metal backend executable runs resident device buffers" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), second_outputs.len);
-    try std.testing.expectEqual(@as(c_int, 0), c.pjrtx_mlx_metal_buffer_has_host_shadow(@ptrCast(@alignCast(second_outputs[0].handle))));
+    try std.testing.expectEqual(@as(u1, 0), @intFromBool(bufferRef(second_outputs[0].handle).hasHostShadow()));
     try b.copyToHost(second_outputs[0].handle, &actual);
     try std.testing.expectEqualSlices(u8, &.{ 8, 21, 40, 65 }, &actual);
 
@@ -6800,7 +6479,7 @@ test "mlx metal backend executable lowers tuple get_tuple_element without materi
     const dims = [_]i64{2};
     const assignment = [_]i32{0};
 
-    const values = try allocator.alloc(core.Value, 4);
+    const values = try allocator.alloc(ir.Value, 4);
     errdefer allocator.free(values);
     for (values[0..2], 0..) |*value, i| {
         value.* = .{
@@ -6826,7 +6505,7 @@ test "mlx metal backend executable lowers tuple get_tuple_element without materi
             .shard_index = 0,
         },
         .storage = .tuple,
-        .elements = try allocator.dupe(core.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+        .elements = try allocator.dupe(ir.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
     };
     values[3] = .{
         .id = .{ .index = 3 },
@@ -6840,7 +6519,7 @@ test "mlx metal backend executable lowers tuple get_tuple_element without materi
         },
     };
 
-    const parameter_shardings = try allocator.alloc(core.ShardingPlan, 2);
+    const parameter_shardings = try allocator.alloc(ir.ShardingPlan, 2);
     for (parameter_shardings) |*sharding| {
         sharding.* = .{
             .kind = .replicated,
@@ -6848,14 +6527,14 @@ test "mlx metal backend executable lowers tuple get_tuple_element without materi
             .device_assignment = try allocator.dupe(i32, &assignment),
         };
     }
-    const output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    const output_shardings = try allocator.alloc(ir.ShardingPlan, 1);
     output_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
 
-    var plan = core.ExecutablePlan{
+    var plan = ir.ExecutablePlan{
         .allocator = allocator,
         .options = .{
             .num_replicas = 1,
@@ -6865,17 +6544,17 @@ test "mlx metal backend executable lowers tuple get_tuple_element without materi
         .values = values,
         .parameter_shardings = parameter_shardings,
         .output_shardings = output_shardings,
-        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 3 }}),
-        .instructions = try allocator.dupe(core.PlanInstruction, &.{
+        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 3 }}),
+        .instructions = try allocator.dupe(ir.PlanInstruction, &.{
             .{
                 .kind = .tuple,
-                .inputs = try allocator.dupe(core.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
-                .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
+                .inputs = try allocator.dupe(ir.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+                .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 2 }}),
             },
             .{
                 .kind = .get_tuple_element,
-                .inputs = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
-                .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 3 }}),
+                .inputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 2 }}),
+                .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 3 }}),
                 .tuple_index = 1,
             },
         }),
@@ -6917,7 +6596,7 @@ test "mlx metal backend lowers metadata custom call and optimization barrier on 
     const assignment = [_]i32{local_hardware_id};
     const dims = [_]i64{4};
 
-    const values = try allocator.alloc(core.Value, 5);
+    const values = try allocator.alloc(ir.Value, 5);
     for (values, 0..) |*value, index| {
         value.* = .{
             .id = .{ .index = @intCast(index) },
@@ -6932,7 +6611,7 @@ test "mlx metal backend lowers metadata custom call and optimization barrier on 
         };
     }
 
-    const parameter_shardings = try allocator.alloc(core.ShardingPlan, 2);
+    const parameter_shardings = try allocator.alloc(ir.ShardingPlan, 2);
     for (parameter_shardings) |*sharding| {
         sharding.* = .{
             .kind = .replicated,
@@ -6941,7 +6620,7 @@ test "mlx metal backend lowers metadata custom call and optimization barrier on 
         };
     }
 
-    var plan = core.ExecutablePlan{
+    var plan = ir.ExecutablePlan{
         .allocator = allocator,
         .options = .{
             .num_replicas = 1,
@@ -6950,19 +6629,19 @@ test "mlx metal backend lowers metadata custom call and optimization barrier on 
         },
         .values = values,
         .parameter_shardings = parameter_shardings,
-        .output_shardings = try allocator.alloc(core.ShardingPlan, 0),
-        .output_ids = try allocator.dupe(core.ValueId, &.{ .{ .index = 3 }, .{ .index = 4 } }),
-        .instructions = try allocator.dupe(core.PlanInstruction, &.{
+        .output_shardings = try allocator.alloc(ir.ShardingPlan, 0),
+        .output_ids = try allocator.dupe(ir.ValueId, &.{ .{ .index = 3 }, .{ .index = 4 } }),
+        .instructions = try allocator.dupe(ir.PlanInstruction, &.{
             .{
                 .kind = .optimization_barrier,
-                .inputs = try allocator.dupe(core.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
-                .outputs = try allocator.dupe(core.ValueId, &.{ .{ .index = 2 }, .{ .index = 3 } }),
+                .inputs = try allocator.dupe(ir.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+                .outputs = try allocator.dupe(ir.ValueId, &.{ .{ .index = 2 }, .{ .index = 3 } }),
                 .dims = try allocator.dupe(i64, &dims),
             },
             .{
                 .kind = .custom_call,
-                .inputs = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
-                .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 4 }}),
+                .inputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 2 }}),
+                .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 4 }}),
                 .dims = try allocator.dupe(i64, &dims),
                 .custom_call_target = try allocator.dupe(u8, "annotate_device_placement"),
             },
@@ -7001,7 +6680,7 @@ test "mlx metal backend rejects gspmd custom call targets precisely" {
     const assignment = [_]i32{0};
     const dims = [_]i64{4};
 
-    const values = try allocator.alloc(core.Value, 2);
+    const values = try allocator.alloc(ir.Value, 2);
     for (values, 0..) |*value, index| {
         value.* = .{
             .id = .{ .index = @intCast(index) },
@@ -7016,14 +6695,14 @@ test "mlx metal backend rejects gspmd custom call targets precisely" {
         };
     }
 
-    const parameter_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    const parameter_shardings = try allocator.alloc(ir.ShardingPlan, 1);
     parameter_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, "test"),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
 
-    var plan = core.ExecutablePlan{
+    var plan = ir.ExecutablePlan{
         .allocator = allocator,
         .options = .{
             .num_replicas = 1,
@@ -7032,12 +6711,12 @@ test "mlx metal backend rejects gspmd custom call targets precisely" {
         },
         .values = values,
         .parameter_shardings = parameter_shardings,
-        .output_shardings = try allocator.alloc(core.ShardingPlan, 0),
-        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 1 }}),
-        .instructions = try allocator.dupe(core.PlanInstruction, &.{.{
+        .output_shardings = try allocator.alloc(ir.ShardingPlan, 0),
+        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
+        .instructions = try allocator.dupe(ir.PlanInstruction, &.{.{
             .kind = .custom_call,
-            .inputs = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }}),
-            .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 1 }}),
+            .inputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 0 }}),
+            .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
             .dims = try allocator.dupe(i64, &dims),
             .custom_call_target = try allocator.dupe(u8, "Sharding"),
         }}),
@@ -7071,7 +6750,7 @@ test "mlx metal backend runs registered binary custom call on device buffers" {
     });
     defer b.unregisterCustomCall(target);
 
-    const values = try allocator.alloc(core.Value, 3);
+    const values = try allocator.alloc(ir.Value, 3);
     for (values, 0..) |*value, index| {
         value.* = .{
             .id = .{ .index = @intCast(index) },
@@ -7086,7 +6765,7 @@ test "mlx metal backend runs registered binary custom call on device buffers" {
         };
     }
 
-    const parameter_shardings = try allocator.alloc(core.ShardingPlan, 2);
+    const parameter_shardings = try allocator.alloc(ir.ShardingPlan, 2);
     for (parameter_shardings) |*sharding| {
         sharding.* = .{
             .kind = .replicated,
@@ -7095,7 +6774,7 @@ test "mlx metal backend runs registered binary custom call on device buffers" {
         };
     }
 
-    var plan = core.ExecutablePlan{
+    var plan = ir.ExecutablePlan{
         .allocator = allocator,
         .options = .{
             .num_replicas = 1,
@@ -7104,12 +6783,12 @@ test "mlx metal backend runs registered binary custom call on device buffers" {
         },
         .values = values,
         .parameter_shardings = parameter_shardings,
-        .output_shardings = try allocator.alloc(core.ShardingPlan, 0),
-        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
-        .instructions = try allocator.dupe(core.PlanInstruction, &.{.{
+        .output_shardings = try allocator.alloc(ir.ShardingPlan, 0),
+        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 2 }}),
+        .instructions = try allocator.dupe(ir.PlanInstruction, &.{.{
             .kind = .custom_call,
-            .inputs = try allocator.dupe(core.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
-            .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
+            .inputs = try allocator.dupe(ir.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+            .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 2 }}),
             .dims = try allocator.dupe(i64, &dims),
             .custom_call_target = try allocator.dupe(u8, target),
         }}),
@@ -7149,7 +6828,7 @@ test "mlx metal backend executable materializes iota on device" {
     const dims = [_]i64{ 2, 3 };
     const assignment = [_]i32{0};
 
-    const values = try allocator.alloc(core.Value, 1);
+    const values = try allocator.alloc(ir.Value, 1);
     errdefer allocator.free(values);
     values[0] = .{
         .id = .{ .index = 0 },
@@ -7163,15 +6842,15 @@ test "mlx metal backend executable materializes iota on device" {
         },
     };
 
-    const parameter_shardings = try allocator.alloc(core.ShardingPlan, 0);
-    const output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    const parameter_shardings = try allocator.alloc(ir.ShardingPlan, 0);
+    const output_shardings = try allocator.alloc(ir.ShardingPlan, 1);
     output_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
 
-    var plan = core.ExecutablePlan{
+    var plan = ir.ExecutablePlan{
         .allocator = allocator,
         .options = .{
             .num_replicas = 1,
@@ -7181,10 +6860,10 @@ test "mlx metal backend executable materializes iota on device" {
         .values = values,
         .parameter_shardings = parameter_shardings,
         .output_shardings = output_shardings,
-        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }}),
-        .instructions = try allocator.dupe(core.PlanInstruction, &.{.{
+        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 0 }}),
+        .instructions = try allocator.dupe(ir.PlanInstruction, &.{.{
             .kind = .iota,
-            .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }}),
+            .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 0 }}),
             .dims = try allocator.dupe(i64, &dims),
             .iota_dimension = 1,
         }}),
@@ -7203,7 +6882,7 @@ test "mlx metal backend executable materializes iota on device" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), outputs.len);
-    try std.testing.expectEqual(core.BufferType.f32, outputs[0].element_type);
+    try std.testing.expectEqual(ir.BufferType.f32, outputs[0].element_type);
     try std.testing.expectEqualSlices(i64, &dims, outputs[0].dims);
     var actual: [6]f32 = undefined;
     try b.copyToHost(outputs[0].handle, std.mem.asBytes(&actual));
@@ -7218,7 +6897,7 @@ test "mlx metal backend executable materializes partition_id on device" {
     const local_hardware_id = devices[0].local_hardware_id;
     const assignment = [_]i32{0};
 
-    const values = try allocator.alloc(core.Value, 1);
+    const values = try allocator.alloc(ir.Value, 1);
     errdefer allocator.free(values);
     values[0] = .{
         .id = .{ .index = 0 },
@@ -7232,15 +6911,15 @@ test "mlx metal backend executable materializes partition_id on device" {
         },
     };
 
-    const parameter_shardings = try allocator.alloc(core.ShardingPlan, 0);
-    const output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    const parameter_shardings = try allocator.alloc(ir.ShardingPlan, 0);
+    const output_shardings = try allocator.alloc(ir.ShardingPlan, 1);
     output_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
 
-    var plan = core.ExecutablePlan{
+    var plan = ir.ExecutablePlan{
         .allocator = allocator,
         .options = .{
             .num_replicas = 1,
@@ -7250,10 +6929,10 @@ test "mlx metal backend executable materializes partition_id on device" {
         .values = values,
         .parameter_shardings = parameter_shardings,
         .output_shardings = output_shardings,
-        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }}),
-        .instructions = try allocator.dupe(core.PlanInstruction, &.{.{
+        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 0 }}),
+        .instructions = try allocator.dupe(ir.PlanInstruction, &.{.{
             .kind = .partition_id,
-            .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }}),
+            .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 0 }}),
         }}),
     };
     defer plan.deinit();
@@ -7270,7 +6949,7 @@ test "mlx metal backend executable materializes partition_id on device" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), outputs.len);
-    try std.testing.expectEqual(core.BufferType.u32, outputs[0].element_type);
+    try std.testing.expectEqual(ir.BufferType.u32, outputs[0].element_type);
     try std.testing.expectEqual(@as(usize, 0), outputs[0].dims.len);
     var actual: u32 = undefined;
     try b.copyToHost(outputs[0].handle, std.mem.asBytes(&actual));
@@ -7286,7 +6965,7 @@ test "mlx metal backend executable lowers deprecated rng on device" {
     const output_dims = [_]i64{ 2, 4 };
     const assignment = [_]i32{0};
 
-    const values = try allocator.alloc(core.Value, 3);
+    const values = try allocator.alloc(ir.Value, 3);
     errdefer allocator.free(values);
     values[0] = .{
         .id = .{ .index = 0 },
@@ -7322,7 +7001,7 @@ test "mlx metal backend executable lowers deprecated rng on device" {
         },
     };
 
-    var parameter_shardings = try allocator.alloc(core.ShardingPlan, 2);
+    var parameter_shardings = try allocator.alloc(ir.ShardingPlan, 2);
     parameter_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
@@ -7333,14 +7012,14 @@ test "mlx metal backend executable lowers deprecated rng on device" {
         .mesh_name = try allocator.dupe(u8, ""),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
-    var output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    var output_shardings = try allocator.alloc(ir.ShardingPlan, 1);
     output_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
 
-    var plan = core.ExecutablePlan{
+    var plan = ir.ExecutablePlan{
         .allocator = allocator,
         .options = .{
             .num_replicas = 1,
@@ -7350,11 +7029,11 @@ test "mlx metal backend executable lowers deprecated rng on device" {
         .values = values,
         .parameter_shardings = parameter_shardings,
         .output_shardings = output_shardings,
-        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
-        .instructions = try allocator.dupe(core.PlanInstruction, &.{.{
+        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 2 }}),
+        .instructions = try allocator.dupe(ir.PlanInstruction, &.{.{
             .kind = .rng,
-            .inputs = try allocator.dupe(core.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
-            .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
+            .inputs = try allocator.dupe(ir.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+            .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 2 }}),
             .dims = try allocator.dupe(i64, &output_dims),
             .rng_distribution = .normal,
         }}),
@@ -7380,7 +7059,7 @@ test "mlx metal backend executable lowers deprecated rng on device" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), outputs.len);
-    try std.testing.expectEqual(core.BufferType.f32, outputs[0].element_type);
+    try std.testing.expectEqual(ir.BufferType.f32, outputs[0].element_type);
     try std.testing.expectEqualSlices(i64, &output_dims, outputs[0].dims);
     var actual: [8]f32 = undefined;
     try b.copyToHost(outputs[0].handle, std.mem.asBytes(&actual));
@@ -7398,7 +7077,7 @@ test "mlx metal backend executable lowers clamp with scalar bounds" {
     const min_literal_value: f32 = -1.0;
     const max_literal_value: f32 = 2.0;
 
-    const values = try allocator.alloc(core.Value, 4);
+    const values = try allocator.alloc(ir.Value, 4);
     errdefer allocator.free(values);
     values[0] = .{
         .id = .{ .index = 0 },
@@ -7445,20 +7124,20 @@ test "mlx metal backend executable lowers clamp with scalar bounds" {
         },
     };
 
-    var parameter_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    var parameter_shardings = try allocator.alloc(ir.ShardingPlan, 1);
     parameter_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
-    var output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    var output_shardings = try allocator.alloc(ir.ShardingPlan, 1);
     output_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
 
-    var plan = core.ExecutablePlan{
+    var plan = ir.ExecutablePlan{
         .allocator = allocator,
         .options = .{
             .num_replicas = 1,
@@ -7468,22 +7147,22 @@ test "mlx metal backend executable lowers clamp with scalar bounds" {
         .values = values,
         .parameter_shardings = parameter_shardings,
         .output_shardings = output_shardings,
-        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 3 }}),
-        .instructions = try allocator.dupe(core.PlanInstruction, &.{
+        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 3 }}),
+        .instructions = try allocator.dupe(ir.PlanInstruction, &.{
             .{
                 .kind = .constant,
-                .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 0 }}),
+                .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 0 }}),
                 .literal = try allocator.dupe(u8, std.mem.asBytes(&min_literal_value)),
             },
             .{
                 .kind = .constant,
-                .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
+                .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 2 }}),
                 .literal = try allocator.dupe(u8, std.mem.asBytes(&max_literal_value)),
             },
             .{
                 .kind = .clamp,
-                .inputs = try allocator.dupe(core.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 }, .{ .index = 2 } }),
-                .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 3 }}),
+                .inputs = try allocator.dupe(ir.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 }, .{ .index = 2 } }),
+                .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 3 }}),
                 .dims = try allocator.dupe(i64, &dims),
             },
         }),
@@ -7518,7 +7197,7 @@ test "mlx metal backend executable rejects unsupported gather form during loweri
     const index_dims = [_]i64{2};
     const output_dims = [_]i64{ 2, 2 };
 
-    const values = try allocator.alloc(core.Value, 3);
+    const values = try allocator.alloc(ir.Value, 3);
     errdefer allocator.free(values);
     values[0] = .{
         .id = .{ .index = 0 },
@@ -7554,7 +7233,7 @@ test "mlx metal backend executable rejects unsupported gather form during loweri
         },
     };
 
-    var parameter_shardings = try allocator.alloc(core.ShardingPlan, 2);
+    var parameter_shardings = try allocator.alloc(ir.ShardingPlan, 2);
     parameter_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
@@ -7565,14 +7244,14 @@ test "mlx metal backend executable rejects unsupported gather form during loweri
         .mesh_name = try allocator.dupe(u8, ""),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
-    var output_shardings = try allocator.alloc(core.ShardingPlan, 1);
+    var output_shardings = try allocator.alloc(ir.ShardingPlan, 1);
     output_shardings[0] = .{
         .kind = .replicated,
         .mesh_name = try allocator.dupe(u8, ""),
         .device_assignment = try allocator.dupe(i32, &assignment),
     };
 
-    var plan = core.ExecutablePlan{
+    var plan = ir.ExecutablePlan{
         .allocator = allocator,
         .options = .{
             .num_replicas = 1,
@@ -7582,11 +7261,11 @@ test "mlx metal backend executable rejects unsupported gather form during loweri
         .values = values,
         .parameter_shardings = parameter_shardings,
         .output_shardings = output_shardings,
-        .output_ids = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
-        .instructions = try allocator.dupe(core.PlanInstruction, &.{.{
+        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 2 }}),
+        .instructions = try allocator.dupe(ir.PlanInstruction, &.{.{
             .kind = .gather,
-            .inputs = try allocator.dupe(core.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
-            .outputs = try allocator.dupe(core.ValueId, &.{.{ .index = 2 }}),
+            .inputs = try allocator.dupe(ir.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+            .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 2 }}),
             .dims = try allocator.dupe(i64, &output_dims),
             .start_index_map = try allocator.dupe(i64, &.{ 0, 1 }),
             .collapsed_slice_dims = try allocator.dupe(i64, &.{1}),

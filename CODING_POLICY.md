@@ -24,8 +24,9 @@ Keep boundaries crisp:
   planning, legalization, diagnostics, and executable plans.
 - Backend code owns MLX/Metal integration, device execution, backend programs,
   resident constants, custom-call execution, and backend capabilities.
-- Core/domain packages own shared value concepts only when those concepts have
-  stable invariants across layers.
+- Compiler-owned IR modules own shared tensor vocabulary and executable-plan
+  concepts. Do not recreate `src/core`, `shared`, or `common` packages for
+  cross-layer convenience.
 
 Do not let concerns leak upward:
 

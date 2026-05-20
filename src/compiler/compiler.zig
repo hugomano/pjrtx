@@ -1,6 +1,6 @@
 const std = @import("std");
 const mlir = @import("c");
-const core = @import("src/core");
+const ir = @import("src/compiler/ir");
 
 var shardy_pass_registration_mutex: std.atomic.Mutex = .unlocked;
 var shardy_passes_registered = false;
@@ -12,7 +12,7 @@ pub const Partitioner = enum {
     gspmd,
 };
 
-pub const CompileOptions = core.CompileOptions;
+pub const CompileOptions = ir.CompileOptions;
 
 pub const ProgramFormat = enum {
     stablehlo_text,
@@ -46,9 +46,9 @@ pub const Operation = struct {
     name: []const u8,
     line: usize,
     column: usize,
-    inputs: []const core.ValueId = &.{},
-    outputs: []const core.ValueId = &.{},
-    region_ids: []const core.RegionId = &.{},
+    inputs: []const ir.ValueId = &.{},
+    outputs: []const ir.ValueId = &.{},
+    region_ids: []const ir.RegionId = &.{},
     dtype: []const u8 = "unknown",
     rank: ?usize = null,
     dims: []const i64 = &.{},
@@ -77,20 +77,20 @@ pub const Operation = struct {
     scatter_indices_batching_dims: []const i64 = &.{},
     scatter_dims_to_operand_dims: []const i64 = &.{},
     index_vector_dim: ?i64 = null,
-    scatter_update_kind: ?core.ScatterUpdateKind = null,
+    scatter_update_kind: ?ir.ScatterUpdateKind = null,
     dimension: ?i64 = null,
     top_k_k: ?i64 = null,
     iota_dimension: ?i64 = null,
-    fft_kind: ?core.FftKind = null,
+    fft_kind: ?ir.FftKind = null,
     dimensions: []const i64 = &.{},
     tuple_index: ?i64 = null,
     lower: ?bool = null,
     triangular_left_side: ?bool = null,
     triangular_lower: ?bool = null,
     triangular_unit_diagonal: ?bool = null,
-    triangular_transpose: ?core.TriangularSolveTranspose = null,
+    triangular_transpose: ?ir.TriangularSolveTranspose = null,
     custom_call_target: []const u8 = &.{},
-    rng_distribution: ?core.RngDistribution = null,
+    rng_distribution: ?ir.RngDistribution = null,
     reduce_dimensions: []const i64 = &.{},
     lhs_batch_dimensions: []const i64 = &.{},
     rhs_batch_dimensions: []const i64 = &.{},
@@ -107,7 +107,7 @@ pub const Operation = struct {
     output_spatial_dimensions: []const i64 = &.{},
     feature_group_count: ?i64 = null,
     batch_group_count: ?i64 = null,
-    compare_direction: ?core.CompareOp = null,
+    compare_direction: ?ir.CompareOp = null,
     literal: []const u8 = &.{},
     sharding: []const u8 = "unspecified",
 
@@ -157,19 +157,19 @@ pub const Operation = struct {
     }
 };
 
-pub const ShardingKind = core.ShardingKind;
-pub const ShardingMetadata = core.ShardingMetadata;
+pub const ShardingKind = ir.ShardingKind;
+pub const ShardingMetadata = ir.ShardingMetadata;
 
 pub const ModuleAnalysis = struct {
     allocator: std.mem.Allocator,
     source: []u8,
     dialects: []Dialect,
     ops: []Operation,
-    values: []core.Value,
-    regions: []core.PlanRegion,
-    output_ids: []const core.ValueId,
-    output_aliases: []const core.OutputAlias,
-    parameter_descriptors: []core.BufferDescriptor,
+    values: []ir.Value,
+    regions: []ir.PlanRegion,
+    output_ids: []const ir.ValueId,
+    output_aliases: []const ir.OutputAlias,
+    parameter_descriptors: []ir.BufferDescriptor,
     num_parameters: usize,
     num_outputs: usize,
     parameter_shardings: []ShardingMetadata,
@@ -479,13 +479,13 @@ fn isLikelyTextMlir(source: []const u8) bool {
     return true;
 }
 
-pub const ShardingPlan = core.ShardingPlan;
-pub const Value = core.Value;
-pub const ValueId = core.ValueId;
-pub const ValueRole = core.ValueRole;
-pub const PlanInstructionKind = core.PlanInstructionKind;
-pub const PlanInstruction = core.PlanInstruction;
-pub const ExecutablePlan = core.ExecutablePlan;
+pub const ShardingPlan = ir.ShardingPlan;
+pub const Value = ir.Value;
+pub const ValueId = ir.ValueId;
+pub const ValueRole = ir.ValueRole;
+pub const PlanInstructionKind = ir.PlanInstructionKind;
+pub const PlanInstruction = ir.PlanInstruction;
+pub const ExecutablePlan = ir.ExecutablePlan;
 pub const VerifyError = std.Io.Writer.Error || error{
     InvalidExecutablePlan,
     OutOfMemory,
@@ -557,7 +557,7 @@ pub fn makeReplicatedPlan(
     const output_shardings = try allocator.alloc(ShardingPlan, num_outputs);
     errdefer allocator.free(output_shardings);
 
-    const parameter_descriptors = try allocator.alloc(core.BufferDescriptor, num_parameters);
+    const parameter_descriptors = try allocator.alloc(ir.BufferDescriptor, num_parameters);
     defer allocator.free(parameter_descriptors);
     @memset(parameter_descriptors, makeDescriptor(&.{}, .invalid));
     const values = try makeBootstrapValues(allocator, parameter_descriptors, &.{}, 1);
@@ -648,7 +648,7 @@ fn applyAnalysisShardingMetadataToPlan(
     }
 }
 
-fn donatedParametersFromOutputAliases(allocator: std.mem.Allocator, output_aliases: []const core.OutputAlias) ![]const u32 {
+fn donatedParametersFromOutputAliases(allocator: std.mem.Allocator, output_aliases: []const ir.OutputAlias) ![]const u32 {
     var donated: std.ArrayList(u32) = .empty;
     defer donated.deinit(allocator);
     for (output_aliases) |alias| {
@@ -671,7 +671,7 @@ pub fn makeExecutablePlan(
     if (options.use_shardy_partitioner) {
         try applyAnalysisShardingMetadataToPlan(allocator, &plan, analysis);
     }
-    plan.output_aliases = try allocator.dupe(core.OutputAlias, analysis.output_aliases);
+    plan.output_aliases = try allocator.dupe(ir.OutputAlias, analysis.output_aliases);
     plan.donated_parameter_indices = try donatedParametersFromOutputAliases(allocator, plan.output_aliases);
     freeInstructions(allocator, plan.instructions);
     plan.instructions = &.{};
@@ -775,7 +775,7 @@ fn instructionKindFromStablehlo(name: []const u8) PlanInstructionKind {
     return .unsupported;
 }
 
-fn bufferTypeFromDtype(dtype: []const u8) core.BufferType {
+fn bufferTypeFromDtype(dtype: []const u8) ir.BufferType {
     if (std.mem.eql(u8, dtype, "pred")) return .pred;
     if (std.mem.eql(u8, dtype, "i8") or std.mem.eql(u8, dtype, "s8")) return .s8;
     if (std.mem.eql(u8, dtype, "i16") or std.mem.eql(u8, dtype, "s16")) return .s16;
@@ -794,7 +794,7 @@ fn bufferTypeFromDtype(dtype: []const u8) core.BufferType {
     return .invalid;
 }
 
-fn makeDescriptor(dims: []const i64, element_type: core.BufferType) core.BufferDescriptor {
+fn makeDescriptor(dims: []const i64, element_type: ir.BufferType) ir.BufferDescriptor {
     return .{
         .element_type = element_type,
         .dims = dims,
@@ -804,23 +804,23 @@ fn makeDescriptor(dims: []const i64, element_type: core.BufferType) core.BufferD
     };
 }
 
-fn descriptorFromOperation(allocator: std.mem.Allocator, op: Operation) !core.BufferDescriptor {
+fn descriptorFromOperation(allocator: std.mem.Allocator, op: Operation) !ir.BufferDescriptor {
     return makeDescriptor(try allocator.dupe(i64, op.dims), bufferTypeFromDtype(op.dtype));
 }
 
-fn descriptorFromType(allocator: std.mem.Allocator, ty: mlir.MlirType) !core.BufferDescriptor {
+fn descriptorFromType(allocator: std.mem.Allocator, ty: mlir.MlirType) !ir.BufferDescriptor {
     if (mlir.mlirTypeIsNull(ty)) return makeDescriptor(try allocator.dupe(i64, &.{}), .invalid);
     const dtype = try typeDtype(allocator, ty);
     defer allocator.free(dtype);
     return makeDescriptor(try typeDims(allocator, ty), bufferTypeFromDtype(dtype));
 }
 
-fn freeDescriptorList(allocator: std.mem.Allocator, descriptors: []const core.BufferDescriptor) void {
+fn freeDescriptorList(allocator: std.mem.Allocator, descriptors: []const ir.BufferDescriptor) void {
     for (descriptors) |descriptor| allocator.free(descriptor.dims);
     allocator.free(descriptors);
 }
 
-fn freeRegionValueList(allocator: std.mem.Allocator, values: []const core.RegionValue) void {
+fn freeRegionValueList(allocator: std.mem.Allocator, values: []const ir.RegionValue) void {
     for (values) |value| {
         allocator.free(value.descriptor.dims);
         if (value.literal) |literal| allocator.free(literal);
@@ -828,7 +828,7 @@ fn freeRegionValueList(allocator: std.mem.Allocator, values: []const core.Region
     allocator.free(values);
 }
 
-fn freeRegionInstructionList(allocator: std.mem.Allocator, instructions: []const core.RegionInstruction) void {
+fn freeRegionInstructionList(allocator: std.mem.Allocator, instructions: []const ir.RegionInstruction) void {
     for (instructions) |instruction| {
         allocator.free(instruction.inputs);
         allocator.free(instruction.outputs);
@@ -838,7 +838,7 @@ fn freeRegionInstructionList(allocator: std.mem.Allocator, instructions: []const
     allocator.free(instructions);
 }
 
-fn freeRegions(allocator: std.mem.Allocator, regions: []const core.PlanRegion) void {
+fn freeRegions(allocator: std.mem.Allocator, regions: []const ir.PlanRegion) void {
     for (regions) |region| {
         freeRegionValueList(allocator, region.values);
         freeDescriptorList(allocator, region.argument_descriptors);
@@ -850,7 +850,7 @@ fn freeRegions(allocator: std.mem.Allocator, regions: []const core.PlanRegion) v
     allocator.free(regions);
 }
 
-fn freeRegionContents(allocator: std.mem.Allocator, regions: []const core.PlanRegion) void {
+fn freeRegionContents(allocator: std.mem.Allocator, regions: []const ir.PlanRegion) void {
     for (regions) |region| {
         freeRegionValueList(allocator, region.values);
         freeDescriptorList(allocator, region.argument_descriptors);
@@ -941,7 +941,7 @@ fn isBinaryKind(kind: PlanInstructionKind) bool {
     };
 }
 
-fn makeValue(id: u32, role: ValueRole, descriptor: core.BufferDescriptor) Value {
+fn makeValue(id: u32, role: ValueRole, descriptor: ir.BufferDescriptor) Value {
     return .{
         .id = .{ .index = id },
         .role = role,
@@ -952,8 +952,8 @@ fn makeValue(id: u32, role: ValueRole, descriptor: core.BufferDescriptor) Value 
 fn makeStructuredValue(
     id: u32,
     role: ValueRole,
-    descriptor: core.BufferDescriptor,
-    storage: core.ValueStorageKind,
+    descriptor: ir.BufferDescriptor,
+    storage: ir.ValueStorageKind,
     elements: []const ValueId,
 ) Value {
     return .{
@@ -965,13 +965,13 @@ fn makeStructuredValue(
     };
 }
 
-fn makeUnknownDescriptor(allocator: std.mem.Allocator) !core.BufferDescriptor {
+fn makeUnknownDescriptor(allocator: std.mem.Allocator) !ir.BufferDescriptor {
     return makeDescriptor(try allocator.dupe(i64, &.{}), .invalid);
 }
 
 fn makeBootstrapValues(
     allocator: std.mem.Allocator,
-    parameter_descriptors: []const core.BufferDescriptor,
+    parameter_descriptors: []const ir.BufferDescriptor,
     ops: []const Operation,
     num_instruction_results: usize,
 ) ![]Value {
@@ -1020,8 +1020,8 @@ fn cloneValues(allocator: std.mem.Allocator, source: []const Value) ![]Value {
     return values;
 }
 
-fn cloneDescriptorList(allocator: std.mem.Allocator, source: []const core.BufferDescriptor) ![]const core.BufferDescriptor {
-    const descriptors = try allocator.alloc(core.BufferDescriptor, source.len);
+fn cloneDescriptorList(allocator: std.mem.Allocator, source: []const ir.BufferDescriptor) ![]const ir.BufferDescriptor {
+    const descriptors = try allocator.alloc(ir.BufferDescriptor, source.len);
     var initialized: usize = 0;
     errdefer {
         for (descriptors[0..initialized]) |descriptor| allocator.free(descriptor.dims);
@@ -1038,8 +1038,8 @@ fn cloneDescriptorList(allocator: std.mem.Allocator, source: []const core.Buffer
     return descriptors;
 }
 
-fn cloneRegionValueList(allocator: std.mem.Allocator, source: []const core.RegionValue) ![]const core.RegionValue {
-    const values = try allocator.alloc(core.RegionValue, source.len);
+fn cloneRegionValueList(allocator: std.mem.Allocator, source: []const ir.RegionValue) ![]const ir.RegionValue {
+    const values = try allocator.alloc(ir.RegionValue, source.len);
     var initialized: usize = 0;
     errdefer {
         for (values[0..initialized]) |value| {
@@ -1072,8 +1072,8 @@ fn cloneRegionValueList(allocator: std.mem.Allocator, source: []const core.Regio
     return values;
 }
 
-fn cloneRegionInstructionList(allocator: std.mem.Allocator, source: []const core.RegionInstruction) ![]const core.RegionInstruction {
-    const instructions = try allocator.alloc(core.RegionInstruction, source.len);
+fn cloneRegionInstructionList(allocator: std.mem.Allocator, source: []const ir.RegionInstruction) ![]const ir.RegionInstruction {
+    const instructions = try allocator.alloc(ir.RegionInstruction, source.len);
     var initialized: usize = 0;
     errdefer {
         for (instructions[0..initialized]) |instruction| {
@@ -1085,9 +1085,9 @@ fn cloneRegionInstructionList(allocator: std.mem.Allocator, source: []const core
         allocator.free(instructions);
     }
     for (source, instructions) |src, *dst| {
-        const inputs = try allocator.dupe(core.RegionValueId, src.inputs);
+        const inputs = try allocator.dupe(ir.RegionValueId, src.inputs);
         errdefer allocator.free(inputs);
-        const outputs = try allocator.dupe(core.RegionValueId, src.outputs);
+        const outputs = try allocator.dupe(ir.RegionValueId, src.outputs);
         errdefer allocator.free(outputs);
         const operands = try cloneDescriptorList(allocator, src.operand_descriptors);
         errdefer freeDescriptorList(allocator, operands);
@@ -1108,8 +1108,8 @@ fn cloneRegionInstructionList(allocator: std.mem.Allocator, source: []const core
     return instructions;
 }
 
-fn cloneRegions(allocator: std.mem.Allocator, source: []const core.PlanRegion) ![]core.PlanRegion {
-    const regions = try allocator.alloc(core.PlanRegion, source.len);
+fn cloneRegions(allocator: std.mem.Allocator, source: []const ir.PlanRegion) ![]ir.PlanRegion {
+    const regions = try allocator.alloc(ir.PlanRegion, source.len);
     var initialized: usize = 0;
     errdefer {
         for (regions[0..initialized]) |region| {
@@ -1131,7 +1131,7 @@ fn cloneRegions(allocator: std.mem.Allocator, source: []const core.PlanRegion) !
         errdefer freeRegionInstructionList(allocator, instructions);
         const returns = try cloneDescriptorList(allocator, src.return_descriptors);
         errdefer freeDescriptorList(allocator, returns);
-        const terminator_operand_ids = try allocator.dupe(core.RegionValueId, src.terminator_operands);
+        const terminator_operand_ids = try allocator.dupe(ir.RegionValueId, src.terminator_operands);
         errdefer allocator.free(terminator_operand_ids);
         const terminator_operand_descriptors = try cloneDescriptorList(allocator, src.terminator_operand_descriptors);
         errdefer freeDescriptorList(allocator, terminator_operand_descriptors);
@@ -1254,7 +1254,7 @@ fn makePlanInstruction(
     errdefer if (inputs.len != 0) allocator.free(inputs);
     const outputs = try allocator.dupe(ValueId, op.outputs);
     errdefer allocator.free(outputs);
-    const region_ids = try allocator.dupe(core.RegionId, op.region_ids);
+    const region_ids = try allocator.dupe(ir.RegionId, op.region_ids);
     errdefer allocator.free(region_ids);
     const dims = if (kind != .constant and kind != .unsupported) try allocator.dupe(i64, op.dims) else null;
     errdefer if (dims) |owned| allocator.free(owned);
@@ -1411,7 +1411,7 @@ fn lowerAnalysisOpsToPlan(allocator: std.mem.Allocator, ops: []const Operation, 
     return plan_instructions;
 }
 
-fn pruneDeadPlanInstructions(allocator: std.mem.Allocator, instructions: []PlanInstruction, output_ids: []const ValueId, value_count: usize, regions: []core.PlanRegion) ![]PlanInstruction {
+fn pruneDeadPlanInstructions(allocator: std.mem.Allocator, instructions: []PlanInstruction, output_ids: []const ValueId, value_count: usize, regions: []ir.PlanRegion) ![]PlanInstruction {
     if (instructions.len == 0) return instructions;
     var live_values = try allocator.alloc(bool, value_count);
     defer allocator.free(live_values);
@@ -1514,15 +1514,15 @@ fn valueInPlan(plan: ExecutablePlan, id: ValueId) bool {
     return index < plan.values.len and plan.values[index].id.index == id.index;
 }
 
-fn descriptorKnown(descriptor: core.BufferDescriptor) bool {
+fn descriptorKnown(descriptor: ir.BufferDescriptor) bool {
     return descriptor.element_type != .invalid;
 }
 
-fn sameShape(lhs: core.BufferDescriptor, rhs: core.BufferDescriptor) bool {
+fn sameShape(lhs: ir.BufferDescriptor, rhs: ir.BufferDescriptor) bool {
     return std.mem.eql(i64, lhs.dims, rhs.dims);
 }
 
-fn sameTypeAndShape(lhs: core.BufferDescriptor, rhs: core.BufferDescriptor) bool {
+fn sameTypeAndShape(lhs: ir.BufferDescriptor, rhs: ir.BufferDescriptor) bool {
     if (!descriptorKnown(lhs) or !descriptorKnown(rhs)) return true;
     return lhs.element_type == rhs.element_type and sameShape(lhs, rhs);
 }
@@ -1605,7 +1605,7 @@ fn verifyInstructionDescriptors(
         },
         .bitcast_convert => {
             const input = plan.values[instruction.inputs[0].index].descriptor;
-            if (descriptorKnown(input) and descriptorKnown(output) and core.denseByteSize(input.element_type, input.dims) != core.denseByteSize(output.element_type, output.dims)) {
+            if (descriptorKnown(input) and descriptorKnown(output) and ir.denseByteSize(input.element_type, input.dims) != ir.denseByteSize(output.element_type, output.dims)) {
                 return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "bitcast_convert must preserve dense byte size", "shape-type");
             }
         },
@@ -1624,7 +1624,7 @@ fn verifyInstructionDescriptors(
             if (descriptorKnown(input) and descriptorKnown(output) and input.element_type != output.element_type) {
                 return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "reshape must preserve dtype", "shape-type");
             }
-            if (descriptorKnown(input) and descriptorKnown(output) and core.denseByteSize(input.element_type, input.dims) != core.denseByteSize(output.element_type, output.dims)) {
+            if (descriptorKnown(input) and descriptorKnown(output) and ir.denseByteSize(input.element_type, input.dims) != ir.denseByteSize(output.element_type, output.dims)) {
                 return failPlanVerification(writer, pass_name, instruction_index, instruction.outputs[0], "reshape must preserve dense byte size", "shape-type");
             }
         },
@@ -2185,7 +2185,7 @@ fn stringAttribute(allocator: std.mem.Allocator, attr: mlir.MlirAttribute) ![]co
     return allocator.dupe(u8, mlirStringSlice(mlir.mlirStringAttrGetValue(attr)));
 }
 
-fn fftKindFromAttr(attr: mlir.MlirAttribute) ?core.FftKind {
+fn fftKindFromAttr(attr: mlir.MlirAttribute) ?ir.FftKind {
     if (mlir.mlirAttributeIsNull(attr) or !mlir.stablehloAttributeIsAFftTypeAttr(attr)) return null;
     const text = mlirStringSlice(mlir.stablehloFftTypeAttrGetValue(attr));
     if (std.mem.eql(u8, text, "FFT")) return .fft;
@@ -2195,7 +2195,7 @@ fn fftKindFromAttr(attr: mlir.MlirAttribute) ?core.FftKind {
     return null;
 }
 
-fn rngDistributionFromAttr(attr: mlir.MlirAttribute) ?core.RngDistribution {
+fn rngDistributionFromAttr(attr: mlir.MlirAttribute) ?ir.RngDistribution {
     if (mlir.mlirAttributeIsNull(attr) or !mlir.stablehloAttributeIsARngDistributionAttr(attr)) return null;
     const text = mlirStringSlice(mlir.stablehloRngDistributionAttrGetValue(attr));
     if (std.mem.eql(u8, text, "UNIFORM")) return .uniform;
@@ -2203,7 +2203,7 @@ fn rngDistributionFromAttr(attr: mlir.MlirAttribute) ?core.RngDistribution {
     return null;
 }
 
-fn triangularTransposeFromAttr(attr: mlir.MlirAttribute) ?core.TriangularSolveTranspose {
+fn triangularTransposeFromAttr(attr: mlir.MlirAttribute) ?ir.TriangularSolveTranspose {
     if (mlir.mlirAttributeIsNull(attr) or !mlir.stablehloAttributeIsATransposeAttr(attr)) return null;
     const text = mlirStringSlice(mlir.stablehloTransposeAttrGetValue(attr));
     if (std.mem.eql(u8, text, "NO_TRANSPOSE")) return .no_transpose;
@@ -2323,15 +2323,15 @@ const CapiAnalysisBuilder = struct {
     diagnostic_writer: *std.Io.Writer,
     dialects: std.ArrayList(Dialect) = .empty,
     ops: std.ArrayList(Operation) = .empty,
-    regions: std.ArrayList(core.PlanRegion) = .empty,
-    parameter_descriptors: std.ArrayList(core.BufferDescriptor) = .empty,
+    regions: std.ArrayList(ir.PlanRegion) = .empty,
+    parameter_descriptors: std.ArrayList(ir.BufferDescriptor) = .empty,
     parameter_shardings: std.ArrayList(ShardingMetadata) = .empty,
     output_shardings: std.ArrayList(ShardingMetadata) = .empty,
     values: std.ArrayList(Value) = .empty,
     value_map: std.ArrayList(ValueMapEntry) = .empty,
     value_parameter_aliases: std.ArrayList(ValueParameterAlias) = .empty,
     output_ids: std.ArrayList(ValueId) = .empty,
-    output_aliases: std.ArrayList(core.OutputAlias) = .empty,
+    output_aliases: std.ArrayList(ir.OutputAlias) = .empty,
     num_parameters: usize = 0,
     num_outputs: usize = 0,
     saw_program_body: bool = false,
@@ -2381,12 +2381,12 @@ const CapiAnalysisBuilder = struct {
         }
     }
 
-    fn replaceParameterDescriptor(self: *CapiAnalysisBuilder, index: usize, descriptor: core.BufferDescriptor) void {
+    fn replaceParameterDescriptor(self: *CapiAnalysisBuilder, index: usize, descriptor: ir.BufferDescriptor) void {
         self.allocator.free(self.parameter_descriptors.items[index].dims);
         self.parameter_descriptors.items[index] = descriptor;
     }
 
-    fn registerValue(self: *CapiAnalysisBuilder, value: mlir.MlirValue, role: ValueRole, descriptor: core.BufferDescriptor) !ValueId {
+    fn registerValue(self: *CapiAnalysisBuilder, value: mlir.MlirValue, role: ValueRole, descriptor: ir.BufferDescriptor) !ValueId {
         if (self.lookupValue(value)) |existing| {
             self.allocator.free(descriptor.dims);
             return existing;
@@ -2398,7 +2398,7 @@ const CapiAnalysisBuilder = struct {
         return id;
     }
 
-    fn setValueStorage(self: *CapiAnalysisBuilder, id: ValueId, storage: core.ValueStorageKind, elements: []const ValueId) !void {
+    fn setValueStorage(self: *CapiAnalysisBuilder, id: ValueId, storage: ir.ValueStorageKind, elements: []const ValueId) !void {
         if (id.index >= self.values.items.len) return error.InvalidStablehloModule;
         const owned_elements = try self.allocator.dupe(ValueId, elements);
         errdefer self.allocator.free(owned_elements);
@@ -2483,7 +2483,7 @@ fn parameterAliasForValue(builder: *const CapiAnalysisBuilder, value_id: ValueId
     return null;
 }
 
-fn appendOutputAlias(builder: *CapiAnalysisBuilder, output_index: u32, parameter_index: u32, kind: core.OutputAliasKind) !void {
+fn appendOutputAlias(builder: *CapiAnalysisBuilder, output_index: u32, parameter_index: u32, kind: ir.OutputAliasKind) !void {
     for (builder.output_aliases.items) |*alias| {
         if (alias.output_index == output_index and alias.parameter_index == parameter_index) {
             if (alias.kind == .donation and kind == .identity) alias.kind = .identity;
@@ -2497,7 +2497,7 @@ fn appendOutputAlias(builder: *CapiAnalysisBuilder, output_index: u32, parameter
     });
 }
 
-fn promoteExistingOutputAlias(builder: *CapiAnalysisBuilder, output_index: u32, parameter_index: u32, kind: core.OutputAliasKind) void {
+fn promoteExistingOutputAlias(builder: *CapiAnalysisBuilder, output_index: u32, parameter_index: u32, kind: ir.OutputAliasKind) void {
     for (builder.output_aliases.items) |*alias| {
         if (alias.output_index == output_index and alias.parameter_index == parameter_index) {
             if (alias.kind == .donation and kind == .identity) alias.kind = .identity;
@@ -2682,7 +2682,7 @@ fn registerResultValues(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation, r
     return ids;
 }
 
-fn regionKindForOperation(short_name: []const u8, region_index: usize) core.RegionKind {
+fn regionKindForOperation(short_name: []const u8, region_index: usize) ir.RegionKind {
     if (std.mem.eql(u8, short_name, "reduce_sum") or
         std.mem.eql(u8, short_name, "reduce_max") or
         std.mem.eql(u8, short_name, "reduce_min") or
@@ -2700,10 +2700,10 @@ fn regionKindForOperation(short_name: []const u8, region_index: usize) core.Regi
     return .generic;
 }
 
-fn descriptorListFromBlockArguments(allocator: std.mem.Allocator, block: mlir.MlirBlock) ![]const core.BufferDescriptor {
-    if (mlir.mlirBlockIsNull(block)) return allocator.alloc(core.BufferDescriptor, 0);
+fn descriptorListFromBlockArguments(allocator: std.mem.Allocator, block: mlir.MlirBlock) ![]const ir.BufferDescriptor {
+    if (mlir.mlirBlockIsNull(block)) return allocator.alloc(ir.BufferDescriptor, 0);
     const count: usize = @intCast(mlir.mlirBlockGetNumArguments(block));
-    const descriptors = try allocator.alloc(core.BufferDescriptor, count);
+    const descriptors = try allocator.alloc(ir.BufferDescriptor, count);
     var initialized: usize = 0;
     errdefer {
         for (descriptors[0..initialized]) |descriptor| allocator.free(descriptor.dims);
@@ -2717,16 +2717,16 @@ fn descriptorListFromBlockArguments(allocator: std.mem.Allocator, block: mlir.Ml
     return descriptors;
 }
 
-fn descriptorListFromTerminatorOperands(allocator: std.mem.Allocator, block: mlir.MlirBlock) ![]const core.BufferDescriptor {
-    if (mlir.mlirBlockIsNull(block)) return allocator.alloc(core.BufferDescriptor, 0);
+fn descriptorListFromTerminatorOperands(allocator: std.mem.Allocator, block: mlir.MlirBlock) ![]const ir.BufferDescriptor {
+    if (mlir.mlirBlockIsNull(block)) return allocator.alloc(ir.BufferDescriptor, 0);
     const terminator = mlir.mlirBlockGetTerminator(block);
-    if (mlir.mlirOperationIsNull(terminator)) return allocator.alloc(core.BufferDescriptor, 0);
+    if (mlir.mlirOperationIsNull(terminator)) return allocator.alloc(ir.BufferDescriptor, 0);
     const name = operationName(terminator);
     if (!std.mem.eql(u8, name, "stablehlo.return") and !std.mem.eql(u8, name, "func.return") and !std.mem.eql(u8, name, "sdy.return")) {
-        return allocator.alloc(core.BufferDescriptor, 0);
+        return allocator.alloc(ir.BufferDescriptor, 0);
     }
     const count: usize = @intCast(mlir.mlirOperationGetNumOperands(terminator));
-    const descriptors = try allocator.alloc(core.BufferDescriptor, count);
+    const descriptors = try allocator.alloc(ir.BufferDescriptor, count);
     var initialized: usize = 0;
     errdefer {
         for (descriptors[0..initialized]) |descriptor| allocator.free(descriptor.dims);
@@ -2740,9 +2740,9 @@ fn descriptorListFromTerminatorOperands(allocator: std.mem.Allocator, block: mli
     return descriptors;
 }
 
-fn descriptorListFromOperationOperands(allocator: std.mem.Allocator, op: mlir.MlirOperation) ![]const core.BufferDescriptor {
+fn descriptorListFromOperationOperands(allocator: std.mem.Allocator, op: mlir.MlirOperation) ![]const ir.BufferDescriptor {
     const count: usize = @intCast(mlir.mlirOperationGetNumOperands(op));
-    const descriptors = try allocator.alloc(core.BufferDescriptor, count);
+    const descriptors = try allocator.alloc(ir.BufferDescriptor, count);
     var initialized: usize = 0;
     errdefer {
         for (descriptors[0..initialized]) |descriptor| allocator.free(descriptor.dims);
@@ -2756,9 +2756,9 @@ fn descriptorListFromOperationOperands(allocator: std.mem.Allocator, op: mlir.Ml
     return descriptors;
 }
 
-fn descriptorListFromOperationResults(allocator: std.mem.Allocator, op: mlir.MlirOperation) ![]const core.BufferDescriptor {
+fn descriptorListFromOperationResults(allocator: std.mem.Allocator, op: mlir.MlirOperation) ![]const ir.BufferDescriptor {
     const count: usize = @intCast(mlir.mlirOperationGetNumResults(op));
-    const descriptors = try allocator.alloc(core.BufferDescriptor, count);
+    const descriptors = try allocator.alloc(ir.BufferDescriptor, count);
     var initialized: usize = 0;
     errdefer {
         for (descriptors[0..initialized]) |descriptor| allocator.free(descriptor.dims);
@@ -2774,13 +2774,13 @@ fn descriptorListFromOperationResults(allocator: std.mem.Allocator, op: mlir.Mli
 
 const RegionValueMapEntry = struct {
     mlir_value: mlir.MlirValue,
-    id: core.RegionValueId,
+    id: ir.RegionValueId,
 };
 
 const CapturedRegionBlock = struct {
-    values: []const core.RegionValue,
-    instructions: []const core.RegionInstruction,
-    terminator_operands: []const core.RegionValueId,
+    values: []const ir.RegionValue,
+    instructions: []const ir.RegionInstruction,
+    terminator_operands: []const ir.RegionValueId,
 };
 
 fn freeCapturedRegionBlock(allocator: std.mem.Allocator, block: CapturedRegionBlock) void {
@@ -2789,7 +2789,7 @@ fn freeCapturedRegionBlock(allocator: std.mem.Allocator, block: CapturedRegionBl
     allocator.free(block.terminator_operands);
 }
 
-fn lookupRegionValue(map: []const RegionValueMapEntry, value: mlir.MlirValue) ?core.RegionValueId {
+fn lookupRegionValue(map: []const RegionValueMapEntry, value: mlir.MlirValue) ?ir.RegionValueId {
     for (map) |entry| {
         if (mlir.mlirValueEqual(entry.mlir_value, value)) return entry.id;
     }
@@ -2798,13 +2798,13 @@ fn lookupRegionValue(map: []const RegionValueMapEntry, value: mlir.MlirValue) ?c
 
 fn appendRegionValue(
     allocator: std.mem.Allocator,
-    values: *std.ArrayList(core.RegionValue),
+    values: *std.ArrayList(ir.RegionValue),
     value_map: *std.ArrayList(RegionValueMapEntry),
     value: mlir.MlirValue,
-    role: core.RegionValueRole,
-) !core.RegionValueId {
+    role: ir.RegionValueRole,
+) !ir.RegionValueId {
     if (lookupRegionValue(value_map.items, value)) |existing| return existing;
-    const id: core.RegionValueId = .{ .index = @intCast(values.items.len) };
+    const id: ir.RegionValueId = .{ .index = @intCast(values.items.len) };
     const descriptor = try descriptorFromType(allocator, mlir.mlirValueGetType(value));
     errdefer allocator.free(descriptor.dims);
     var actual_role = role;
@@ -2831,7 +2831,7 @@ fn appendRegionValue(
 
 fn registerRegionBlockArguments(
     allocator: std.mem.Allocator,
-    values: *std.ArrayList(core.RegionValue),
+    values: *std.ArrayList(ir.RegionValue),
     value_map: *std.ArrayList(RegionValueMapEntry),
     block: mlir.MlirBlock,
 ) !void {
@@ -2844,12 +2844,12 @@ fn registerRegionBlockArguments(
 
 fn regionValueIdsForOperationOperands(
     allocator: std.mem.Allocator,
-    values: *std.ArrayList(core.RegionValue),
+    values: *std.ArrayList(ir.RegionValue),
     value_map: *std.ArrayList(RegionValueMapEntry),
     op: mlir.MlirOperation,
-) ![]const core.RegionValueId {
+) ![]const ir.RegionValueId {
     const count: usize = @intCast(mlir.mlirOperationGetNumOperands(op));
-    const ids = try allocator.alloc(core.RegionValueId, count);
+    const ids = try allocator.alloc(ir.RegionValueId, count);
     errdefer allocator.free(ids);
     var index: isize = 0;
     while (index < @as(isize, @intCast(count))) : (index += 1) {
@@ -2867,12 +2867,12 @@ fn regionValueIdsForOperationOperands(
 
 fn regionValueIdsForOperationResults(
     allocator: std.mem.Allocator,
-    values: *std.ArrayList(core.RegionValue),
+    values: *std.ArrayList(ir.RegionValue),
     value_map: *std.ArrayList(RegionValueMapEntry),
     op: mlir.MlirOperation,
-) ![]const core.RegionValueId {
+) ![]const ir.RegionValueId {
     const count: usize = @intCast(mlir.mlirOperationGetNumResults(op));
-    const ids = try allocator.alloc(core.RegionValueId, count);
+    const ids = try allocator.alloc(ir.RegionValueId, count);
     errdefer allocator.free(ids);
     var index: isize = 0;
     while (index < @as(isize, @intCast(count))) : (index += 1) {
@@ -2885,26 +2885,26 @@ fn terminatorOperandIds(
     allocator: std.mem.Allocator,
     value_map: []const RegionValueMapEntry,
     block: mlir.MlirBlock,
-) ![]const core.RegionValueId {
-    if (mlir.mlirBlockIsNull(block)) return allocator.alloc(core.RegionValueId, 0);
+) ![]const ir.RegionValueId {
+    if (mlir.mlirBlockIsNull(block)) return allocator.alloc(ir.RegionValueId, 0);
     const terminator = mlir.mlirBlockGetTerminator(block);
-    if (mlir.mlirOperationIsNull(terminator)) return allocator.alloc(core.RegionValueId, 0);
+    if (mlir.mlirOperationIsNull(terminator)) return allocator.alloc(ir.RegionValueId, 0);
     const name = operationName(terminator);
     if (!std.mem.eql(u8, name, "stablehlo.return") and !std.mem.eql(u8, name, "func.return") and !std.mem.eql(u8, name, "sdy.return")) {
-        return allocator.alloc(core.RegionValueId, 0);
+        return allocator.alloc(ir.RegionValueId, 0);
     }
     const count: usize = @intCast(mlir.mlirOperationGetNumOperands(terminator));
-    const ids = try allocator.alloc(core.RegionValueId, count);
+    const ids = try allocator.alloc(ir.RegionValueId, count);
     errdefer allocator.free(ids);
     var index: isize = 0;
     while (index < @as(isize, @intCast(count))) : (index += 1) {
         const operand = mlir.mlirOperationGetOperand(terminator, index);
-        ids[@intCast(index)] = lookupRegionValue(value_map, operand) orelse core.RegionValueId.invalid;
+        ids[@intCast(index)] = lookupRegionValue(value_map, operand) orelse ir.RegionValueId.invalid;
     }
     return ids;
 }
 
-fn regionInstructionKindFromOperationName(name: []const u8) core.PlanInstructionKind {
+fn regionInstructionKindFromOperationName(name: []const u8) ir.PlanInstructionKind {
     if (std.mem.startsWith(u8, name, "stablehlo.")) {
         const raw_name = name["stablehlo.".len..];
         return instructionKindFromStablehlo(raw_name);
@@ -2918,12 +2918,12 @@ fn regionInstructionKindFromOperationName(name: []const u8) core.PlanInstruction
 
 fn captureRegionBlock(allocator: std.mem.Allocator, block: mlir.MlirBlock) !CapturedRegionBlock {
     if (mlir.mlirBlockIsNull(block)) return .{
-        .values = try allocator.alloc(core.RegionValue, 0),
-        .instructions = try allocator.alloc(core.RegionInstruction, 0),
-        .terminator_operands = try allocator.alloc(core.RegionValueId, 0),
+        .values = try allocator.alloc(ir.RegionValue, 0),
+        .instructions = try allocator.alloc(ir.RegionInstruction, 0),
+        .terminator_operands = try allocator.alloc(ir.RegionValueId, 0),
     };
 
-    var values: std.ArrayList(core.RegionValue) = .empty;
+    var values: std.ArrayList(ir.RegionValue) = .empty;
     errdefer {
         for (values.items) |value| allocator.free(value.descriptor.dims);
         values.deinit(allocator);
@@ -2932,7 +2932,7 @@ fn captureRegionBlock(allocator: std.mem.Allocator, block: mlir.MlirBlock) !Capt
     var value_map: std.ArrayList(RegionValueMapEntry) = .empty;
     defer value_map.deinit(allocator);
 
-    var instructions: std.ArrayList(core.RegionInstruction) = .empty;
+    var instructions: std.ArrayList(ir.RegionInstruction) = .empty;
     errdefer {
         for (instructions.items) |instruction| {
             allocator.free(instruction.inputs);
@@ -2988,9 +2988,9 @@ fn captureRegionBlock(allocator: std.mem.Allocator, block: mlir.MlirBlock) !Capt
     };
 }
 
-fn captureOperationRegions(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation, short_name: []const u8) AnalyzeError![]const core.RegionId {
+fn captureOperationRegions(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation, short_name: []const u8) AnalyzeError![]const ir.RegionId {
     const region_count: usize = @intCast(mlir.mlirOperationGetNumRegions(op));
-    var ids: std.ArrayList(core.RegionId) = .empty;
+    var ids: std.ArrayList(ir.RegionId) = .empty;
     errdefer ids.deinit(builder.allocator);
     const first_new_region = builder.regions.items.len;
     errdefer {
@@ -3013,7 +3013,7 @@ fn captureOperationRegions(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation
             errdefer freeDescriptorList(builder.allocator, return_descriptors);
             const terminator_operand_descriptors = try cloneDescriptorList(builder.allocator, return_descriptors);
             errdefer freeDescriptorList(builder.allocator, terminator_operand_descriptors);
-            const id: core.RegionId = .{ .index = @intCast(builder.regions.items.len) };
+            const id: ir.RegionId = .{ .index = @intCast(builder.regions.items.len) };
             try ids.append(builder.allocator, id);
             try builder.regions.append(builder.allocator, .{
                 .id = id,
@@ -3033,9 +3033,9 @@ fn captureOperationRegions(builder: *CapiAnalysisBuilder, op: mlir.MlirOperation
     return try ids.toOwnedSlice(builder.allocator);
 }
 
-fn denseLiteralBytes(allocator: std.mem.Allocator, attr: mlir.MlirAttribute, element_type: core.BufferType, dims: []const i64) ![]const u8 {
+fn denseLiteralBytes(allocator: std.mem.Allocator, attr: mlir.MlirAttribute, element_type: ir.BufferType, dims: []const i64) ![]const u8 {
     if (mlir.mlirAttributeIsNull(attr) or !mlir.mlirAttributeIsADenseElements(attr)) return allocator.dupe(u8, &.{});
-    const byte_size = core.denseByteSize(element_type, dims);
+    const byte_size = ir.denseByteSize(element_type, dims);
     const bytes = try allocator.alloc(u8, byte_size);
     errdefer allocator.free(bytes);
     const element_count: usize = @intCast(mlir.mlirElementsAttrGetNumElements(attr));
@@ -3215,7 +3215,7 @@ fn stablehloScatterIndexVectorDim(attr: mlir.MlirAttribute) ?i64 {
     return mlir.stablehloDimensionNumbersGetIndexVectorDim(attr);
 }
 
-fn scatterUpdateKindFromRegion(op: mlir.MlirOperation) ?core.ScatterUpdateKind {
+fn scatterUpdateKindFromRegion(op: mlir.MlirOperation) ?ir.ScatterUpdateKind {
     const n_regions = mlir.mlirOperationGetNumRegions(op);
     var region_index: isize = 0;
     while (region_index < n_regions) : (region_index += 1) {
@@ -3232,7 +3232,7 @@ fn scatterUpdateKindFromRegion(op: mlir.MlirOperation) ?core.ScatterUpdateKind {
     return null;
 }
 
-fn compareDirectionFromAttr(attr: mlir.MlirAttribute) ?core.CompareOp {
+fn compareDirectionFromAttr(attr: mlir.MlirAttribute) ?ir.CompareOp {
     if (mlir.mlirAttributeIsNull(attr) or !mlir.stablehloAttributeIsAComparisonDirectionAttr(attr)) return null;
     const text = mlirStringSlice(mlir.stablehloComparisonDirectionAttrGetValue(attr));
     if (std.mem.eql(u8, text, "EQ")) return .eq;
@@ -3298,8 +3298,8 @@ fn regionContainsOperation(op: mlir.MlirOperation, target_name: []const u8) bool
     return false;
 }
 
-fn compareDirectionFromSortRegion(op: mlir.MlirOperation) ?core.CompareOp {
-    var last_compare: ?core.CompareOp = null;
+fn compareDirectionFromSortRegion(op: mlir.MlirOperation) ?ir.CompareOp {
+    var last_compare: ?ir.CompareOp = null;
     const n_regions = mlir.mlirOperationGetNumRegions(op);
     var region_index: isize = 0;
     while (region_index < n_regions) : (region_index += 1) {
@@ -3611,7 +3611,7 @@ fn analyzeStablehloOperationFromCapi(builder: *CapiAnalysisBuilder, op: mlir.Mli
     const owned_name = try builder.allocator.dupe(u8, short_name);
     var owns_name = true;
     errdefer if (owns_name) builder.allocator.free(owned_name);
-    const empty_region_ids = try builder.allocator.dupe(core.RegionId, &.{});
+    const empty_region_ids = try builder.allocator.dupe(ir.RegionId, &.{});
     var owns_region_ids = true;
     errdefer if (owns_region_ids) builder.allocator.free(empty_region_ids);
 
@@ -4258,8 +4258,8 @@ test "executable plan values carry parameter and result descriptors" {
     defer plan.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), plan.values.len);
-    try std.testing.expectEqual(core.BufferType.f32, plan.values[0].descriptor.element_type);
-    try std.testing.expectEqual(core.BufferType.f32, plan.values[1].descriptor.element_type);
+    try std.testing.expectEqual(ir.BufferType.f32, plan.values[0].descriptor.element_type);
+    try std.testing.expectEqual(ir.BufferType.f32, plan.values[1].descriptor.element_type);
     try std.testing.expectEqualSlices(i64, &.{4}, plan.values[0].descriptor.dims);
     try std.testing.expectEqualSlices(i64, &.{4}, plan.values[1].descriptor.dims);
 }
@@ -4313,7 +4313,7 @@ test "executable plan imports function input output alias donation metadata" {
     try std.testing.expectEqual(@as(usize, 1), plan.output_aliases.len);
     try std.testing.expectEqual(@as(u32, 0), plan.output_aliases[0].output_index);
     try std.testing.expectEqual(@as(u32, 0), plan.output_aliases[0].parameter_index);
-    try std.testing.expectEqual(core.OutputAliasKind.donation, plan.output_aliases[0].kind);
+    try std.testing.expectEqual(ir.OutputAliasKind.donation, plan.output_aliases[0].kind);
     try std.testing.expectEqualSlices(u32, &.{0}, plan.donated_parameter_indices);
 
     var verify_diagnostics = std.Io.Writer.Allocating.init(std.testing.allocator);
@@ -4662,7 +4662,7 @@ test "executable plan lowers sort with dimension and comparator direction" {
     try std.testing.expectEqual(PlanInstructionKind.sort, plan.instructions[0].kind);
     try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, plan.instructions[0].dims.?);
     try std.testing.expectEqual(@as(?i64, 1), plan.instructions[0].dimension);
-    try std.testing.expectEqual(core.CompareOp.lt, plan.instructions[0].compare_direction.?);
+    try std.testing.expectEqual(ir.CompareOp.lt, plan.instructions[0].compare_direction.?);
 }
 
 test "executable plan records region summaries for region-bodied ops" {
@@ -4692,11 +4692,11 @@ test "executable plan records region summaries for region-bodied ops" {
     try std.testing.expectEqual(PlanInstructionKind.reduce_sum, plan.instructions[0].kind);
     try std.testing.expectEqual(@as(usize, 1), plan.instructions[0].region_ids.len);
     const region = plan.regions[plan.instructions[0].region_ids[0].index];
-    try std.testing.expectEqual(core.RegionKind.reducer, region.kind);
+    try std.testing.expectEqual(ir.RegionKind.reducer, region.kind);
     try std.testing.expectEqual(@as(usize, 0), region.parent_instruction_index);
     try std.testing.expectEqual(@as(usize, 2), region.argument_descriptors.len);
     try std.testing.expectEqual(@as(usize, 1), region.return_descriptors.len);
-    try std.testing.expectEqual(core.BufferType.f32, region.return_descriptors[0].element_type);
+    try std.testing.expectEqual(ir.BufferType.f32, region.return_descriptors[0].element_type);
 }
 
 test "executable plan records while region subprogram summaries" {
@@ -4734,38 +4734,38 @@ test "executable plan records while region subprogram summaries" {
     try std.testing.expectEqual(@as(usize, 2), while_instruction.region_ids.len);
 
     const cond = plan.regions[while_instruction.region_ids[0].index];
-    try std.testing.expectEqual(core.RegionKind.while_cond, cond.kind);
+    try std.testing.expectEqual(ir.RegionKind.while_cond, cond.kind);
     try std.testing.expectEqual(@as(usize, 0), cond.parent_instruction_index);
     try std.testing.expectEqual(@as(usize, 3), cond.values.len);
-    try std.testing.expectEqual(core.RegionValueRole.argument, cond.values[0].role);
-    try std.testing.expectEqual(core.RegionValueRole.constant, cond.values[1].role);
+    try std.testing.expectEqual(ir.RegionValueRole.argument, cond.values[0].role);
+    try std.testing.expectEqual(ir.RegionValueRole.constant, cond.values[1].role);
     try std.testing.expect(cond.values[1].literal != null);
-    try std.testing.expectEqual(core.RegionValueRole.instruction_result, cond.values[2].role);
+    try std.testing.expectEqual(ir.RegionValueRole.instruction_result, cond.values[2].role);
     try std.testing.expectEqual(@as(usize, 1), cond.argument_descriptors.len);
     try std.testing.expectEqual(@as(usize, 1), cond.instructions.len);
     try std.testing.expectEqual(PlanInstructionKind.compare, cond.instructions[0].kind);
-    try std.testing.expectEqual(core.CompareOp.lt, cond.instructions[0].compare_direction.?);
+    try std.testing.expectEqual(ir.CompareOp.lt, cond.instructions[0].compare_direction.?);
     try std.testing.expectEqual(@as(usize, 2), cond.instructions[0].inputs.len);
     try std.testing.expectEqual(@as(u32, 0), cond.instructions[0].inputs[0].index);
     try std.testing.expectEqual(@as(u32, 1), cond.instructions[0].inputs[1].index);
     try std.testing.expectEqual(@as(u32, 2), cond.instructions[0].outputs[0].index);
     try std.testing.expectEqual(@as(usize, 1), cond.return_descriptors.len);
-    try std.testing.expectEqual(core.BufferType.pred, cond.return_descriptors[0].element_type);
+    try std.testing.expectEqual(ir.BufferType.pred, cond.return_descriptors[0].element_type);
     try std.testing.expectEqual(@as(usize, 1), cond.terminator_operands.len);
     try std.testing.expectEqual(@as(u32, 2), cond.terminator_operands[0].index);
     try std.testing.expectEqual(@as(usize, 1), cond.terminator_operand_descriptors.len);
 
     const body = plan.regions[while_instruction.region_ids[1].index];
-    try std.testing.expectEqual(core.RegionKind.while_body, body.kind);
+    try std.testing.expectEqual(ir.RegionKind.while_body, body.kind);
     try std.testing.expectEqual(@as(usize, 3), body.values.len);
     try std.testing.expectEqual(@as(usize, 1), body.argument_descriptors.len);
-    try std.testing.expectEqual(core.RegionValueRole.constant, body.values[1].role);
+    try std.testing.expectEqual(ir.RegionValueRole.constant, body.values[1].role);
     try std.testing.expect(body.values[1].literal != null);
     try std.testing.expectEqual(@as(usize, 1), body.instructions.len);
     try std.testing.expectEqual(PlanInstructionKind.add, body.instructions[0].kind);
     try std.testing.expectEqual(@as(u32, 2), body.instructions[0].outputs[0].index);
     try std.testing.expectEqual(@as(usize, 1), body.return_descriptors.len);
-    try std.testing.expectEqual(core.BufferType.f32, body.return_descriptors[0].element_type);
+    try std.testing.expectEqual(ir.BufferType.f32, body.return_descriptors[0].element_type);
     try std.testing.expectEqual(@as(usize, 1), body.terminator_operands.len);
     try std.testing.expectEqual(@as(u32, 2), body.terminator_operands[0].index);
     try std.testing.expectEqual(@as(usize, 1), body.terminator_operand_descriptors.len);
@@ -4877,12 +4877,12 @@ test "executable plan records structured storage for tuple and complex values" {
 
     try std.testing.expectEqual(@as(usize, 2), plan.instructions.len);
     const tuple_value = plan.values[plan.instructions[0].outputs[0].index];
-    try std.testing.expectEqual(core.ValueStorageKind.tuple, tuple_value.storage);
+    try std.testing.expectEqual(ir.ValueStorageKind.tuple, tuple_value.storage);
     try std.testing.expectEqual(@as(usize, 2), tuple_value.elements.len);
     try std.testing.expectEqual(@as(u32, 0), tuple_value.elements[0].index);
     try std.testing.expectEqual(@as(u32, 1), tuple_value.elements[1].index);
     const complex_value = plan.values[plan.instructions[1].outputs[0].index];
-    try std.testing.expectEqual(core.ValueStorageKind.complex_pair, complex_value.storage);
+    try std.testing.expectEqual(ir.ValueStorageKind.complex_pair, complex_value.storage);
     try std.testing.expectEqual(@as(usize, 2), complex_value.elements.len);
 }
 
@@ -4909,7 +4909,7 @@ test "executable plan lowers tuple extraction as structured value use" {
     try std.testing.expectEqual(PlanInstructionKind.tuple, plan.instructions[0].kind);
     try std.testing.expectEqual(PlanInstructionKind.get_tuple_element, plan.instructions[1].kind);
     try std.testing.expectEqual(@as(?i64, 1), plan.instructions[1].tuple_index);
-    try std.testing.expectEqual(core.ValueStorageKind.tuple, plan.values[plan.instructions[0].outputs[0].index].storage);
+    try std.testing.expectEqual(ir.ValueStorageKind.tuple, plan.values[plan.instructions[0].outputs[0].index].storage);
 
     var verify_diagnostics = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer verify_diagnostics.deinit();
@@ -4946,7 +4946,7 @@ test "executable plan lowers heavy random and structural StableHLO op shells" {
     try std.testing.expectEqual(@as(?bool, true), plan.instructions[2].triangular_left_side);
     try std.testing.expectEqual(@as(?bool, true), plan.instructions[2].triangular_lower);
     try std.testing.expectEqual(@as(?bool, false), plan.instructions[2].triangular_unit_diagonal);
-    try std.testing.expectEqual(core.TriangularSolveTranspose.no_transpose, plan.instructions[2].triangular_transpose.?);
+    try std.testing.expectEqual(ir.TriangularSolveTranspose.no_transpose, plan.instructions[2].triangular_transpose.?);
     try std.testing.expectEqual(PlanInstructionKind.custom_call, plan.instructions[3].kind);
     try std.testing.expectEqualStrings("pjrtx.test", plan.instructions[3].custom_call_target.?);
 }
@@ -4976,7 +4976,7 @@ test "executable plan lowers deprecated rng distribution metadata" {
     try std.testing.expectEqual(@as(usize, 3), plan.instructions.len);
     const rng_instruction = plan.instructions[2];
     try std.testing.expectEqual(PlanInstructionKind.rng, rng_instruction.kind);
-    try std.testing.expectEqual(core.RngDistribution.normal, rng_instruction.rng_distribution.?);
+    try std.testing.expectEqual(ir.RngDistribution.normal, rng_instruction.rng_distribution.?);
     try std.testing.expectEqual(@as(usize, 2), rng_instruction.inputs.len);
     try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, rng_instruction.dims.?);
 }

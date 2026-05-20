@@ -126,7 +126,7 @@ pub const Executable = opaque {
     /// Executes the resident backend graph for one logical device.
     pub fn executeDevice(self: *Executable, device_index: usize, arguments: []const *runtime.Buffer) runtime.GraphExecuteError!runtime.GraphExecuteResult {
         const executable = self.owned();
-        return executable.graph.executeDevice(plugin.allocator(), executable.client, executable.plan, device_index, arguments);
+        return runtime.executeDevice(&executable.graph, plugin.allocator(), executable.client.executableContext(), executable.plan, device_index, arguments);
     }
 
     /// Narrow test access for executable invariants that are not PJRT API surface.

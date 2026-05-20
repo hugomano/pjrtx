@@ -5,17 +5,40 @@ zig_library(
     name = "mlx_metal",
     import_name = "src/backend/mlx_metal",
     main = "backend.zig",
-    visibility = ["//src/backend:__pkg__"],
+    srcs = [
+        "async_transfer.zig",
+        "buffer.zig",
+        "custom_call.zig",
+        "device.zig",
+        "executable.zig",
+        "mlx_call.zig",
+        "profiling.zig",
+        "program.zig",
+    ],
+    visibility = ["//visibility:public"],
     deps = [
         ":api",
-        "//src/backend",
-        "//src/core",
+        "//src/compiler:ir",
     ],
 )
 
 zig_test(
     name = "mlx_metal_test",
-    deps = [":mlx_metal"],
+    main = "backend.zig",
+    srcs = [
+        "async_transfer.zig",
+        "buffer.zig",
+        "custom_call.zig",
+        "device.zig",
+        "executable.zig",
+        "mlx_call.zig",
+        "profiling.zig",
+        "program.zig",
+    ],
+    deps = [
+        ":api",
+        "//src/compiler:ir",
+    ],
 )
 
 cc_library(

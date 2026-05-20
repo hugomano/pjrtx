@@ -2,10 +2,6 @@ const std = @import("std");
 
 pub const MAX_DEVICES = 64;
 
-pub const BackendKind = enum {
-    metal_mlx,
-};
-
 pub const MemoryKind = enum {
     device,
     host_pinned,

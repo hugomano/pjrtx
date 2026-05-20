@@ -297,7 +297,7 @@ const ExecuteApiCallback = struct {
 
 test "execute cleanup destroys only unassigned runtime outputs" {
     const test_allocator = std.testing.allocator;
-    const client = try runtime.createClient(test_allocator, .{ .backend_kind = .metal_mlx, .device_count = 1 });
+    const client = try runtime.createClient(test_allocator, .{ .device_count = 1 });
     defer client.deinit();
 
     const dims = [_]i64{4};

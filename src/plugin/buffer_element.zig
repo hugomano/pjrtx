@@ -1,32 +1,9 @@
-const std = @import("std");
-
-const runtime = @import("src/runtime");
 const c = @import("c");
-const abi = @import("pjrt_abi.zig");
-const state = @import("state.zig");
+const runtime = @import("src/runtime");
 
-const default_memory_kind = state.default_memory_kind;
-
-pub const Bytes = struct {
-    pub fn copy(dst: []u8, src: []const u8) !void {
-        if (dst.len != src.len) return error.InvalidArgument;
-        var reader: std.Io.Reader = .fixed(src);
-        var writer = std.Io.Writer.fixed(dst);
-        const copied = try reader.streamRemaining(&writer);
-        if (copied != src.len) return error.InvalidArgument;
-    }
-};
-
-pub const MemoryKind = struct {
-    pub fn fillDefault(kinds: [][*c]const u8, sizes: []usize) void {
-        for (kinds, sizes) |*kind, *size| {
-            kind.* = default_memory_kind.ptr;
-            size.* = default_memory_kind.len;
-        }
-    }
-};
-
-pub const BufferType = struct {
+/// Converts between PJRT buffer element types and PjRTx runtime buffer types.
+pub const ElementType = struct {
+    /// Returns the dense byte width for one element of a PJRT buffer type.
     pub fn elementSize(t: c.PJRT_Buffer_Type) usize {
         return switch (t) {
             c.PJRT_Buffer_Type_PRED, c.PJRT_Buffer_Type_S8, c.PJRT_Buffer_Type_U8 => 1,
@@ -38,6 +15,7 @@ pub const BufferType = struct {
         };
     }
 
+    /// Decodes a PJRT element type into the runtime type used for buffers.
     pub fn fromPjrt(t: c.PJRT_Buffer_Type) runtime.BufferType {
         return switch (t) {
             c.PJRT_Buffer_Type_PRED => .pred,
@@ -59,6 +37,7 @@ pub const BufferType = struct {
         };
     }
 
+    /// Encodes a runtime buffer element type for the PJRT C ABI.
     pub fn toPjrt(t: runtime.BufferType) c.PJRT_Buffer_Type {
         return switch (t) {
             .invalid => c.PJRT_Buffer_Type_INVALID,
@@ -80,6 +59,7 @@ pub const BufferType = struct {
         };
     }
 
+    /// Computes the dense storage byte size for a PJRT shape.
     pub fn denseByteSize(t: c.PJRT_Buffer_Type, dims: []const i64) usize {
         var elems: usize = 1;
         for (dims) |dim| elems *= @intCast(dim);

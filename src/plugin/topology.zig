@@ -1,41 +1,45 @@
 const std = @import("std");
 
-const runtime = @import("src/runtime");
 const c = @import("c");
+const runtime = @import("src/runtime");
+
 const abi = @import("pjrt_abi.zig");
 const errors = @import("errors.zig");
-const state = @import("state.zig");
+const handles = @import("pjrt_handles.zig");
+const plugin = @import("plugin.zig");
 
-const allocator = state.allocator;
-const platform_name = state.platform_name;
-const platform_version = state.platform_version;
-const SerializedTopology = state.SerializedTopology;
-const SerializedTopologyHandle = abi.SerializedTopology(SerializedTopology);
 const PjrtError = errors.Error;
 
-const SerializedTopologyView = struct {
+const SerializedTopology = struct {
+    bytes: []u8,
+};
+
+const SerializedTopologyHandle = handles.SerializedTopology(SerializedTopology);
+
+const SerializedTopologyRef = struct {
     ptr: *SerializedTopology,
 
-    fn at(raw: *c.PJRT_SerializedTopology) SerializedTopologyView {
-        return .{ .ptr = SerializedTopologyHandle.view(raw) };
+    fn at(raw: *c.PJRT_SerializedTopology) SerializedTopologyRef {
+        return .{ .ptr = SerializedTopologyHandle.ref(raw) };
     }
 
-    fn handle(self: SerializedTopologyView) *c.PJRT_SerializedTopology {
+    fn handle(self: SerializedTopologyRef) *c.PJRT_SerializedTopology {
         return SerializedTopologyHandle.handle(self.ptr);
     }
 
     fn delete(raw: ?*c.PJRT_SerializedTopology) callconv(.c) void {
         const opaque_topology = raw orelse return;
         const topology = at(opaque_topology).ptr;
-        allocator.free(topology.bytes);
-        allocator.destroy(topology);
+        plugin.allocator().free(topology.bytes);
+        plugin.allocator().destroy(topology);
     }
 };
 
-const TopologyDescription = struct {
+/// Borrowed PJRT topology description backed by a runtime client.
+pub const TopologyDescription = struct {
     client: *const runtime.Client,
 
-    const Api = struct {
+    pub const Api = struct {
         pub const Create = TopologyLifecycle.create;
         pub const Destroy = TopologyLifecycle.destroy;
         pub const PlatformName = TopologyCallback(c.PJRT_TopologyDescription_PlatformName_Args, .platform_name).call;
@@ -48,17 +52,17 @@ const TopologyDescription = struct {
     };
 
     fn at(raw: anytype) TopologyDescription {
-        return .{ .client = abi.TopologyDescription.viewConst(raw) };
+        return .{ .client = handles.TopologyDescription.refConst(raw) };
     }
 
     fn platformName(self: TopologyDescription) []const u8 {
         _ = self;
-        return platform_name;
+        return plugin.Platform.name;
     }
 
     fn platformVersion(self: TopologyDescription) []const u8 {
         _ = self;
-        return platform_version;
+        return plugin.Platform.version;
     }
 
     fn devices(self: TopologyDescription) []const *runtime.Device {
@@ -67,8 +71,8 @@ const TopologyDescription = struct {
 
     fn fingerprint(self: TopologyDescription) u64 {
         var hasher = std.hash.Wyhash.init(0);
-        hasher.update(platform_name);
-        hasher.update(platform_version);
+        hasher.update(plugin.Platform.name);
+        hasher.update(plugin.Platform.version);
         for (self.client.devices) |device| {
             hasher.update(std.mem.asBytes(&device.id));
             hasher.update(std.mem.asBytes(&device.local_hardware_id));
@@ -79,27 +83,27 @@ const TopologyDescription = struct {
     }
 
     fn serialize(self: TopologyDescription) ?*SerializedTopology {
-        var writer = std.Io.Writer.Allocating.init(allocator);
+        var writer = std.Io.Writer.Allocating.init(plugin.allocator());
         defer writer.deinit();
-        writer.writer.print("platform={s};version={s};devices={d}", .{ platform_name, platform_version, self.client.devices.len }) catch return null;
+        writer.writer.print("platform={s};version={s};devices={d}", .{ plugin.Platform.name, plugin.Platform.version, self.client.devices.len }) catch return null;
         for (self.client.devices) |device| {
             writer.writer.print(";device={d}:{d}:{d}:{s}", .{ device.id, device.local_hardware_id, device.process_index, device.name }) catch return null;
         }
-        const topology = allocator.create(SerializedTopology) catch return null;
+        const topology = plugin.allocator().create(SerializedTopology) catch return null;
         topology.* = .{ .bytes = writer.toOwnedSlice() catch {
-            allocator.destroy(topology);
+            plugin.allocator().destroy(topology);
             return null;
         } };
         return topology;
     }
 
     fn writeSerialized(self: TopologyDescription, args: anytype) ?*c.PJRT_Error {
-        const topology = self.serialize() orelse return PjrtError.make(c.PJRT_Error_Code_INTERNAL, "failed to serialize topology");
-        const view: SerializedTopologyView = .{ .ptr = topology };
+        const topology = self.serialize() orelse return PjrtError.internal("failed to serialize topology");
+        const serialized: SerializedTopologyRef = .{ .ptr = topology };
         args.serialized_bytes = topology.bytes.ptr;
         args.serialized_bytes_size = topology.bytes.len;
-        args.serialized_topology = view.handle();
-        args.serialized_topology_deleter = SerializedTopologyView.delete;
+        args.serialized_topology = serialized.handle();
+        args.serialized_topology_deleter = SerializedTopologyRef.delete;
         return null;
     }
 };
@@ -118,11 +122,11 @@ fn TopologyCallback(comptime Args: type, comptime op: TopologyOp) type {
             const args = &raw[0];
             const topology = TopologyDescription.at(args.topology);
             switch (op) {
-                .platform_name => abi.Args.writeBytes("platform_name", "platform_name_size", args, topology.platformName()),
-                .platform_version => abi.Args.writeBytes("platform_version", "platform_version_size", args, topology.platformVersion()),
+                .platform_name => abi.Out.writeBytes("platform_name", "platform_name_size", args, topology.platformName()),
+                .platform_version => abi.Out.writeBytes("platform_version", "platform_version_size", args, topology.platformVersion()),
                 .device_descriptions => {
                     const devices = topology.devices();
-                    args.descriptions = abi.DeviceDescription.handleSlice(devices);
+                    args.descriptions = handles.DeviceDescription.handleSlice(devices);
                     args.num_descriptions = devices.len;
                 },
                 .attributes => {
@@ -153,5 +157,3 @@ const TopologyLifecycle = struct {
         return PjrtError.unimplemented("topology deserialization is not implemented yet");
     }
 };
-
-pub const Api = TopologyDescription.Api;

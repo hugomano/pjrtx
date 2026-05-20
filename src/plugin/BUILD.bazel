@@ -5,6 +5,8 @@ PLUGIN_SRCS = [
     "api.zig",
     "async_h2d.zig",
     "buffer.zig",
+    "buffer_element.zig",
+    "buffer_placement.zig",
     "client.zig",
     "custom_call.zig",
     "device_memory.zig",
@@ -13,17 +15,17 @@ PLUGIN_SRCS = [
     "executable.zig",
     "execute.zig",
     "pjrt_abi.zig",
-    "state.zig",
+    "pjrt_handles.zig",
     "topology.zig",
-    "trace_render.zig",
     "trace.zig",
-    "types.zig",
+    "trace_render.zig",
 ]
 
 filegroup(
     name = "sources",
     srcs = [
         "BUILD.bazel",
+        "api_test.zig",
         "plugin.zig",
     ] + PLUGIN_SRCS,
     visibility = ["//visibility:public"],
@@ -84,6 +86,19 @@ zig_test(
     name = "plugin_test",
     main = "plugin.zig",
     srcs = PLUGIN_SRCS,
+    deps = [
+        "//src/runtime",
+        "@xla//xla/pjrt/c:pjrt_c_api_gpu_extension_hdrs",
+        "@xla//xla/pjrt/c:pjrt_c_api_hdrs",
+    ],
+)
+
+zig_test(
+    name = "api_test",
+    main = "api_test.zig",
+    srcs = [
+        "plugin.zig",
+    ] + PLUGIN_SRCS,
     deps = [
         "//src/runtime",
         "@xla//xla/pjrt/c:pjrt_c_api_gpu_extension_hdrs",

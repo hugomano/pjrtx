@@ -34,9 +34,30 @@ Do not move behavior across those boundaries for convenience.
   modules.
 - Do not add manual trace prints when a structured trace hook belongs at a
   boundary.
+- Do not introduce vague local role names such as `View`, `Helper`, `Data`, or
+  `State`. Exact protocol nouns are allowed when the external API uses them and
+  the type owns a precise invariant, but prefer the repo vocabulary:
+  `Ref` for borrowed decoded handles, `Request`/`Call` for decoded entrypoint
+  arguments, `Handle` for opaque ABI adapters, and `Api` for callback groups.
 
 Existing generic files are legacy debt. When touching them, prefer moving code
 toward a domain-owned file instead of expanding the bucket.
+
+A module may only expose public APIs for its named domain. Do not put plugin
+metadata callbacks in `errors.zig`, executable ownership in process metadata,
+or runtime-aware handle aliases in raw ABI modules. If a file name and a public
+declaration tell different stories, move the declaration.
+
+Raw boundary modules must stay raw. In particular, `src/plugin/pjrt_abi.zig`
+must not import `src/runtime`, compiler, backend, MLX, or Metal code. Runtime
+handle aliases belong in a runtime-aware adapter such as `pjrt_handles.zig`;
+device lookup/assignment helpers belong in a placement module owned by that
+concept.
+
+Install each PJRT API prefix once. If `PJRT_LoadedExecutable_*` or another API
+family is implemented by multiple modules, pass those owner scopes to the
+generic installer as a tuple. Do not hand-forward individual callbacks inside
+`api.zig`, and do not create a facade module that owns no behavior.
 
 ## Preferred Code
 
@@ -51,12 +72,12 @@ const Event = struct {
     };
 
     fn at(raw: anytype) Event {
-        return .{ .ptr = abi.Event.view(raw) };
+        return .{ .ptr = handles.Event.ref(raw) };
     }
 };
 ```
 
-Use small request/view structs when an entrypoint has meaningful state:
+Use small request/ref structs when an entrypoint has meaningful state:
 
 ```zig
 const ExecuteCall = struct {
@@ -64,13 +85,30 @@ const ExecuteCall = struct {
     executable: *Executable,
 
     fn init(raw: *allowzero c.PJRT_LoadedExecutable_Execute_Args) ExecuteCall {
-        return .{ .raw = raw, .executable = LoadedExecutableHandle.view(raw.executable) };
+        return .{ .raw = raw, .executable = LoadedExecutableHandle.ref(raw.executable) };
     }
 };
 ```
 
 Prefer `Thing.init`, `Thing.deinit`, `Thing.validate`, `Thing.writeTo`, and
 domain-specific methods over free-floating helpers.
+
+Use Zig 0.16’s standard vocabulary directly. Reach for `std.Io.Reader`,
+`std.Io.Writer`, `std.Io.Timestamp`, `std.Io.Mutex`, bounded arrays,
+allocator-aware containers, `errdefer`, and precise error sets before inventing
+local wrappers. Process-wide lazy state must be protected by a real Zig
+synchronization primitive; naked init booleans are not acceptable for API
+tables, plugin contexts, attributes, or registries. Initialize IO mutexes with
+`std.Io.Mutex.init` and pass the owning layer's `std.Io` to lock/unlock calls;
+use `lockUncancelable(io)` for non-cancelable C ABI entrypoints. Outside the
+process initialization root, use the IO accessor owned by the layer instead of
+creating a fresh IO handle.
+
+Sort each file in a predictable order: imports, constants/handle aliases,
+public owned domain types, private refs/requests, operation enums, callback
+generators, public `Api` groups, then tests. Keep the same internal ordering
+inside repeated scopes so similar files look like relatives, not one-off
+accidents.
 
 ## Public API Discipline
 
@@ -138,6 +176,7 @@ Before editing, classify the problem:
 6. Is `pub` exposing something that should be private?
 7. Is a public API missing an intent comment?
 8. Is the test protecting intended behavior or protecting an accident?
+9. Are names and declaration order harmonized with neighboring modules?
 
 Use concrete critique categories:
 
@@ -150,6 +189,8 @@ Use concrete critique categories:
 - Diagnostic gap
 - Visibility leak
 - Documentation gap
+- Domain mismatch
+- Boundary impurity
 - Test mismatch
 
 Then choose one action:

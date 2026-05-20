@@ -70,6 +70,66 @@ passes, callbacks, and backend details, split it before adding more behavior.
 Existing generic files are legacy debt, not precedent. When touching one, move
 new behavior toward a domain-owned module and shrink the generic file.
 
+## File Order And Naming Harmony
+
+Keep every file sorted in a predictable, domain-first order. This is a coding
+standard, not a formatting preference. A reader should be able to scan a file
+from top to bottom and see ownership before mechanics:
+
+- imports, grouped from standard library to foreign ABI to local owner modules
+- file-level constants and handle aliases
+- public owned domain types, with public methods near the owned state
+- private borrowed references or decoded request structs
+- operation enums and callback generators
+- lifecycle/callback implementations
+- exported package API tables at the end
+- colocated tests after implementation
+
+Do not interleave unrelated callback families, request decoders, tests, and
+public state just because it avoids moving text. When a file has multiple
+related scopes, keep each scope internally ordered the same way: fields, `Api`,
+constructors/decoders, validation, writers, lifecycle. Tests live after the
+implementation they verify, not in the middle of callback machinery.
+
+Use the same vocabulary for the same role across the codebase:
+
+- `Owned` or the domain noun for values that own storage
+- `Ref` for a borrowed decoded handle/reference
+- `Request` or `Call` for decoded PJRT entrypoint arguments
+- `Handle` only for opaque ABI handle adapters
+- `Api` only for callback groups installed into `PJRT_Api`
+
+Avoid vague role names such as `View`, `Data`, `Info`, `Helper`, `Manager`, or
+`State` unless the domain or external protocol itself uses that noun and the
+type owns a precise invariant. A name should explain what owns the value, not
+how convenient it was to pass around. For example, PJRT's
+`AsyncHostToDeviceTransferManager` may keep the protocol word `Manager`, but a
+local decoded transfer payload should be named for its domain, such as
+`ByteTransferRequest`, not `Data`.
+
+A file may only expose public APIs for the domain named by the file. Do not put
+callbacks, structs, or constants in a nearby module just because it already has
+the imports you need. For example:
+
+- plugin metadata callbacks belong with plugin metadata, not error handling
+- executable ownership belongs with executable lifecycle, not process state
+- buffer element-type conversion belongs with buffer typing, not a generic
+  `types.zig`
+- opaque runtime handle aliases belong in a handle-boundary module, not the raw
+  ABI mechanics module
+
+Boundary modules should be honest about their level. A raw ABI helper such as
+`pjrt_abi.zig` must not import runtime, compiler, backend, MLX, or Metal code.
+If a helper needs runtime types, it is no longer raw ABI; move it to a
+runtime-aware adapter such as `pjrt_handles.zig` or a domain-specific placement
+module.
+
+API table composition should also tell the truth. Install each PJRT prefix once
+from one installer call. If implementation lives in multiple domain modules,
+pass those owner scopes as a tuple to the generic installer. Do not hand-forward
+individual callbacks in `api.zig`, and do not create facade files that exist
+only to re-export callbacks from real owner modules.
+
 ## Zig Style
 
 Prefer owning structs with methods over loose package-level helper functions.
@@ -110,6 +170,25 @@ Use Zig features deliberately:
 - `errdefer` and `deinit` for visible ownership.
 - `std.Io.Reader` for streamed program/data ingestion.
 - `std.Io.Writer` for diagnostics, traces, reports, and dumps.
+- Zig 0.16 standard-library primitives before local inventions:
+  `std.Io`, `std.Io.Timestamp`, `std.Io.Mutex`, bounded arrays, writers,
+  readers, and allocator-aware containers should be the default vocabulary.
+- Process-wide mutable state must be guarded with `std.Io.Mutex` or a
+  stricter Zig 0.16 synchronization primitive owned by the module. Do not use
+  naked boolean init flags for API tables, plugin contexts, registries, or
+  lazily initialized attributes.
+- Initialize IO mutexes with `std.Io.Mutex.init` and pass the owning layer's
+  `std.Io` to lock/unlock calls. For non-cancelable C ABI entrypoints, prefer
+  `lockUncancelable(io)` when holding a process-lifetime guard.
+- Reuse the plugin/runtime IO objects exposed by the owning layer instead of
+  creating ad hoc writers, clocks, or C time shims at call sites.
+- Only the process/plugin initialization root should create the first
+  process-lifetime `std.Io` handle. All other plugin modules should call
+  `plugin.io()` or the owning layer's IO accessor.
+
+When Zig 0.16 has a standard feature for a job, prefer it. A local abstraction
+is justified only when it gives a domain name to an invariant, not because it
+hides ordinary standard-library usage.
 
 ## Public API And Visibility
 
@@ -272,6 +351,10 @@ Use this vocabulary:
   owner.
 - Documentation gap: a public API lacks an intent comment or documents
   implementation details instead of contract.
+- Domain mismatch: a public API lives in a file whose name describes a different
+  owner.
+- Boundary impurity: a low-level ABI or foreign-boundary module imports a
+  higher-level runtime/compiler/backend package.
 - Test mismatch: tests validate an implementation shortcut instead of the
   intended boundary.
 
@@ -286,7 +369,7 @@ Avoid comments that only say code is ugly or sloppy. Say, for example:
 
 ```text
 `client.zig` is mixing compile-option decoding with buffer placement. Buffer
-placement belongs to a request/view type owned by runtime-facing client code;
+placement belongs to a request/ref type owned by runtime-facing client code;
 split that path and keep PJRT field decoding at the callback boundary.
 ```
 

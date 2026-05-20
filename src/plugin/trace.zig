@@ -3,34 +3,65 @@ const std = @import("std");
 const c = @import("c");
 const errors = @import("errors.zig");
 const PjrtError = errors.Error;
-const state = @import("state.zig");
+const plugin = @import("plugin.zig");
 const render = @import("trace_render.zig");
 
-const allocator = state.allocator;
+const Timestamp = std.Io.Timestamp;
 
-pub const Timestamp = std.Io.Timestamp;
-pub const io = state.io;
+const Config = struct {
+    trace_enabled: bool,
+    executable_cache_max_bytes: ?u64,
 
-pub const Env = struct {
-    pub fn traceEnabled() bool {
-        return flag("PJRTX_TRACE") or flag("PJRTX_PROFILE");
-    }
-
-    pub fn flag(comptime name: [:0]const u8) bool {
-        const raw = std.c.getenv(name) orelse return false;
-        const text = std.mem.span(raw);
-        return text.len != 0 and !std.mem.eql(u8, text, "0") and !std.ascii.eqlIgnoreCase(text, "false");
-    }
-
-    pub fn executableCacheMaxBytes() ?u64 {
-        const raw = std.c.getenv("PJRTX_EXECUTABLE_CACHE_MAX_BYTES") orelse return null;
-        const text = std.mem.span(raw);
-        return if (text.len == 0) null else std.fmt.parseUnsigned(u64, text, 10) catch null;
+    fn init() Config {
+        return .{
+            .trace_enabled = flagFromEnv("PJRTX_TRACE") or flagFromEnv("PJRTX_PROFILE"),
+            .executable_cache_max_bytes = integerFromEnv("PJRTX_EXECUTABLE_CACHE_MAX_BYTES"),
+        };
     }
 };
 
+var config_state: enum { cold, ready } = .cold;
+var config_storage: Config = undefined;
+var config_mutex: std.Io.Mutex = .init;
+
+/// Reads plugin tracing and profiling environment configuration.
+pub const Env = struct {
+    /// Returns whether PJRT API tracing or profiling is enabled for this process.
+    pub fn traceEnabled() bool {
+        return config().trace_enabled;
+    }
+
+    /// Returns the optional executable-cache residency limit requested by the environment.
+    pub fn executableCacheMaxBytes() ?u64 {
+        return config().executable_cache_max_bytes;
+    }
+};
+
+fn config() Config {
+    config_mutex.lockUncancelable(plugin.io());
+    defer config_mutex.unlock(plugin.io());
+
+    if (config_state == .cold) {
+        config_storage = Config.init();
+        config_state = .ready;
+    }
+    return config_storage;
+}
+
+fn flagFromEnv(comptime name: [:0]const u8) bool {
+    const raw = std.c.getenv(name) orelse return false;
+    const text = std.mem.span(raw);
+    return text.len != 0 and !std.mem.eql(u8, text, "0") and !std.ascii.eqlIgnoreCase(text, "false");
+}
+
+fn integerFromEnv(comptime name: [:0]const u8) ?u64 {
+    const raw = std.c.getenv(name) orelse return null;
+    const text = std.mem.span(raw);
+    return if (text.len == 0) null else std.fmt.parseUnsigned(u64, text, 10) catch null;
+}
+
 fn now() Timestamp {
-    return Timestamp.now(io, .awake);
+    return Timestamp.now(plugin.io(), .awake);
 }
 
 fn resultText(result: ?*c.PJRT_Error, out: *std.Io.Writer.Allocating) []const u8 {
@@ -45,26 +76,29 @@ fn resultText(result: ?*c.PJRT_Error, out: *std.Io.Writer.Allocating) []const u8
     return out.writer.buffered();
 }
 
+/// Wraps PJRT callbacks with uniform trace rendering when tracing is enabled.
 pub const Api = struct {
+    /// Returns a C-callable wrapper that traces arguments, result, and elapsed time.
     pub fn Callback(comptime name: []const u8, comptime callback: anytype) type {
-        const info = @typeInfo(@TypeOf(callback)).@"fn";
-        const Args = info.params[0].type orelse @compileError("PJRT callback args type is missing");
-        const Return = info.return_type orelse void;
+        const callback_fn = @typeInfo(@TypeOf(callback)).@"fn";
+        const Args = callback_fn.params[0].type orelse @compileError("PJRT callback args type is missing");
+        const Return = callback_fn.return_type orelse void;
         return struct {
+            /// Invokes the wrapped PJRT callback and emits one trace line when enabled.
             pub fn call(args: Args) callconv(.c) Return {
                 if (!Env.traceEnabled()) return callback(args);
                 const start = now();
                 if (Return == void) {
                     callback(args);
-                    var args_text = std.Io.Writer.Allocating.init(allocator);
+                    var args_text = std.Io.Writer.Allocating.init(plugin.allocator());
                     defer args_text.deinit();
                     emit(name, start, c.PJRT_Error_Code_OK, render.Render.args(Args, args, &args_text), "ok");
                     return;
                 }
                 const result = callback(args);
-                var args_text = std.Io.Writer.Allocating.init(allocator);
+                var args_text = std.Io.Writer.Allocating.init(plugin.allocator());
                 defer args_text.deinit();
-                var rendered_result = std.Io.Writer.Allocating.init(allocator);
+                var rendered_result = std.Io.Writer.Allocating.init(plugin.allocator());
                 defer rendered_result.deinit();
                 emit(name, start, PjrtError.code(result), render.Render.args(Args, args, &args_text), resultText(result, &rendered_result));
                 return result;

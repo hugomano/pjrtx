@@ -1,19 +1,22 @@
 const std = @import("std");
 
-const runtime = @import("src/runtime");
 const c = @import("c");
+const runtime = @import("src/runtime");
+
 const abi = @import("pjrt_abi.zig");
 const errors = @import("errors.zig");
-const PjrtError = errors.Error;
 const events_mod = @import("events.zig");
-const state = @import("state.zig");
+const executable_mod = @import("executable.zig");
+const handles = @import("pjrt_handles.zig");
+const plugin = @import("plugin.zig");
 
-const allocator = state.allocator;
-const Executable = state.Executable;
-const LoadedExecutableHandle = abi.LoadedExecutable(Executable);
+const Executable = executable_mod.Executable;
+const LoadedExecutableHandle = handles.LoadedExecutable(Executable);
+const PjrtError = errors.Error;
 const PjrtEvent = events_mod.Event;
 
-const LoadedExecutable = struct {
+/// PJRT loaded-executable execution callbacks.
+pub const Execution = struct {
     pub const Api = struct {
         pub const Execute = ExecuteApiCallback.call;
     };
@@ -41,7 +44,7 @@ const ExecuteOptions = struct {
         const raw = options orelse return .{};
         if (raw.non_donatable_input_indices == null) return .{};
         return .{
-            .non_donatable_input_indices = raw.non_donatable_input_indices[0..raw.num_non_donatable_input_indices],
+            .non_donatable_input_indices = abi.Slice.constList(i64, raw.non_donatable_input_indices, raw.num_non_donatable_input_indices) orelse &.{},
         };
     }
 
@@ -74,7 +77,7 @@ const ExecuteCall = struct {
     fn init(raw: *allowzero c.PJRT_LoadedExecutable_Execute_Args) ExecuteCall {
         return .{
             .raw = raw,
-            .executable = LoadedExecutableHandle.view(raw.executable),
+            .executable = LoadedExecutableHandle.ref(raw.executable),
             .options = ExecuteOptions.init(raw.options),
         };
     }
@@ -88,15 +91,15 @@ const ExecuteCall = struct {
     }
 
     fn expectedArgs(self: ExecuteCall) usize {
-        return self.executable.plan.parameter_shardings.len;
+        return self.executable.parameterCount();
     }
 
     fn expectedOutputs(self: ExecuteCall) usize {
-        return self.executable.plan.output_ids.len;
+        return self.executable.outputCount();
     }
 
     fn argument(self: ExecuteCall, device_index: usize, argument_index: usize) *runtime.Buffer {
-        return abi.Buffer.view(self.raw.argument_lists[device_index][argument_index]);
+        return handles.Buffer.ref(self.raw.argument_lists[device_index][argument_index]);
     }
 
     fn rawArgument(self: ExecuteCall, device_index: usize, argument_index: usize) ?*c.PJRT_Buffer {
@@ -122,7 +125,7 @@ const ExecuteCall = struct {
                 if (outputs != null) {
                     for (0..output_count) |output_index| {
                         if (outputs[output_index]) |output| {
-                            abi.Buffer.view(output).deinit();
+                            handles.Buffer.ref(output).deinit();
                             outputs[output_index] = null;
                         }
                     }
@@ -130,10 +133,7 @@ const ExecuteCall = struct {
             }
             if (self.raw.device_complete_events) |events| {
                 if (events[device_index]) |event| {
-                    var event_destroy_args = std.mem.zeroes(c.PJRT_Event_Destroy_Args);
-                    event_destroy_args.struct_size = c.PJRT_Event_Destroy_Args_STRUCT_SIZE;
-                    event_destroy_args.event = event;
-                    _ = PjrtEvent.Api.Destroy(&event_destroy_args);
+                    PjrtEvent.destroy(event);
                     events[device_index] = null;
                 }
             }
@@ -142,18 +142,18 @@ const ExecuteCall = struct {
 
     fn completionEventSlot(self: ExecuteCall, device_index: usize, source: runtime.Event) ?*runtime.Event {
         if (self.raw.device_complete_events) |events| {
-            events[device_index] = PjrtEvent.fromRuntime(source) orelse return null;
-            return PjrtEvent.runtime(events[device_index].?);
+            const completion = PjrtEvent.Completion.fromRuntime(&events[device_index], source) orelse return null;
+            return completion.runtime();
         }
         return null;
     }
 
     fn assignOutput(self: ExecuteCall, device_index: usize, output_index: usize, output: *runtime.Buffer) void {
-        self.raw.output_lists[device_index][output_index] = abi.Buffer.handle(output);
+        self.raw.output_lists[device_index][output_index] = handles.Buffer.handle(output);
     }
 
     fn validate(self: ExecuteCall) ?*c.PJRT_Error {
-        if (self.executable.deleted) return PjrtError.failedPrecondition("loaded executable has been deleted");
+        if (self.executable.isDeleted()) return PjrtError.failedPrecondition("loaded executable has been deleted");
         if (self.validateLists()) |err| return err;
         if (self.options.validate(self.raw.options, self.numArgs())) |err| return err;
         return self.validateDonationAliasHazards();
@@ -163,7 +163,7 @@ const ExecuteCall = struct {
         const expected_args = self.expectedArgs();
         const expected_outputs = self.expectedOutputs();
         if (self.numDevices() == 0) return PjrtError.invalidArgument("PjRTx execute requires at least one device");
-        if (self.numDevices() > self.executable.graph.device_ids.len) return PjrtError.invalidArgument("PjRTx execute requested more devices than the executable graph contains");
+        if (self.numDevices() > self.executable.graphDeviceCount()) return PjrtError.invalidArgument("PjRTx execute requested more devices than the executable graph contains");
         if (self.numArgs() != expected_args) return PjrtError.invalidArgument("PjRTx execute argument count does not match executable parameters");
         if (expected_args != 0 and self.raw.argument_lists == null) return PjrtError.invalidArgument("PjRTx execute requires non-null argument_lists for executable parameters");
         if (expected_outputs != 0 and self.raw.output_lists == null) return PjrtError.invalidArgument("PjRTx execute requires non-null output_lists for executable outputs");
@@ -186,7 +186,7 @@ const ExecuteCall = struct {
     fn validateDonationAliasHazards(self: ExecuteCall) ?*c.PJRT_Error {
         for (0..self.numDevices()) |donor_device_index| {
             for (0..self.numArgs()) |donor_argument_index| {
-                if (!executableDonatesParameter(self.executable, donor_argument_index)) continue;
+                if (!self.executable.donatesParameter(donor_argument_index)) continue;
                 if (self.options.keepsParameter(donor_argument_index)) continue;
                 const donor_buffer = self.rawArgument(donor_device_index, donor_argument_index).?;
                 for (0..self.numDevices()) |other_device_index| {
@@ -207,14 +207,14 @@ const DonationSet = struct {
     list: std.ArrayList(*runtime.Buffer) = .empty,
 
     fn deinit(self: *DonationSet) void {
-        self.list.deinit(allocator);
+        self.list.deinit(plugin.allocator());
     }
 
     fn record(self: *DonationSet, buffer: *runtime.Buffer) !void {
         for (self.list.items) |existing| {
             if (existing == buffer) return;
         }
-        try self.list.append(allocator, buffer);
+        try self.list.append(plugin.allocator(), buffer);
     }
 
     fn commit(self: DonationSet) void {
@@ -222,37 +222,9 @@ const DonationSet = struct {
     }
 };
 
-fn executableDonatesParameter(executable: *const Executable, parameter_index: usize) bool {
-    for (executable.plan.donated_parameter_indices) |candidate| {
-        if (candidate == parameter_index) return true;
-    }
-    return false;
-}
-
 fn cleanupUnassignedExecuteOutputs(outputs: []const *runtime.Buffer, assigned_count: usize) void {
     if (assigned_count >= outputs.len) return;
     for (outputs[assigned_count..]) |output| output.deinit();
-}
-
-test "execute cleanup destroys only unassigned runtime outputs" {
-    const test_allocator = std.testing.allocator;
-    const client = try runtime.createClient(test_allocator, .{ .backend_kind = .metal_mlx, .device_count = 1 });
-    defer client.deinit();
-
-    const dims = [_]i64{4};
-    const first_data = [_]u8{ 1, 2, 3, 4 };
-    const second_data = [_]u8{ 5, 6, 7, 8 };
-    const first = try client.createHostBufferFromBytes(test_allocator, .u8, &dims, &client.devices[0], &client.memories[0], 0, &first_data);
-    defer first.deinit();
-    const second = try client.createHostBufferFromBytes(test_allocator, .u8, &dims, &client.devices[0], &client.memories[0], 0, &second_data);
-
-    const bytes_before_cleanup = client.memories[0].stats.bytes_in_use;
-    const second_bytes: u64 = @intCast(second.byte_size);
-    var outputs = [_]*runtime.Buffer{ first, second };
-    cleanupUnassignedExecuteOutputs(&outputs, 1);
-
-    try first.ensureUsable();
-    try std.testing.expectEqual(bytes_before_cleanup - second_bytes, client.memories[0].stats.bytes_in_use);
 }
 
 const ExecuteApiCallback = struct {
@@ -276,14 +248,14 @@ const ExecuteApiCallback = struct {
     }
 
     fn runDevice(request: ExecuteCall, executable: *Executable, donated_arguments: *DonationSet, device_index: usize, output_count: usize) ?*c.PJRT_Error {
-        const arguments = allocator.alloc(*runtime.Buffer, request.numArgs()) catch {
+        const arguments = plugin.allocator().alloc(*runtime.Buffer, request.numArgs()) catch {
             request.cleanupResults(output_count);
             return PjrtError.internal("failed to allocate executable graph argument list");
         };
-        defer allocator.free(arguments);
+        defer plugin.allocator().free(arguments);
         for (arguments, 0..) |*argument, argument_index| {
             argument.* = request.argument(device_index, argument_index);
-            if (executableDonatesParameter(executable, argument_index) and !request.options.keepsParameter(argument_index)) {
+            if (executable.donatesParameter(argument_index) and !request.options.keepsParameter(argument_index)) {
                 donated_arguments.record(argument.*) catch {
                     request.cleanupResults(output_count);
                     return PjrtError.internal("failed to record donated executable argument");
@@ -291,7 +263,7 @@ const ExecuteApiCallback = struct {
             }
         }
 
-        const execute_result = executable.graph.executeDevice(allocator, executable.client, executable.plan, device_index, arguments) catch |err| {
+        const execute_result = executable.executeDevice(device_index, arguments) catch |err| {
             request.cleanupResults(output_count);
             return graphExecuteError(err);
         };
@@ -300,7 +272,7 @@ const ExecuteApiCallback = struct {
 
     fn assignDeviceOutputs(request: ExecuteCall, device_index: usize, output_count: usize, execute_result: runtime.GraphExecuteResult) ?*c.PJRT_Error {
         const outputs = execute_result.outputs;
-        defer allocator.free(outputs);
+        defer plugin.allocator().free(outputs);
         var assigned_outputs: usize = 0;
         var outputs_transferred = false;
         defer if (!outputs_transferred) cleanupUnassignedExecuteOutputs(outputs, assigned_outputs);
@@ -323,4 +295,23 @@ const ExecuteApiCallback = struct {
     }
 };
 
-pub const LoadedExecutableApi = LoadedExecutable.Api;
+test "execute cleanup destroys only unassigned runtime outputs" {
+    const test_allocator = std.testing.allocator;
+    const client = try runtime.createClient(test_allocator, .{ .backend_kind = .metal_mlx, .device_count = 1 });
+    defer client.deinit();
+
+    const dims = [_]i64{4};
+    const first_data = [_]u8{ 1, 2, 3, 4 };
+    const second_data = [_]u8{ 5, 6, 7, 8 };
+    const first = try client.createHostBufferFromBytes(test_allocator, .u8, &dims, &client.devices[0], &client.memories[0], 0, &first_data);
+    defer first.deinit();
+    const second = try client.createHostBufferFromBytes(test_allocator, .u8, &dims, &client.devices[0], &client.memories[0], 0, &second_data);
+
+    const bytes_before_cleanup = client.memories[0].stats.bytes_in_use;
+    const second_bytes: u64 = @intCast(second.byte_size);
+    var outputs = [_]*runtime.Buffer{ first, second };
+    cleanupUnassignedExecuteOutputs(&outputs, 1);
+
+    try first.ensureUsable();
+    try std.testing.expectEqual(bytes_before_cleanup - second_bytes, client.memories[0].stats.bytes_in_use);
+}

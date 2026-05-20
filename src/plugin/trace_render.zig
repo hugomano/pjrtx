@@ -20,11 +20,11 @@ fn ignored(comptime name: []const u8) bool {
 }
 
 fn pointer(comptime T: type, ptr_value: T, writer: *std.Io.Writer) !void {
-    const info = @typeInfo(T).pointer;
-    switch (info.size) {
-        .c => if (ptr_value == null) try writer.writeAll("null") else try writer.print("{s}(non_null)", .{typeName(info.child)}),
-        .slice => try writer.print("{s}[{d}]", .{ typeName(info.child), ptr_value.len }),
-        else => try writer.print("{s}(non_null)", .{typeName(info.child)}),
+    const pointer_meta = @typeInfo(T).pointer;
+    switch (pointer_meta.size) {
+        .c => if (ptr_value == null) try writer.writeAll("null") else try writer.print("{s}(non_null)", .{typeName(pointer_meta.child)}),
+        .slice => try writer.print("{s}[{d}]", .{ typeName(pointer_meta.child), ptr_value.len }),
+        else => try writer.print("{s}(non_null)", .{typeName(pointer_meta.child)}),
     }
 }
 
@@ -46,11 +46,11 @@ fn value(comptime T: type, item: T, writer: *std.Io.Writer, comptime depth: u8) 
             }
             try writer.writeByte(']');
         },
-        .@"struct" => |info| {
+        .@"struct" => |struct_meta| {
             if (depth > 1) return writer.print("{s}{{...}}", .{typeName(T)});
             try writer.print("{s}{{", .{typeName(T)});
             var first = true;
-            inline for (info.fields) |field| if (!ignored(field.name)) {
+            inline for (struct_meta.fields) |field| if (!ignored(field.name)) {
                 if (!first) try writer.writeByte(',');
                 first = false;
                 try writer.print("{s}=", .{field.name});
@@ -62,15 +62,19 @@ fn value(comptime T: type, item: T, writer: *std.Io.Writer, comptime depth: u8) 
     }
 }
 
+/// Renders PJRT callback arguments and values for structured trace lines.
 pub const Render = struct {
+    /// Writes text as a single trace-safe token.
     pub fn tokenText(writer: *std.Io.Writer, text: []const u8) !void {
         try token(writer, text);
     }
 
+    /// Writes an arbitrary value using the generic PJRT trace renderer.
     pub fn valueOf(comptime T: type, item: T, writer: *std.Io.Writer, comptime depth: u8) !void {
         try value(T, item, writer, depth);
     }
 
+    /// Renders a PJRT callback argument pointer into the supplied scratch buffer.
     pub fn args(comptime Args: type, raw: Args, out: *std.Io.Writer.Allocating) []const u8 {
         if (raw == null) return "null";
         value(@typeInfo(Args).pointer.child, raw[0], &out.writer, 0) catch {

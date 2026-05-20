@@ -22,11 +22,111 @@ pub const CustomCallKind = backend_api.CustomCallKind;
 pub const CustomCallRegistration = backend_api.CustomCallRegistration;
 pub const AsyncHostToDeviceTransferHandle = backend_api.AsyncHostToDeviceTransferHandle;
 
-pub fn registerCustomCall(registration: CustomCallRegistration) backend_api.Error!void {
+pub const BufferCreateError = std.mem.Allocator.Error || backend_api.Error || error{ InvalidArgument, UnsupportedRuntimeFeature };
+pub const PendingBackendTransferBufferError = std.mem.Allocator.Error || error{InvalidArgument};
+pub const AsyncTransferBeginError = backend_api.Error || error{UnsupportedRuntimeFeature};
+pub const AsyncTransferWriteError = backend_api.Error;
+pub const AsyncTransferFinishError = backend_api.Error || error{ UnsupportedRuntimeFeature, BufferDeleted, BufferDonated };
+pub const HostReadbackError = error{
+    DestinationTooSmall,
+    BufferDeleted,
+    BufferDonated,
+    BufferNotReady,
+    BufferReadinessFailed,
+    UnsupportedRuntimeFeature,
+    BackendBufferCopyFailed,
+};
+
+fn parseCustomCallOp(comptime Op: type, name: []const u8, comptime entries: anytype) ?Op {
+    return inline for (entries) |entry| {
+        if (std.mem.eql(u8, name, entry[0])) break entry[1];
+    } else null;
+}
+
+fn parseBinaryCustomCallOp(name: []const u8) ?ElementwiseBinaryOp {
+    return parseCustomCallOp(ElementwiseBinaryOp, name, .{
+        .{ "add", ElementwiseBinaryOp.add },
+        .{ "subtract", ElementwiseBinaryOp.subtract },
+        .{ "multiply", ElementwiseBinaryOp.multiply },
+        .{ "divide", ElementwiseBinaryOp.divide },
+        .{ "maximum", ElementwiseBinaryOp.maximum },
+        .{ "minimum", ElementwiseBinaryOp.minimum },
+        .{ "power", ElementwiseBinaryOp.power },
+        .{ "atan2", ElementwiseBinaryOp.atan2 },
+        .{ "remainder", ElementwiseBinaryOp.remainder },
+        .{ "and", ElementwiseBinaryOp.and_ },
+        .{ "or", ElementwiseBinaryOp.or_ },
+        .{ "xor", ElementwiseBinaryOp.xor },
+        .{ "shift_left", ElementwiseBinaryOp.shift_left },
+        .{ "shift_right_logical", ElementwiseBinaryOp.shift_right_logical },
+        .{ "shift_right_arithmetic", ElementwiseBinaryOp.shift_right_arithmetic },
+    });
+}
+
+fn parseUnaryCustomCallOp(name: []const u8) ?ElementwiseUnaryOp {
+    return parseCustomCallOp(ElementwiseUnaryOp, name, .{
+        .{ "negate", ElementwiseUnaryOp.negate },
+        .{ "exp", ElementwiseUnaryOp.exp },
+        .{ "expm1", ElementwiseUnaryOp.expm1 },
+        .{ "tanh", ElementwiseUnaryOp.tanh },
+        .{ "sqrt", ElementwiseUnaryOp.sqrt },
+        .{ "rsqrt", ElementwiseUnaryOp.rsqrt },
+        .{ "abs", ElementwiseUnaryOp.abs },
+        .{ "cbrt", ElementwiseUnaryOp.cbrt },
+        .{ "ceil", ElementwiseUnaryOp.ceil },
+        .{ "floor", ElementwiseUnaryOp.floor },
+        .{ "log", ElementwiseUnaryOp.log },
+        .{ "log1p", ElementwiseUnaryOp.log1p },
+        .{ "logistic", ElementwiseUnaryOp.logistic },
+        .{ "sine", ElementwiseUnaryOp.sine },
+        .{ "cosine", ElementwiseUnaryOp.cosine },
+        .{ "not", ElementwiseUnaryOp.not_ },
+        .{ "sign", ElementwiseUnaryOp.sign },
+        .{ "is_finite", ElementwiseUnaryOp.is_finite },
+        .{ "round_nearest_afz", ElementwiseUnaryOp.round_nearest_afz },
+        .{ "round_nearest_even", ElementwiseUnaryOp.round_nearest_even },
+        .{ "popcnt", ElementwiseUnaryOp.popcnt },
+        .{ "count_leading_zeros", ElementwiseUnaryOp.count_leading_zeros },
+    });
+}
+
+/// Errors returned while registering backend custom-call targets.
+pub const CustomCallRegistrationError = backend_api.Error;
+
+/// Registers a fully typed backend custom-call target with the Metal/MLX runtime.
+pub fn registerCustomCall(registration: CustomCallRegistration) CustomCallRegistrationError!void {
     var backend_impl = backend_registry.create(.metal_mlx);
     return backend_impl.registerCustomCall(registration);
 }
 
+/// Registers a named binary elementwise custom call after runtime validation.
+pub fn registerBinaryCustomCall(target: []const u8, op_name: []const u8) CustomCallRegistrationError!void {
+    const op = parseBinaryCustomCallOp(op_name) orelse return error.InvalidCustomCall;
+    return registerCustomCall(.{ .target = target, .kind = .binary, .binary_op = op });
+}
+
+/// Registers an identity custom call whose execution aliases its input.
+pub fn registerIdentityCustomCall(target: []const u8) CustomCallRegistrationError!void {
+    return registerCustomCall(.{ .target = target, .kind = .identity });
+}
+
+/// Registers a named unary elementwise custom call after runtime validation.
+pub fn registerUnaryCustomCall(target: []const u8, op_name: []const u8) CustomCallRegistrationError!void {
+    const op = parseUnaryCustomCallOp(op_name) orelse return error.InvalidCustomCall;
+    return registerCustomCall(.{ .target = target, .kind = .unary, .unary_op = op });
+}
+
+/// Registers the runtime-owned marker for a unary square-root custom call.
+pub fn registerUnarySqrtCustomCall(target: []const u8) CustomCallRegistrationError!void {
+    return registerCustomCall(.{ .target = target, .kind = .unary, .unary_op = .sqrt });
+}
+
+/// Registers the runtime-owned marker for a binary add custom call.
+pub fn registerBinaryAddCustomCall(target: []const u8) CustomCallRegistrationError!void {
+    return registerCustomCall(.{ .target = target, .kind = .binary, .binary_op = .add });
+}
+
+/// Removes a custom-call target from the Metal/MLX backend registry.
 pub fn unregisterCustomCall(target: []const u8) void {
     var backend_impl = backend_registry.create(.metal_mlx);
     backend_impl.unregisterCustomCall(target);
@@ -1148,6 +1248,14 @@ pub const Client = struct {
         return null;
     }
 
+    /// Finds an addressable device by backend-local hardware id.
+    pub fn lookupAddressableDeviceByLocalHardwareId(self: *const Client, local_hardware_id: i32) ?*const Device {
+        for (self.devices) |*device| {
+            if (device.addressable and device.local_hardware_id == local_hardware_id) return device;
+        }
+        return null;
+    }
+
     pub fn lookupMemory(self: *const Client, id: i32) ?*const Memory {
         for (self.memories) |*memory| {
             if (memory.id == id) return memory;
@@ -1324,7 +1432,7 @@ pub const Client = struct {
         memory: *Memory,
         shard_index: usize,
         src: []const u8,
-    ) !*Buffer {
+    ) BufferCreateError!*Buffer {
         return Buffer.initHostCopyForBackend(allocator, self.backend, element_type, dims, device, memory, shard_index, src);
     }
 
@@ -1336,7 +1444,7 @@ pub const Client = struct {
         device: *Device,
         memory: *Memory,
         shard_index: usize,
-    ) !*Buffer {
+    ) BufferCreateError!*Buffer {
         return Buffer.initDeviceAllocationForBackend(allocator, self.backend, element_type, dims, device, memory, shard_index);
     }
 
@@ -1348,7 +1456,7 @@ pub const Client = struct {
         device: *Device,
         memory: *Memory,
         shard_index: usize,
-    ) !*Buffer {
+    ) BufferCreateError!*Buffer {
         return Buffer.initPendingBackendTransfer(allocator, self.backend, element_type, dims, device, memory, shard_index);
     }
 
@@ -1358,26 +1466,22 @@ pub const Client = struct {
         element_type: BufferType,
         dims: []const i64,
         byte_size: usize,
-    ) ?AsyncHostToDeviceTransferHandle {
-        return self.backend.beginAsyncHostToDeviceTransfer(device.local_hardware_id, element_type, dims, byte_size) catch null;
+    ) AsyncTransferBeginError!AsyncHostToDeviceTransferHandle {
+        return try self.backend.beginAsyncHostToDeviceTransfer(device.local_hardware_id, element_type, dims, byte_size) orelse error.UnsupportedRuntimeFeature;
     }
 
     pub fn destroyAsyncHostToDeviceTransfer(self: *Client, transfer: AsyncHostToDeviceTransferHandle) void {
         self.backend.destroyAsyncHostToDeviceTransfer(transfer);
     }
 
-    pub fn writeAsyncHostToDeviceTransfer(self: *Client, transfer: AsyncHostToDeviceTransferHandle, offset: usize, bytes: []const u8) !void {
+    pub fn writeAsyncHostToDeviceTransfer(self: *Client, transfer: AsyncHostToDeviceTransferHandle, offset: usize, bytes: []const u8) AsyncTransferWriteError!void {
         try self.backend.writeAsyncHostToDeviceTransfer(transfer, offset, bytes);
     }
 
-    pub fn finishAsyncHostToDeviceTransfer(self: *Client, buffer: *Buffer, transfer: AsyncHostToDeviceTransferHandle) !void {
+    pub fn finishAsyncHostToDeviceTransfer(self: *Client, buffer: *Buffer, transfer: AsyncHostToDeviceTransferHandle) AsyncTransferFinishError!void {
         const backend_buffer = try self.backend.finishAsyncHostToDeviceTransfer(transfer) orelse return error.UnsupportedRuntimeFeature;
         errdefer self.backend.destroyBuffer(backend_buffer);
         try buffer.replaceBackendStorage(backend_buffer);
-    }
-
-    pub fn installStagedHostBuffer(_: *Client, buffer: *Buffer, staging: []const u8) !void {
-        try buffer.replaceBackendStorageFromHost(staging);
     }
 
     pub fn compileProgram(
@@ -1849,7 +1953,7 @@ pub const Buffer = struct {
         byte_size: usize,
         backend_buffer: backend_api.BufferHandle,
         shard_index: usize,
-    ) !*Buffer {
+    ) BufferCreateError!*Buffer {
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
 
@@ -1886,7 +1990,7 @@ pub const Buffer = struct {
         memory: *Memory,
         shard_index: usize,
         src: []const u8,
-    ) !*Buffer {
+    ) BufferCreateError!*Buffer {
         if (!memory.isAddressableBy(device)) return error.InvalidArgument;
 
         const buffer = try allocator.create(Buffer);
@@ -1929,7 +2033,7 @@ pub const Buffer = struct {
         device: *Device,
         memory: *Memory,
         shard_index: usize,
-    ) !*Buffer {
+    ) BufferCreateError!*Buffer {
         if (!memory.isAddressableBy(device)) return error.InvalidArgument;
 
         const buffer = try allocator.create(Buffer);
@@ -1972,7 +2076,7 @@ pub const Buffer = struct {
         device: *Device,
         memory: *Memory,
         shard_index: usize,
-    ) !*Buffer {
+    ) PendingBackendTransferBufferError!*Buffer {
         if (!memory.isAddressableBy(device)) return error.InvalidArgument;
 
         const buffer = try allocator.create(Buffer);
@@ -2655,7 +2759,7 @@ pub const Buffer = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn copyToHost(self: *Buffer, dst: []u8) !void {
+    pub fn copyToHost(self: *Buffer, dst: []u8) HostReadbackError!void {
         try self.ensureUsable();
         try self.ensureReady();
         if (dst.len < self.byte_size) return error.DestinationTooSmall;
@@ -2693,17 +2797,7 @@ pub const Buffer = struct {
         return backend_buffer;
     }
 
-    pub fn replaceBackendStorageFromHost(self: *Buffer, src: []const u8) !void {
-        try self.ensureUsable();
-        if (src.len != self.byte_size) return error.ShapeMismatch;
-        const backend_buffer = try self.backend.bufferFromHost(self.device.local_hardware_id, self.element_type, self.dims, src) orelse
-            return error.UnsupportedRuntimeFeature;
-        errdefer self.backend.destroyBuffer(backend_buffer);
-        try self.replaceBackendStorage(backend_buffer);
-        self.memory.stats.host_to_device_bytes += @intCast(src.len);
-    }
-
-    pub fn replaceBackendStorage(self: *Buffer, backend_buffer: backend_api.BufferHandle) !void {
+    pub fn replaceBackendStorage(self: *Buffer, backend_buffer: backend_api.BufferHandle) error{ BufferDeleted, BufferDonated }!void {
         try self.ensureUsable();
         self.releaseStorage();
         self.backend_buffer = backend_buffer;

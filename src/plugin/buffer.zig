@@ -1,17 +1,20 @@
-const runtime = @import("src/runtime");
 const c = @import("c");
-const abi = @import("pjrt_abi.zig");
-const errors = @import("errors.zig");
-const PjrtError = errors.Error;
-const events = @import("events.zig");
-const types = @import("types.zig");
+const runtime = @import("src/runtime");
 
+const abi = @import("pjrt_abi.zig");
+const buffer_element = @import("buffer_element.zig");
+const errors = @import("errors.zig");
+const events = @import("events.zig");
+const handles = @import("pjrt_handles.zig");
+
+const PjrtError = errors.Error;
 const PjrtEvent = events.Event;
 
-const Buffer = struct {
+/// Borrowed PJRT buffer reference backed by a runtime buffer.
+pub const Buffer = struct {
     ptr: *runtime.Buffer,
 
-    const Api = struct {
+    pub const Api = struct {
         pub const Destroy = BufferCallback(c.PJRT_Buffer_Destroy_Args, .destroy).call;
         pub const ElementType = BufferScalarCallback(c.PJRT_Buffer_ElementType_Args, "type", .element_type).call;
         pub const Dimensions = BufferCallback(c.PJRT_Buffer_Dimensions_Args, .dimensions).call;
@@ -27,11 +30,11 @@ const Buffer = struct {
     };
 
     fn at(raw: anytype) Buffer {
-        return .{ .ptr = abi.Buffer.view(raw) };
+        return .{ .ptr = handles.Buffer.ref(raw) };
     }
 
     fn elementType(self: Buffer) c.PJRT_Buffer_Type {
-        return types.BufferType.toPjrt(self.ptr.element_type);
+        return buffer_element.ElementType.toPjrt(self.ptr.element_type);
     }
 
     fn onDeviceSize(self: Buffer) usize {
@@ -47,11 +50,11 @@ const Buffer = struct {
     }
 
     fn device(self: Buffer) *c.PJRT_Device {
-        return abi.Device.handle(self.ptr.device);
+        return handles.Device.handle(self.ptr.device);
     }
 
     fn memory(self: Buffer) *c.PJRT_Memory {
-        return abi.Memory.handle(self.ptr.memory);
+        return handles.Memory.handle(self.ptr.memory);
     }
 
     fn readyEvent(self: Buffer) ?*c.PJRT_Event {
@@ -85,7 +88,8 @@ const Buffer = struct {
             error.BufferDeleted, error.BufferDonated => PjrtError.failedPrecondition("buffer has been deleted or donated"),
             error.BufferNotReady => PjrtError.failedPrecondition("buffer is not ready"),
             error.BufferReadinessFailed => PjrtError.failedPrecondition("buffer readiness failed"),
-            else => PjrtError.internal("failed to copy buffer to host"),
+            error.UnsupportedRuntimeFeature => PjrtError.unimplemented("backend cannot copy this buffer to host"),
+            error.BackendBufferCopyFailed => PjrtError.internal("failed to copy buffer to host"),
         };
         return null;
     }
@@ -172,7 +176,7 @@ fn BufferCallback(comptime Args: type, comptime op: BufferOp) type {
                 .delete => delete(args),
                 .dimensions => dimensions(args),
                 .dynamic_dimensions => dynamicDimensions(args),
-                .to_host => ToHost.run(args),
+                .to_host => HostReadbackRequest.run(args),
             };
         }
 
@@ -219,18 +223,18 @@ const DynamicDims = struct {
     }
 };
 
-const ToHost = struct {
+const HostReadbackRequest = struct {
     raw: *allowzero c.PJRT_Buffer_ToHostBuffer_Args,
     buffer: Buffer,
 
     fn run(raw: *allowzero c.PJRT_Buffer_ToHostBuffer_Args) ?*c.PJRT_Error {
-        return (ToHost{
+        return (HostReadbackRequest{
             .raw = raw,
             .buffer = Buffer.at(raw.src),
         }).copy();
     }
 
-    fn copy(self: ToHost) ?*c.PJRT_Error {
+    fn copy(self: HostReadbackRequest) ?*c.PJRT_Error {
         if (self.buffer.ensureUsable()) |err| return err;
         if (self.raw.dst == null) return self.querySize();
         if (self.buffer.ensureReady()) |err| return err;
@@ -242,15 +246,12 @@ const ToHost = struct {
         return null;
     }
 
-    fn querySize(self: ToHost) ?*c.PJRT_Error {
+    fn querySize(self: HostReadbackRequest) ?*c.PJRT_Error {
         self.raw.dst_size = self.buffer.onDeviceSize();
         return null;
     }
 
-    fn complete(self: ToHost) void {
-        self.raw.event = PjrtEvent.pending();
-        PjrtEvent.setReady(self.raw.event);
+    fn complete(self: HostReadbackRequest) void {
+        self.raw.event = PjrtEvent.ready();
     }
 };
-
-pub const Api = Buffer.Api;

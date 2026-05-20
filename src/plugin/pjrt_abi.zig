@@ -1,115 +1,57 @@
 const std = @import("std");
 
-const runtime = @import("src/runtime");
 const c = @import("c");
 
-pub fn structSize(comptime T: type) usize {
-    const typedef_name = comptime blk: {
-        const needle = ".struct_";
-        const idx = std.mem.indexOf(u8, @typeName(T), needle).?;
-        break :blk @typeName(T)[idx + needle.len ..];
-    };
-    return @field(c, typedef_name ++ "_STRUCT_SIZE");
-}
-
-pub fn Struct(comptime T: type) type {
-    const fields = std.meta.fields(T);
-    var names: [fields.len][]const u8 = undefined;
-    var types: [fields.len]type = undefined;
-    var attributes: [fields.len]std.builtin.Type.StructField.Attributes = undefined;
-    for (fields, &names, &types, &attributes) |field, *name, *type_, *attr| {
-        name.* = field.name;
-        type_.* = field.type;
-        attr.* = .{
-            .default_value_ptr = @ptrCast(if (std.mem.eql(u8, field.name, "struct_size"))
-                &structSize(T)
-            else
-                &std.mem.zeroes(field.type)),
-        };
-    }
-    return @Struct(.@"extern", null, &names, &types, &attributes);
-}
-
-fn view(comptime T: type, ptr: anytype) *T {
+fn ref(comptime T: type, ptr: anytype) *T {
     return switch (@typeInfo(@TypeOf(ptr))) {
         .optional => @ptrCast(@alignCast(ptr.?)),
         .pointer => @ptrCast(@alignCast(ptr)),
-        else => @compileError("PJRT ABI view expects an opaque pointer"),
+        else => @compileError("PJRT ABI ref expects an opaque pointer"),
     };
 }
 
-fn viewConst(comptime T: type, ptr: anytype) *const T {
+fn refConst(comptime T: type, ptr: anytype) *const T {
     return switch (@typeInfo(@TypeOf(ptr))) {
         .optional => @ptrCast(@alignCast(ptr.?)),
         .pointer => @ptrCast(@alignCast(ptr)),
-        else => @compileError("PJRT ABI const view expects an opaque pointer"),
+        else => @compileError("PJRT ABI const ref expects an opaque pointer"),
     };
 }
 
-pub fn Opaque(comptime State: type, comptime CHandle: type) type {
+/// Defines typed conversions between a PjRTx owner and an opaque PJRT handle.
+pub fn Opaque(comptime Owner: type, comptime CHandle: type) type {
     return struct {
-        pub fn view(raw: anytype) *State {
-            return pjrt_abi.view(State, raw);
+        /// Borrows a mutable PjRTx owner from an opaque PJRT handle.
+        pub fn ref(raw: anytype) *Owner {
+            return pjrt_abi.ref(Owner, raw);
         }
 
-        pub fn viewConst(raw: anytype) *const State {
-            return pjrt_abi.viewConst(State, raw);
+        /// Borrows an immutable PjRTx owner from an opaque PJRT handle.
+        pub fn refConst(raw: anytype) *const Owner {
+            return pjrt_abi.refConst(Owner, raw);
         }
 
-        pub fn handle(state: anytype) *CHandle {
-            return @ptrCast(state);
+        /// Reinterprets a PjRTx owner as the opaque PJRT handle exported to callers.
+        pub fn handle(owner: anytype) *CHandle {
+            return @ptrCast(owner);
         }
 
-        pub fn handleSlice(states: []const *State) [*c]*CHandle {
-            return @ptrCast(@constCast(states.ptr));
-        }
-
-        pub fn optionalHandle(state: anytype) ?*CHandle {
-            return if (state) |ptr| handle(ptr) else null;
+        /// Reinterprets a list of PjRTx owners as a PJRT handle array.
+        pub fn handleSlice(owners: []const *Owner) [*c]*CHandle {
+            return @ptrCast(@constCast(owners.ptr));
         }
     };
 }
 
 const pjrt_abi = @This();
 
-pub const Client = Opaque(runtime.Client, c.PJRT_Client);
-pub const TopologyDescription = Opaque(runtime.Client, c.PJRT_TopologyDescription);
-pub const Device = Opaque(runtime.Device, c.PJRT_Device);
-pub const DeviceDescription = Opaque(runtime.Device, c.PJRT_DeviceDescription);
-pub const Memory = Opaque(runtime.Memory, c.PJRT_Memory);
-pub const Buffer = Opaque(runtime.Buffer, c.PJRT_Buffer);
-pub const Event = Opaque(runtime.Event, c.PJRT_Event);
-
-pub fn Executable(comptime State: type) type {
-    return Opaque(State, c.PJRT_Executable);
-}
-
-pub fn LoadedExecutable(comptime State: type) type {
-    return Opaque(State, c.PJRT_LoadedExecutable);
-}
-
-pub fn AsyncHostToDeviceTransferManager(comptime State: type) type {
-    return Opaque(State, c.PJRT_AsyncHostToDeviceTransferManager);
-}
-
-pub fn SerializedTopology(comptime State: type) type {
-    return Opaque(State, c.PJRT_SerializedTopology);
-}
-
-pub fn DeviceAttributes(comptime State: type) type {
-    return Opaque(State, c.PJRT_Device_Attributes);
-}
-
-pub fn UserData(comptime State: type) type {
-    return Opaque(State, anyopaque);
-}
-
+/// Typed wrapper over PJRT named values used for options and plugin attributes.
 pub const NamedValue = extern struct {
     comptime {
         std.debug.assert(@sizeOf(NamedValue) == @sizeOf(c.PJRT_NamedValue));
     }
 
-    inner: c.PJRT_NamedValue,
+    raw: c.PJRT_NamedValue,
 
     pub const Kind = enum(c.PJRT_NamedValue_Type) {
         string = c.PJRT_NamedValue_kString,
@@ -119,6 +61,7 @@ pub const NamedValue = extern struct {
         bool = c.PJRT_NamedValue_kBool,
     };
 
+    /// Zig view of the tagged value carried by a PJRT named value.
     pub const Value = union(Kind) {
         string: []const u8,
         int64: i64,
@@ -127,9 +70,10 @@ pub const NamedValue = extern struct {
         bool: bool,
     };
 
+    /// Builds a PJRT named value that borrows its name and payload.
     pub fn init(comptime kind_: Kind, name_: []const u8, value_: std.meta.fieldInfo(Value, kind_).type) NamedValue {
         return .{
-            .inner = .{
+            .raw = .{
                 .struct_size = c.PJRT_NamedValue_STRUCT_SIZE,
                 .extension_start = null,
                 .name = name_.ptr,
@@ -150,48 +94,63 @@ pub const NamedValue = extern struct {
         };
     }
 
+    /// Builds a borrowed string named value.
     pub fn string(key: []const u8, value_: []const u8) NamedValue {
         return init(.string, key, value_);
     }
 
+    /// Builds an integer named value.
     pub fn int64(key: []const u8, value_: i64) NamedValue {
         return init(.int64, key, value_);
     }
 
+    /// Builds a boolean named value.
     pub fn boolean(key: []const u8, value_: bool) NamedValue {
         return init(.bool, key, value_);
     }
 
+    /// Builds a borrowed integer-list named value.
     pub fn int64List(key: []const u8, comptime len: usize, values: *const [len]i64) NamedValue {
         return init(.int64list, key, values[0..]);
     }
 
-    pub fn ptr(values: []NamedValue) [*c]c.PJRT_NamedValue {
+    /// Exposes a named-value array to PJRT without copying it.
+    pub fn borrowedMany(values: []NamedValue) [*c]c.PJRT_NamedValue {
         return @ptrCast(values.ptr);
     }
 
-    pub fn view(inner: c.PJRT_NamedValue) NamedValue {
-        return .{ .inner = inner };
+    /// Wraps a PJRT named value supplied by the caller.
+    pub fn borrow(raw: c.PJRT_NamedValue) NamedValue {
+        return .{ .raw = raw };
     }
 
+    /// Returns the tagged kind of a PJRT named value.
     pub fn kind(self: NamedValue) Kind {
-        return @enumFromInt(self.inner.type);
+        return @enumFromInt(self.raw.type);
     }
 
+    /// Returns the borrowed PJRT named-value key.
     pub fn name(self: NamedValue) []const u8 {
-        return Slice.bytes(self.inner.name, self.inner.name_size) orelse &.{};
+        return Slice.bytes(self.raw.name, self.raw.name_size) orelse &.{};
     }
 
+    /// Returns the borrowed or scalar payload of a PJRT named value.
     pub fn value(self: NamedValue) Value {
         return switch (self.kind()) {
-            .string => .{ .string = Slice.bytes(self.inner.unnamed_0.string_value, self.inner.value_size) orelse &.{} },
-            .int64 => .{ .int64 = self.inner.unnamed_0.int64_value },
-            .int64list => .{ .int64list = self.inner.unnamed_0.int64_array_value[0..self.inner.value_size] },
-            .float => .{ .float = self.inner.unnamed_0.float_value },
-            .bool => .{ .bool = self.inner.unnamed_0.bool_value },
+            .string => .{ .string = Slice.bytes(self.raw.unnamed_0.string_value, self.raw.value_size) orelse &.{} },
+            .int64 => .{ .int64 = self.raw.unnamed_0.int64_value },
+            .int64list => .{ .int64list = self.raw.unnamed_0.int64_array_value[0..self.raw.value_size] },
+            .float => .{ .float = self.raw.unnamed_0.float_value },
+            .bool => .{ .bool = self.raw.unnamed_0.bool_value },
         };
     }
 
+    /// Returns the PJRT payload element count for tests and ABI validation.
+    pub fn valueSize(self: NamedValue) usize {
+        return self.raw.value_size;
+    }
+
+    /// Returns the string payload when this named value is a string.
     pub fn stringValue(self: NamedValue) ?[]const u8 {
         return switch (self.value()) {
             .string => |text| text,
@@ -200,23 +159,35 @@ pub const NamedValue = extern struct {
     }
 };
 
+/// Converts C pointer/length pairs into Zig slices at the PJRT ABI boundary.
 pub const Slice = struct {
+    /// Exposes an array of byte pointers to PJRT without copying it.
     pub fn ptrList(values: [][*c]const u8) [*c][*c]const u8 {
         return @ptrCast(values.ptr);
     }
 
+    /// Borrows a typed caller-owned pointer/count list.
+    pub fn constList(comptime T: type, ptr: [*c]const T, len: usize) ?[]const T {
+        if (ptr == null and len != 0) return null;
+        if (len == 0) return &.{};
+        return ptr[0..len];
+    }
+
+    /// Borrows a caller-owned byte pointer/count pair.
     pub fn bytes(ptr: [*c]const u8, len: usize) ?[]const u8 {
         if (ptr == null and len != 0) return null;
         if (len == 0) return &.{};
         return ptr[0..len];
     }
 
+    /// Borrows a mutable caller-owned byte buffer.
     pub fn mutBytes(ptr: ?*anyopaque, len: usize) ?[]u8 {
         if (ptr == null and len != 0) return null;
         if (len == 0) return &.{};
         return @as([*]u8, @ptrCast(ptr.?))[0..len];
     }
 
+    /// Borrows an immutable caller-owned byte buffer.
     pub fn constBytes(ptr: ?*const anyopaque, len: usize) ?[]const u8 {
         if (ptr == null and len != 0) return null;
         if (len == 0) return &.{};
@@ -224,19 +195,20 @@ pub const Slice = struct {
     }
 };
 
-pub const Args = struct {
+/// Writes borrowed values into PJRT callback output fields.
+pub const Out = struct {
+    /// Writes a byte slice into paired pointer and length fields.
     pub fn writeBytes(comptime ptr_field: []const u8, comptime len_field: []const u8, args: anytype, value: []const u8) void {
         @field(args, ptr_field) = value.ptr;
         @field(args, len_field) = value.len;
     }
 };
 
-pub const Placement = struct {
-    pub fn deviceIndex(client: *const runtime.Client, device: *const runtime.Device) ?usize {
-        for (client.devices, 0..) |*candidate, i| {
-            if (candidate == device or candidate.id == device.id) return i;
-        }
-        return null;
+/// Numeric conversions needed when writing PJRT ABI scalar fields.
+pub const Scalar = struct {
+    /// Clamps an unsigned byte/count value into a signed PJRT `int64_t` field.
+    pub fn clampI64(value: u64) i64 {
+        return @intCast(@min(value, @as(u64, @intCast(std.math.maxInt(i64)))));
     }
 };
 
@@ -247,7 +219,7 @@ test "named value helpers build PJRT strings and lists" {
 
     const values = [_]i64{ 1, 16, 0 };
     const list = NamedValue.int64List("version", values.len, &values);
-    try std.testing.expectEqual(@as(usize, 3), list.inner.value_size);
+    try std.testing.expectEqual(@as(usize, 3), list.valueSize());
     try std.testing.expectEqual(NamedValue.Kind.int64list, list.kind());
     try std.testing.expectEqualSlices(i64, &values, list.value().int64list);
 }

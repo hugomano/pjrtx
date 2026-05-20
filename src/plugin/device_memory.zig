@@ -1,16 +1,24 @@
-const runtime = @import("src/runtime");
+const std = @import("std");
+
 const c = @import("c");
+const runtime = @import("src/runtime");
+
 const abi = @import("pjrt_abi.zig");
 const errors = @import("errors.zig");
+const handles = @import("pjrt_handles.zig");
+const plugin = @import("plugin.zig");
+
 const PjrtError = errors.Error;
-const state = @import("state.zig");
+const DeviceAttributesHandle = handles.DeviceAttributes(DeviceAttributes);
 
-const allocator = state.allocator;
+var description_attributes: std.AutoHashMapUnmanaged(usize, *DeviceAttributes) = .empty;
+var description_attributes_mutex: std.Io.Mutex = .init;
 
-const DeviceDescription = struct {
+/// Borrowed PJRT device-description reference backed by a runtime device.
+pub const DeviceDescription = struct {
     device: *runtime.Device,
 
-    const Api = struct {
+    pub const Api = struct {
         pub const Id = DeviceDescriptionScalar(c.PJRT_DeviceDescription_Id_Args, "id", .id).call;
         pub const ProcessIndex = DeviceDescriptionScalar(c.PJRT_DeviceDescription_ProcessIndex_Args, "process_index", .process_index).call;
         pub const Attributes = DeviceDescriptionCallback(c.PJRT_DeviceDescription_Attributes_Args, .attributes).call;
@@ -20,7 +28,7 @@ const DeviceDescription = struct {
     };
 
     fn at(raw: anytype) DeviceDescription {
-        return .{ .device = abi.DeviceDescription.view(raw) };
+        return .{ .device = handles.DeviceDescription.ref(raw) };
     }
 
     fn id(self: DeviceDescription) i32 {
@@ -32,18 +40,26 @@ const DeviceDescription = struct {
     }
 
     fn kind(_: DeviceDescription) []const u8 {
-        return state.device_kind;
+        return plugin.Platform.device_kind;
     }
 
     fn debugString(self: DeviceDescription) []const u8 {
         return self.device.debug_string;
     }
+
+    fn writeAttributes(self: DeviceDescription, args: anytype) ?*c.PJRT_Error {
+        const attrs = DeviceAttributesCache.get(self.device) catch return PjrtError.internal("failed to allocate device description attributes");
+        args.attributes = abi.NamedValue.borrowedMany(attrs.attrs[0..]);
+        args.num_attributes = attrs.attrs.len;
+        return null;
+    }
 };
 
-const Device = struct {
+/// Borrowed PJRT device reference backed by a runtime device.
+pub const Device = struct {
     ptr: *runtime.Device,
 
-    const Api = struct {
+    pub const Api = struct {
         pub const GetDescription = DeviceCallback(c.PJRT_Device_GetDescription_Args, .description).call;
         pub const IsAddressable = DeviceCallback(c.PJRT_Device_IsAddressable_Args, .is_addressable).call;
         pub const LocalHardwareId = DeviceCallback(c.PJRT_Device_LocalHardwareId_Args, .local_hardware_id).call;
@@ -54,11 +70,11 @@ const Device = struct {
     };
 
     fn at(raw: anytype) Device {
-        return .{ .ptr = abi.Device.view(raw) };
+        return .{ .ptr = handles.Device.ref(raw) };
     }
 
     fn description(self: Device) *c.PJRT_DeviceDescription {
-        return abi.DeviceDescription.handle(self.ptr);
+        return handles.DeviceDescription.handle(self.ptr);
     }
 
     fn addressableMemories(self: Device) []const *runtime.Memory {
@@ -79,16 +95,16 @@ const Device = struct {
 
     fn writeAddressableMemories(self: Device, args: anytype) void {
         const memories = self.addressableMemories();
-        args.memories = abi.Memory.handleSlice(memories);
+        args.memories = handles.Memory.handleSlice(memories);
         args.num_memories = memories.len;
     }
 
     fn writeAttributes(self: Device, args: anytype) ?*c.PJRT_Error {
-        const owned = allocator.create(DeviceAttributes) catch {
+        const owned = plugin.allocator().create(DeviceAttributes) catch {
             return PjrtError.internal("failed to allocate device attributes");
         };
         owned.* = DeviceAttributes.init(self.ptr);
-        args.attributes = abi.NamedValue.ptr(owned.attrs[0..]);
+        args.attributes = abi.NamedValue.borrowedMany(owned.attrs[0..]);
         args.num_attributes = owned.attrs.len;
         args.device_attributes = DeviceAttributesHandle.handle(owned);
         args.attributes_deleter = DeviceAttributes.delete;
@@ -96,10 +112,11 @@ const Device = struct {
     }
 };
 
-const Memory = struct {
+/// Borrowed PJRT memory reference backed by a runtime memory.
+pub const Memory = struct {
     ptr: *runtime.Memory,
 
-    const Api = struct {
+    pub const Api = struct {
         pub const Id = MemoryCallback(c.PJRT_Memory_Id_Args, .id).call;
         pub const Kind = MemoryText(c.PJRT_Memory_Kind_Args, "kind", "kind_size", .kind).call;
         pub const DebugString = MemoryText(c.PJRT_Memory_DebugString_Args, "debug_string", "debug_string_size", .debug_string).call;
@@ -108,7 +125,7 @@ const Memory = struct {
     };
 
     fn at(raw: anytype) Memory {
-        return .{ .ptr = abi.Memory.view(raw) };
+        return .{ .ptr = handles.Memory.ref(raw) };
     }
 
     fn kind(self: Memory) []const u8 {
@@ -124,7 +141,7 @@ const Memory = struct {
     }
 
     fn writeAddressableDevices(self: Memory, args: anytype) void {
-        args.devices = abi.Device.handleSlice(self.ptr.addressable_devices);
+        args.devices = handles.Device.handleSlice(self.ptr.addressable_devices);
         args.num_devices = self.ptr.addressable_devices.len;
     }
 };
@@ -136,13 +153,13 @@ const DeviceAttribute = enum {
     has_unified_memory,
     default_memory_id,
 
-    const fields = @typeInfo(DeviceAttribute).@"enum".fields;
+    const variants = @typeInfo(DeviceAttribute).@"enum".fields;
 
     fn namedValue(comptime attr: DeviceAttribute, device: *const runtime.Device) abi.NamedValue {
         return switch (attr) {
             .name => abi.NamedValue.string("device_name", device.name),
-            .registry_id => abi.NamedValue.int64("pjrtx_registry_id", state.Scalar.clampI64(device.registry_id)),
-            .recommended_working_set_size => abi.NamedValue.int64("pjrtx_recommended_working_set_size", state.Scalar.clampI64(device.memory_bytes)),
+            .registry_id => abi.NamedValue.int64("pjrtx_registry_id", abi.Scalar.clampI64(device.registry_id)),
+            .recommended_working_set_size => abi.NamedValue.int64("pjrtx_recommended_working_set_size", abi.Scalar.clampI64(device.memory_bytes)),
             .has_unified_memory => abi.NamedValue.int64("pjrtx_has_unified_memory", if (device.has_unified_memory) 1 else 0),
             .default_memory_id => abi.NamedValue.int64("pjrtx_default_memory_id", device.default_memory_id),
         };
@@ -150,29 +167,54 @@ const DeviceAttribute = enum {
 };
 
 const DeviceAttributes = struct {
-    attrs: [DeviceAttribute.fields.len]abi.NamedValue,
+    attrs: [DeviceAttribute.variants.len]abi.NamedValue,
 
     fn init(device: *const runtime.Device) DeviceAttributes {
-        var attrs: [DeviceAttribute.fields.len]abi.NamedValue = undefined;
-        inline for (DeviceAttribute.fields, 0..) |field, i| {
+        var attrs: [DeviceAttribute.variants.len]abi.NamedValue = undefined;
+        inline for (DeviceAttribute.variants, 0..) |field, i| {
             attrs[i] = @as(DeviceAttribute, @enumFromInt(field.value)).namedValue(device);
         }
         return .{ .attrs = attrs };
     }
 
     fn delete(raw: ?*c.PJRT_Device_Attributes) callconv(.c) void {
-        if (raw) |opaque_attrs| allocator.destroy(DeviceAttributesHandle.view(opaque_attrs));
+        if (raw) |opaque_attrs| plugin.allocator().destroy(DeviceAttributesHandle.ref(opaque_attrs));
     }
 };
 
-const DeviceAttributesHandle = abi.DeviceAttributes(DeviceAttributes);
+const DeviceAttributesCache = struct {
+    fn get(device: *const runtime.Device) !*DeviceAttributes {
+        const key = @intFromPtr(device);
+        description_attributes_mutex.lockUncancelable(plugin.io());
+        defer description_attributes_mutex.unlock(plugin.io());
+
+        if (description_attributes.get(key)) |attrs| return attrs;
+        const attrs = try plugin.allocator().create(DeviceAttributes);
+        errdefer plugin.allocator().destroy(attrs);
+        attrs.* = DeviceAttributes.init(device);
+        try description_attributes.put(plugin.allocator(), key, attrs);
+        return attrs;
+    }
+
+    fn forget(device: *const runtime.Device) void {
+        const key = @intFromPtr(device);
+        description_attributes_mutex.lockUncancelable(plugin.io());
+        defer description_attributes_mutex.unlock(plugin.io());
+
+        if (description_attributes.fetchRemove(key)) |entry| plugin.allocator().destroy(entry.value);
+    }
+
+    fn releaseClient(client: *const runtime.Client) void {
+        for (client.devices) |*device| forget(device);
+    }
+};
 
 fn set(comptime field: []const u8, raw: anytype, value: anytype) void {
     @field(raw[0], field) = value;
 }
 
 fn setText(comptime ptr_field: []const u8, comptime len_field: []const u8, raw: anytype, value: []const u8) void {
-    abi.Args.writeBytes(ptr_field, len_field, &raw[0], value);
+    abi.Out.writeBytes(ptr_field, len_field, &raw[0], value);
 }
 
 fn DeviceDescriptionScalar(
@@ -242,19 +284,19 @@ const MemoryStats = struct {
     }
 
     fn writeCore(self: MemoryStats) void {
-        self.args.bytes_in_use = state.Scalar.clampI64(self.stats.totalBytesInUse());
-        self.args.peak_bytes_in_use = state.Scalar.clampI64(self.stats.peakTotalBytesInUse());
+        self.args.bytes_in_use = abi.Scalar.clampI64(self.stats.totalBytesInUse());
+        self.args.peak_bytes_in_use = abi.Scalar.clampI64(self.stats.peakTotalBytesInUse());
         self.args.peak_bytes_in_use_is_set = true;
-        self.args.num_allocs = state.Scalar.clampI64(self.stats.live_allocs +| self.stats.executable_cache_resident_entries);
+        self.args.num_allocs = abi.Scalar.clampI64(self.stats.live_allocs +| self.stats.executable_cache_resident_entries);
         self.args.num_allocs_is_set = true;
-        self.args.largest_alloc_size = state.Scalar.clampI64(@max(self.stats.largest_alloc_size, self.stats.executable_cache_largest_resident_bytes));
+        self.args.largest_alloc_size = abi.Scalar.clampI64(@max(self.stats.largest_alloc_size, self.stats.executable_cache_largest_resident_bytes));
         self.args.largest_alloc_size_is_set = true;
     }
 
     fn writeCapacity(self: MemoryStats) void {
-        self.args.bytes_limit = state.Scalar.clampI64(self.stats.capacity_bytes);
+        self.args.bytes_limit = abi.Scalar.clampI64(self.stats.capacity_bytes);
         self.args.bytes_limit_is_set = true;
-        self.args.largest_free_block_bytes = state.Scalar.clampI64(self.freeBytes());
+        self.args.largest_free_block_bytes = abi.Scalar.clampI64(self.freeBytes());
         self.args.largest_free_block_bytes_is_set = true;
         self.args.bytes_reservable_limit = self.args.largest_free_block_bytes;
         self.args.bytes_reservable_limit_is_set = true;
@@ -274,9 +316,7 @@ fn DeviceDescriptionCallback(comptime Args: type, comptime op: DeviceDescription
             const args = &raw[0];
             switch (op) {
                 .attributes => {
-                    _ = DeviceDescription.at(args.device_description);
-                    args.attributes = null;
-                    args.num_attributes = 0;
+                    return DeviceDescription.at(args.device_description).writeAttributes(args);
                 },
             }
             return null;
@@ -304,7 +344,7 @@ fn DeviceCallback(comptime Args: type, comptime op: DeviceOp) type {
                 .is_addressable => args.is_addressable = device.isAddressable(),
                 .local_hardware_id => args.local_hardware_id = device.localHardwareId(),
                 .addressable_memories => device.writeAddressableMemories(args),
-                .default_memory => args.memory = abi.Memory.handle(device.defaultMemory()),
+                .default_memory => args.memory = handles.Memory.handle(device.defaultMemory()),
                 .memory_stats => MemoryStats.write(args, device.defaultMemory().stats),
                 .attributes => return device.writeAttributes(args),
             }
@@ -329,6 +369,10 @@ fn MemoryCallback(comptime Args: type, comptime op: MemoryOp) type {
     };
 }
 
-pub const DeviceDescriptionApi = DeviceDescription.Api;
-pub const DeviceApi = Device.Api;
-pub const MemoryApi = Memory.Api;
+/// Lifecycle hooks for PJRT device, memory, and description state.
+pub const Lifetime = struct {
+    /// Releases client-scoped borrowed PJRT metadata before runtime client teardown.
+    pub fn releaseClientCaches(client: *const runtime.Client) void {
+        DeviceAttributesCache.releaseClient(client);
+    }
+};

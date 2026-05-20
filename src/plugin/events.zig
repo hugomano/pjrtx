@@ -1,15 +1,60 @@
-const rt = @import("src/runtime");
+const std = @import("std");
+
 const c = @import("c");
+const runtime_mod = @import("src/runtime");
+
 const abi = @import("pjrt_abi.zig");
 const errors = @import("errors.zig");
+const handles = @import("pjrt_handles.zig");
+const plugin = @import("plugin.zig");
+
+const BridgeHandle = handles.UserArg(OnReadyBridge);
 const PjrtError = errors.Error;
-const state = @import("state.zig");
 
-const allocator = state.allocator;
-const BridgeHandle = abi.UserData(OnReadyBridge);
-
+/// PJRT event reference over a runtime event owned by the plugin.
 pub const Event = struct {
-    ptr: *rt.Event,
+    ptr: *runtime_mod.Event,
+
+    /// Mutable PJRT event output slot used by APIs that complete asynchronously.
+    pub const Completion = struct {
+        slot: *allowzero ?*c.PJRT_Event,
+
+        /// Creates a pending event in a PJRT output slot.
+        pub fn pending(slot: *allowzero ?*c.PJRT_Event) ?*c.PJRT_Error {
+            const completion = Completion.at(slot);
+            completion.slot.* = Event.create(runtime_mod.Event.pending());
+            if (completion.slot.* == null) return PjrtError.resourceExhausted("failed to allocate PJRT event");
+            return null;
+        }
+
+        /// Creates an event mirroring a runtime event in a PJRT output slot.
+        pub fn fromRuntime(slot: *allowzero ?*c.PJRT_Event, source: runtime_mod.Event) ?Completion {
+            const completion = Completion.at(slot);
+            completion.slot.* = Event.create(source);
+            if (completion.slot.* == null) return null;
+            return completion;
+        }
+
+        /// Binds a helper to an existing PJRT event output slot.
+        pub fn at(slot: *allowzero ?*c.PJRT_Event) Completion {
+            return .{ .slot = slot };
+        }
+
+        /// Marks the event in this slot ready when the caller supplied one.
+        pub fn setReady(self: Completion) void {
+            if (self.slot.*) |event| Event.at(event).ptr.setReady();
+        }
+
+        /// Marks the event in this slot failed when the caller supplied one.
+        pub fn setFailed(self: Completion, message: []const u8) void {
+            if (self.slot.*) |event| Event.at(event).ptr.setFailed(message);
+        }
+
+        /// Borrows the runtime event stored in this output slot.
+        pub fn runtime(self: Completion) *runtime_mod.Event {
+            return Event.at(self.slot.*.?).ptr;
+        }
+    };
 
     pub const Api = struct {
         pub const Destroy = EventCallback(c.PJRT_Event_Destroy_Args, .destroy).call;
@@ -19,53 +64,37 @@ pub const Event = struct {
         pub const OnReady = EventCallback(c.PJRT_Event_OnReady_Args, .on_ready).call;
     };
 
-    pub fn at(raw: *c.PJRT_Event) Event {
-        return .{ .ptr = abi.Event.view(raw) };
+    fn at(raw: *c.PJRT_Event) Event {
+        return .{ .ptr = handles.Event.ref(raw) };
     }
 
-    pub fn create(source: rt.Event) ?*c.PJRT_Event {
-        const event = allocator.create(rt.Event) catch return null;
+    fn create(source: runtime_mod.Event) ?*c.PJRT_Event {
+        const event = plugin.allocator().create(runtime_mod.Event) catch return null;
         event.* = source;
-        return abi.Event.handle(event);
+        return handles.Event.handle(event);
     }
 
     pub fn ready() ?*c.PJRT_Event {
-        return create(rt.Event.ready());
+        return create(runtime_mod.Event.ready());
     }
 
     pub fn pending() ?*c.PJRT_Event {
-        return create(rt.Event.pending());
+        return create(runtime_mod.Event.pending());
     }
 
     pub fn failed(message: []const u8) ?*c.PJRT_Event {
-        return create(rt.Event.failed(message));
+        return create(runtime_mod.Event.failed(message));
     }
 
-    pub fn fromRuntime(source: rt.Event) ?*c.PJRT_Event {
-        return switch (source.state) {
-            .pending => pending(),
-            .ready => ready(),
-            .failed => failed(source.message),
-        };
+    pub fn fromRuntime(source: runtime_mod.Event) ?*c.PJRT_Event {
+        return create(source);
     }
 
-    pub fn setReady(raw: ?*c.PJRT_Event) void {
-        if (raw) |event| at(event).ptr.setReady();
-    }
-
-    pub fn setFailed(raw: ?*c.PJRT_Event, message: []const u8) void {
-        if (raw) |event| at(event).ptr.setFailed(message);
-    }
-
-    pub fn runtime(raw: *c.PJRT_Event) *rt.Event {
-        return at(raw).ptr;
-    }
-
-    fn destroy(raw: ?*c.PJRT_Event) void {
+    pub fn destroy(raw: ?*c.PJRT_Event) void {
         const event = raw orelse return;
-        const view = Event.at(event);
-        view.ptr.deinit();
-        allocator.destroy(view.ptr);
+        const event_ref = Event.at(event);
+        event_ref.ptr.deinit();
+        plugin.allocator().destroy(event_ref.ptr);
     }
 
     fn isReady(self: Event) bool {
@@ -94,6 +123,35 @@ pub const Event = struct {
             };
         };
         return null;
+    }
+};
+
+const OnReadyBridge = struct {
+    callback_fn: c.PJRT_Event_OnReadyCallback,
+    user_arg: ?*anyopaque,
+
+    fn create(callback_fn: c.PJRT_Event_OnReadyCallback, user_arg: ?*anyopaque) ?*OnReadyBridge {
+        const bridge = plugin.allocator().create(OnReadyBridge) catch return null;
+        bridge.* = .{ .callback_fn = callback_fn, .user_arg = user_arg };
+        return bridge;
+    }
+
+    fn fromUserArg(user_arg: ?*anyopaque) *OnReadyBridge {
+        return BridgeHandle.ref(user_arg);
+    }
+
+    fn destroy(bridge: *OnReadyBridge) void {
+        plugin.allocator().destroy(bridge);
+    }
+
+    fn complete(self: *OnReadyBridge, message: ?[]const u8) void {
+        defer OnReadyBridge.destroy(self);
+        const maybe_error = if (message) |msg| PjrtError.failedPrecondition(msg) else null;
+        self.callback_fn.?(maybe_error, self.user_arg);
+    }
+
+    fn callback(message: ?[]const u8, user_arg: ?*anyopaque) void {
+        OnReadyBridge.fromUserArg(user_arg).complete(message);
     }
 };
 
@@ -146,34 +204,3 @@ fn EventCallback(comptime Args: type, comptime op: EventOp) type {
         }
     };
 }
-
-const OnReadyBridge = struct {
-    callback_fn: c.PJRT_Event_OnReadyCallback,
-    user_arg: ?*anyopaque,
-
-    fn create(callback_fn: c.PJRT_Event_OnReadyCallback, user_arg: ?*anyopaque) ?*OnReadyBridge {
-        const bridge = allocator.create(OnReadyBridge) catch return null;
-        bridge.* = .{ .callback_fn = callback_fn, .user_arg = user_arg };
-        return bridge;
-    }
-
-    fn fromUserArg(user_arg: ?*anyopaque) *OnReadyBridge {
-        return BridgeHandle.view(user_arg);
-    }
-
-    fn destroy(bridge: *OnReadyBridge) void {
-        allocator.destroy(bridge);
-    }
-
-    fn complete(self: *OnReadyBridge, message: ?[]const u8) void {
-        defer OnReadyBridge.destroy(self);
-        const maybe_error = if (message) |msg| PjrtError.failedPrecondition(msg) else null;
-        self.callback_fn.?(maybe_error, self.user_arg);
-    }
-
-    fn callback(message: ?[]const u8, user_arg: ?*anyopaque) void {
-        OnReadyBridge.fromUserArg(user_arg).complete(message);
-    }
-};
-
-pub const Api = Event.Api;

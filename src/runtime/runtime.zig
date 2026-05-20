@@ -11,9 +11,6 @@ const executable_mod = @import("executable.zig");
 const executable_cache = @import("executable_cache.zig");
 
 pub const BufferType = ir.BufferType;
-pub const ElementwiseBinaryOp = ir.ElementwiseBinaryOp;
-pub const ElementwiseUnaryOp = ir.ElementwiseUnaryOp;
-pub const CompareOp = ir.CompareOp;
 pub const CompileOptions = ir.CompileOptions;
 pub const ExecutablePlan = ir.ExecutablePlan;
 pub const PlanInstruction = ir.PlanInstruction;

@@ -2584,3 +2584,157 @@ pub fn executableUnaryOp(instruction_kind: ir.PlanInstructionKind) ?ir.Elementwi
         else => null,
     };
 }
+
+test "mlx metal backend rejects gspmd custom call targets precisely" {
+    const allocator = std.testing.allocator;
+    const assignment = [_]i32{0};
+    const dims = [_]i64{4};
+
+    const values = try allocator.alloc(ir.Value, 2);
+    for (values, 0..) |*value, index| {
+        value.* = .{
+            .id = .{ .index = @intCast(index) },
+            .role = if (index == 0) .parameter else .instruction_result,
+            .descriptor = .{
+                .element_type = .u8,
+                .dims = try allocator.dupe(i64, &dims),
+                .device_id = 0,
+                .memory_id = 0,
+                .shard_index = 0,
+            },
+        };
+    }
+
+    const parameter_shardings = try allocator.alloc(ir.ShardingPlan, 1);
+    parameter_shardings[0] = .{
+        .kind = .replicated,
+        .mesh_name = try allocator.dupe(u8, "test"),
+        .device_assignment = try allocator.dupe(i32, &assignment),
+    };
+
+    var plan = ir.ExecutablePlan{
+        .allocator = allocator,
+        .options = .{
+            .num_replicas = 1,
+            .num_partitions = 1,
+            .device_assignment = try allocator.dupe(i32, &assignment),
+        },
+        .values = values,
+        .parameter_shardings = parameter_shardings,
+        .output_shardings = try allocator.alloc(ir.ShardingPlan, 0),
+        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
+        .instructions = try allocator.dupe(ir.PlanInstruction, &.{.{
+            .kind = .custom_call,
+            .inputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 0 }}),
+            .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
+            .dims = try allocator.dupe(i64, &dims),
+            .custom_call_target = try allocator.dupe(u8, "Sharding"),
+        }}),
+    };
+    defer plan.deinit();
+
+    const issue = executableIssue(&plan, &assignment) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Sharding", issue.feature);
+
+    var diagnostics = std.Io.Writer.Allocating.init(allocator);
+    defer diagnostics.deinit();
+    try writeIssue(&plan, issue, &diagnostics.writer);
+    const message = diagnostics.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, message, "op=custom_call") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "feature=Sharding") != null);
+}
+
+test "mlx metal backend executable rejects unsupported gather form during lowering" {
+    const allocator = std.testing.allocator;
+    const assignment = [_]i32{0};
+    const operand_dims = [_]i64{ 4, 2 };
+    const index_dims = [_]i64{2};
+    const output_dims = [_]i64{ 2, 2 };
+
+    const values = try allocator.alloc(ir.Value, 3);
+    errdefer allocator.free(values);
+    values[0] = .{
+        .id = .{ .index = 0 },
+        .role = .parameter,
+        .descriptor = .{
+            .element_type = .f32,
+            .dims = try allocator.dupe(i64, &operand_dims),
+            .device_id = 0,
+            .memory_id = 0,
+            .shard_index = 0,
+        },
+    };
+    values[1] = .{
+        .id = .{ .index = 1 },
+        .role = .parameter,
+        .descriptor = .{
+            .element_type = .s32,
+            .dims = try allocator.dupe(i64, &index_dims),
+            .device_id = 0,
+            .memory_id = 0,
+            .shard_index = 0,
+        },
+    };
+    values[2] = .{
+        .id = .{ .index = 2 },
+        .role = .instruction_result,
+        .descriptor = .{
+            .element_type = .f32,
+            .dims = try allocator.dupe(i64, &output_dims),
+            .device_id = 0,
+            .memory_id = 0,
+            .shard_index = 0,
+        },
+    };
+
+    var parameter_shardings = try allocator.alloc(ir.ShardingPlan, 2);
+    parameter_shardings[0] = .{
+        .kind = .replicated,
+        .mesh_name = try allocator.dupe(u8, ""),
+        .device_assignment = try allocator.dupe(i32, &assignment),
+    };
+    parameter_shardings[1] = .{
+        .kind = .replicated,
+        .mesh_name = try allocator.dupe(u8, ""),
+        .device_assignment = try allocator.dupe(i32, &assignment),
+    };
+    var output_shardings = try allocator.alloc(ir.ShardingPlan, 1);
+    output_shardings[0] = .{
+        .kind = .replicated,
+        .mesh_name = try allocator.dupe(u8, ""),
+        .device_assignment = try allocator.dupe(i32, &assignment),
+    };
+
+    var plan = ir.ExecutablePlan{
+        .allocator = allocator,
+        .options = .{
+            .num_replicas = 1,
+            .num_partitions = 1,
+            .device_assignment = try allocator.dupe(i32, &assignment),
+        },
+        .values = values,
+        .parameter_shardings = parameter_shardings,
+        .output_shardings = output_shardings,
+        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 2 }}),
+        .instructions = try allocator.dupe(ir.PlanInstruction, &.{.{
+            .kind = .gather,
+            .inputs = try allocator.dupe(ir.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+            .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 2 }}),
+            .dims = try allocator.dupe(i64, &output_dims),
+            .start_index_map = try allocator.dupe(i64, &.{ 0, 1 }),
+            .collapsed_slice_dims = try allocator.dupe(i64, &.{1}),
+            .slice_sizes = try allocator.dupe(i64, &.{ 4, 1 }),
+            .index_vector_dim = 1,
+        }}),
+    };
+    defer plan.deinit();
+
+    const issue = executableIssue(&plan, &assignment) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("mlx-gather-general-shape", issue.feature);
+    var diagnostics = std.Io.Writer.Allocating.init(allocator);
+    defer diagnostics.deinit();
+    try writeIssue(&plan, issue, &diagnostics.writer);
+    const message = diagnostics.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, message, "op=gather") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "feature=mlx-gather-general-shape") != null);
+}

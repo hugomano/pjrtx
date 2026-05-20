@@ -4,6 +4,7 @@ sh_test(
     name = "architecture_boundary_test",
     srcs = ["architecture_boundary_test.sh"],
     data = [
+        "//src/backend/mlx_metal:sources",
         "//src/compiler:sources",
         "//src/plugin:sources",
         "//src/runtime:sources",

@@ -334,6 +334,31 @@ pub const Backend = struct {
         return backend.registerCustomCall(self, registration);
     }
 
+    /// Registers a named binary custom-call target in the MLX/Metal backend registry.
+    pub fn registerBinaryCustomCall(self: Backend, target: []const u8, op_name: []const u8) Error!void {
+        return backend.registerBinaryCustomCall(self, target, op_name);
+    }
+
+    /// Registers an identity custom-call target in the MLX/Metal backend registry.
+    pub fn registerIdentityCustomCall(self: Backend, target: []const u8) Error!void {
+        return backend.registerIdentityCustomCall(self, target);
+    }
+
+    /// Registers a named unary custom-call target in the MLX/Metal backend registry.
+    pub fn registerUnaryCustomCall(self: Backend, target: []const u8, op_name: []const u8) Error!void {
+        return backend.registerUnaryCustomCall(self, target, op_name);
+    }
+
+    /// Registers the built-in unary square-root custom-call marker.
+    pub fn registerUnarySqrtCustomCall(self: Backend, target: []const u8) Error!void {
+        return backend.registerUnarySqrtCustomCall(self, target);
+    }
+
+    /// Registers the built-in binary add custom-call marker.
+    pub fn registerBinaryAddCustomCall(self: Backend, target: []const u8) Error!void {
+        return backend.registerBinaryAddCustomCall(self, target);
+    }
+
     pub fn unregisterCustomCall(self: Backend, target: []const u8) void {
         backend.unregisterCustomCall(self, target);
     }
@@ -641,14 +666,31 @@ fn profileElapsedUs(start: std.Io.Timestamp) u64 {
 
 const CompiledExecutable = executable_mod.Executable;
 
-const WhileF32LtAddPattern = lowering_mod.WhileF32LtAddPattern;
-const WhilePatternOperand = lowering_mod.WhilePatternOperand;
-
 const CompiledProgramContext = executable_mod.CompiledProgramContext;
 const ArgumentCaptureState = executable_mod.ArgumentCaptureState;
 
 fn registerCustomCall(_: backend.Backend, registration: backend.CustomCallRegistration) backend.Error!void {
     return custom_call_mod.register(registration);
+}
+
+fn registerBinaryCustomCall(_: backend.Backend, target: []const u8, op_name: []const u8) backend.Error!void {
+    return custom_call_mod.registerBinary(target, op_name);
+}
+
+fn registerIdentityCustomCall(_: backend.Backend, target: []const u8) backend.Error!void {
+    return custom_call_mod.registerIdentity(target);
+}
+
+fn registerUnaryCustomCall(_: backend.Backend, target: []const u8, op_name: []const u8) backend.Error!void {
+    return custom_call_mod.registerUnary(target, op_name);
+}
+
+fn registerUnarySqrtCustomCall(_: backend.Backend, target: []const u8) backend.Error!void {
+    return custom_call_mod.registerUnarySqrt(target);
+}
+
+fn registerBinaryAddCustomCall(_: backend.Backend, target: []const u8) backend.Error!void {
+    return custom_call_mod.registerBinaryAdd(target);
 }
 
 fn unregisterCustomCall(_: backend.Backend, target: []const u8) void {
@@ -728,7 +770,7 @@ fn compileExecutable(backend_impl: backend.Backend, allocator: std.mem.Allocator
     }
     for (program.control_flows, 0..) |control_flow, control_flow_index| {
         if (control_flow.condition_subprogram >= program.subprograms.len or control_flow.body_subprogram >= program.subprograms.len) return error.InvalidProgram;
-        const pattern = matchWhileF32LtAddPattern(program.subprograms[control_flow.condition_subprogram], program.subprograms[control_flow.body_subprogram]) orelse continue;
+        const pattern = lowering_mod.matchWhileF32LtAddPattern(program.subprograms[control_flow.condition_subprogram], program.subprograms[control_flow.body_subprogram]) orelse continue;
         for (device_local_hardware_ids, 0..) |local_hardware_id, device_index| {
             if (pattern.limit.role == .constant) {
                 const limit_literal = pattern.limit.literal orelse return error.InvalidProgram;
@@ -848,26 +890,6 @@ fn executableLoweringIssue(plan: *const ir.ExecutablePlan, device_local_hardware
 
 fn writeLoweringIssue(plan: *const ir.ExecutablePlan, issue: lowering_mod.Issue, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     return lowering_mod.writeIssue(plan, issue, writer);
-}
-
-fn matchWhileF32LtAddPattern(cond: backend.ProgramSubprogram, body: backend.ProgramSubprogram) ?lowering_mod.WhileF32LtAddPattern {
-    return lowering_mod.matchWhileF32LtAddPattern(cond, body);
-}
-
-fn regionValueById(subprogram: backend.ProgramSubprogram, id: ir.RegionValueId) ?ir.RegionValue {
-    return lowering_mod.regionValueById(subprogram, id);
-}
-
-fn supportedScatterAxis(instruction: ir.PlanInstruction) ?i64 {
-    return lowering_mod.supportedScatterAxis(instruction);
-}
-
-fn executableBinaryOp(instruction_kind: ir.PlanInstructionKind) ?ir.ElementwiseBinaryOp {
-    return lowering_mod.executableBinaryOp(instruction_kind);
-}
-
-fn executableUnaryOp(instruction_kind: ir.PlanInstructionKind) ?ir.ElementwiseUnaryOp {
-    return lowering_mod.executableUnaryOp(instruction_kind);
 }
 
 test "mlx metal backend exposes opaque backend interface" {
@@ -1059,173 +1081,6 @@ test "mlx metal backend executable lowers reduce_window sum on device" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.5), out[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, -0.5), out[1], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), out[2], 0.0001);
-}
-
-test "mlx metal backend program owns while cond body subprogram descriptors" {
-    const allocator = std.testing.allocator;
-    const assignment = [_]i32{0};
-
-    const scalar_f32 = ir.BufferDescriptor{
-        .element_type = .f32,
-        .dims = &.{},
-        .device_id = 0,
-        .memory_id = 0,
-        .shard_index = 0,
-    };
-    const scalar_pred = ir.BufferDescriptor{
-        .element_type = .pred,
-        .dims = &.{},
-        .device_id = 0,
-        .memory_id = 0,
-        .shard_index = 0,
-    };
-
-    const values = try allocator.alloc(ir.Value, 2);
-    errdefer allocator.free(values);
-    values[0] = .{
-        .id = .{ .index = 0 },
-        .role = .parameter,
-        .descriptor = scalar_f32,
-    };
-    values[1] = .{
-        .id = .{ .index = 1 },
-        .role = .instruction_result,
-        .descriptor = scalar_f32,
-    };
-
-    var parameter_shardings = try allocator.alloc(ir.ShardingPlan, 1);
-    parameter_shardings[0] = .{
-        .kind = .replicated,
-        .mesh_name = try allocator.dupe(u8, ""),
-        .device_assignment = try allocator.dupe(i32, &assignment),
-    };
-    var output_shardings = try allocator.alloc(ir.ShardingPlan, 1);
-    output_shardings[0] = .{
-        .kind = .replicated,
-        .mesh_name = try allocator.dupe(u8, ""),
-        .device_assignment = try allocator.dupe(i32, &assignment),
-    };
-
-    const cond_args = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32});
-    const cond_returns = try allocator.dupe(ir.BufferDescriptor, &.{scalar_pred});
-    const cond_terminator_ids = try allocator.dupe(ir.RegionValueId, &.{.{ .index = 1 }});
-    const cond_terminator = try allocator.dupe(ir.BufferDescriptor, &.{scalar_pred});
-    const cond_instruction_operands = try allocator.dupe(ir.BufferDescriptor, &.{ scalar_f32, scalar_f32 });
-    const cond_instruction_results = try allocator.dupe(ir.BufferDescriptor, &.{scalar_pred});
-    const cond_instruction_inputs = try allocator.dupe(ir.RegionValueId, &.{ .{ .index = 0 }, .{ .index = 0 } });
-    const cond_instruction_outputs = try allocator.dupe(ir.RegionValueId, &.{.{ .index = 1 }});
-    const cond_instructions = try allocator.dupe(ir.RegionInstruction, &.{.{
-        .kind = .compare,
-        .inputs = cond_instruction_inputs,
-        .outputs = cond_instruction_outputs,
-        .operand_descriptors = cond_instruction_operands,
-        .result_descriptors = cond_instruction_results,
-    }});
-    const cond_values = try allocator.dupe(ir.RegionValue, &.{
-        .{ .id = .{ .index = 0 }, .role = .argument, .descriptor = scalar_f32 },
-        .{ .id = .{ .index = 1 }, .role = .instruction_result, .descriptor = scalar_pred },
-    });
-
-    const body_args = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32});
-    const body_returns = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32});
-    const body_terminator_ids = try allocator.dupe(ir.RegionValueId, &.{.{ .index = 1 }});
-    const body_terminator = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32});
-    const body_instruction_operands = try allocator.dupe(ir.BufferDescriptor, &.{ scalar_f32, scalar_f32 });
-    const body_instruction_results = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32});
-    const body_instruction_inputs = try allocator.dupe(ir.RegionValueId, &.{ .{ .index = 0 }, .{ .index = 0 } });
-    const body_instruction_outputs = try allocator.dupe(ir.RegionValueId, &.{.{ .index = 1 }});
-    const body_instructions = try allocator.dupe(ir.RegionInstruction, &.{.{
-        .kind = .add,
-        .inputs = body_instruction_inputs,
-        .outputs = body_instruction_outputs,
-        .operand_descriptors = body_instruction_operands,
-        .result_descriptors = body_instruction_results,
-    }});
-    const body_values = try allocator.dupe(ir.RegionValue, &.{
-        .{ .id = .{ .index = 0 }, .role = .argument, .descriptor = scalar_f32 },
-        .{ .id = .{ .index = 1 }, .role = .instruction_result, .descriptor = scalar_f32 },
-    });
-
-    var regions = try allocator.alloc(ir.PlanRegion, 2);
-    regions[0] = .{
-        .id = .{ .index = 0 },
-        .parent_instruction_index = 0,
-        .kind = .while_cond,
-        .values = cond_values,
-        .argument_descriptors = cond_args,
-        .instructions = cond_instructions,
-        .return_descriptors = cond_returns,
-        .terminator_operands = cond_terminator_ids,
-        .terminator_operand_descriptors = cond_terminator,
-    };
-    regions[1] = .{
-        .id = .{ .index = 1 },
-        .parent_instruction_index = 0,
-        .kind = .while_body,
-        .values = body_values,
-        .argument_descriptors = body_args,
-        .instructions = body_instructions,
-        .return_descriptors = body_returns,
-        .terminator_operands = body_terminator_ids,
-        .terminator_operand_descriptors = body_terminator,
-    };
-
-    var plan = ir.ExecutablePlan{
-        .allocator = allocator,
-        .options = .{
-            .num_replicas = 1,
-            .num_partitions = 1,
-            .device_assignment = try allocator.dupe(i32, &assignment),
-        },
-        .values = values,
-        .regions = regions,
-        .parameter_shardings = parameter_shardings,
-        .output_shardings = output_shardings,
-        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
-        .instructions = try allocator.dupe(ir.PlanInstruction, &.{.{
-            .kind = .while_,
-            .inputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 0 }}),
-            .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
-            .region_ids = try allocator.dupe(ir.RegionId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
-        }}),
-    };
-    defer plan.deinit();
-
-    var program = try buildBackendProgram(allocator, &plan, null);
-    defer program.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), program.nodes.len);
-    try std.testing.expectEqual(backend.ProgramNodeKind.control_flow, program.nodes[0].kind);
-    try std.testing.expectEqual(@as(usize, 2), program.nodes[0].subprograms.len);
-    try std.testing.expectEqual(@as(usize, 2), program.subprograms.len);
-    try std.testing.expectEqual(@as(usize, 1), program.control_flows.len);
-    try std.testing.expectEqual(@as(?usize, 0), program.nodes[0].control_flow);
-    const control_flow = program.control_flows[0];
-    try std.testing.expectEqual(backend.ProgramControlFlowKind.while_loop, control_flow.kind);
-    try std.testing.expectEqual(@as(usize, 0), control_flow.parent_node);
-    try std.testing.expectEqual(program.nodes[0].subprograms[0], control_flow.condition_subprogram);
-    try std.testing.expectEqual(program.nodes[0].subprograms[1], control_flow.body_subprogram);
-    try std.testing.expectEqual(@as(usize, 1), control_flow.state_inputs.len);
-    try std.testing.expectEqual(@as(usize, 1), control_flow.state_outputs.len);
-    try std.testing.expectEqual(@as(u32, 1), control_flow.predicate_output.index);
-    const cond = program.subprograms[program.nodes[0].subprograms[0]];
-    const body = program.subprograms[program.nodes[0].subprograms[1]];
-    try std.testing.expectEqual(ir.RegionKind.while_cond, cond.kind);
-    try std.testing.expectEqual(ir.RegionKind.while_body, body.kind);
-    try std.testing.expectEqual(@as(usize, 2), cond.values.len);
-    try std.testing.expectEqual(ir.RegionValueRole.argument, cond.values[0].role);
-    try std.testing.expectEqual(ir.RegionValueRole.instruction_result, cond.values[1].role);
-    try std.testing.expectEqual(@as(usize, 1), cond.instructions.len);
-    try std.testing.expectEqual(ir.PlanInstructionKind.compare, cond.instructions[0].kind);
-    try std.testing.expectEqual(@as(usize, 2), cond.instructions[0].inputs.len);
-    try std.testing.expectEqual(@as(u32, 0), cond.instructions[0].inputs[0].index);
-    try std.testing.expectEqual(@as(u32, 1), cond.instructions[0].outputs[0].index);
-    try std.testing.expectEqual(@as(u32, 1), cond.terminator_operands[0].index);
-    try std.testing.expectEqual(@as(usize, 1), body.instructions.len);
-    try std.testing.expectEqual(ir.PlanInstructionKind.add, body.instructions[0].kind);
-    try std.testing.expectEqual(@as(u32, 1), body.terminator_operands[0].index);
-    try std.testing.expectEqual(ir.BufferType.pred, cond.return_descriptors[0].element_type);
-    try std.testing.expectEqual(ir.BufferType.f32, body.return_descriptors[0].element_type);
 }
 
 test "mlx metal backend executes f32 lt/add while loop on device" {
@@ -1807,67 +1662,6 @@ test "mlx metal backend lowers metadata custom call and optimization barrier on 
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, &annotated_lhs);
 }
 
-test "mlx metal backend rejects gspmd custom call targets precisely" {
-    const b = create();
-    const allocator = std.testing.allocator;
-    const assignment = [_]i32{0};
-    const dims = [_]i64{4};
-
-    const values = try allocator.alloc(ir.Value, 2);
-    for (values, 0..) |*value, index| {
-        value.* = .{
-            .id = .{ .index = @intCast(index) },
-            .role = if (index == 0) .parameter else .instruction_result,
-            .descriptor = .{
-                .element_type = .u8,
-                .dims = try allocator.dupe(i64, &dims),
-                .device_id = 0,
-                .memory_id = 0,
-                .shard_index = 0,
-            },
-        };
-    }
-
-    const parameter_shardings = try allocator.alloc(ir.ShardingPlan, 1);
-    parameter_shardings[0] = .{
-        .kind = .replicated,
-        .mesh_name = try allocator.dupe(u8, "test"),
-        .device_assignment = try allocator.dupe(i32, &assignment),
-    };
-
-    var plan = ir.ExecutablePlan{
-        .allocator = allocator,
-        .options = .{
-            .num_replicas = 1,
-            .num_partitions = 1,
-            .device_assignment = try allocator.dupe(i32, &assignment),
-        },
-        .values = values,
-        .parameter_shardings = parameter_shardings,
-        .output_shardings = try allocator.alloc(ir.ShardingPlan, 0),
-        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
-        .instructions = try allocator.dupe(ir.PlanInstruction, &.{.{
-            .kind = .custom_call,
-            .inputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 0 }}),
-            .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
-            .dims = try allocator.dupe(i64, &dims),
-            .custom_call_target = try allocator.dupe(u8, "Sharding"),
-        }}),
-    };
-    defer plan.deinit();
-
-    const maybe_executable = try b.compileExecutable(allocator, &plan, &assignment);
-    if (maybe_executable) |executable| b.destroyExecutable(executable);
-    try std.testing.expect(maybe_executable == null);
-
-    var diagnostics = std.Io.Writer.Allocating.init(allocator);
-    defer diagnostics.deinit();
-    try b.writeExecutableLoweringDiagnostic(&plan, &assignment, &diagnostics.writer);
-    const message = diagnostics.writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, message, "op=custom_call") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "feature=Sharding") != null);
-}
-
 test "mlx metal backend runs registered binary custom call on device buffers" {
     const b = create();
     const allocator = std.testing.allocator;
@@ -2320,101 +2114,4 @@ test "mlx metal backend executable lowers clamp with scalar bounds" {
     var actual: [3]f32 = undefined;
     try b.copyToHost(outputs[0].handle, std.mem.asBytes(&actual));
     try std.testing.expectEqualSlices(f32, &.{ -1.0, 0.5, 2.0 }, &actual);
-}
-
-test "mlx metal backend executable rejects unsupported gather form during lowering" {
-    const b = create();
-    const allocator = std.testing.allocator;
-    const assignment = [_]i32{0};
-    const operand_dims = [_]i64{ 4, 2 };
-    const index_dims = [_]i64{2};
-    const output_dims = [_]i64{ 2, 2 };
-
-    const values = try allocator.alloc(ir.Value, 3);
-    errdefer allocator.free(values);
-    values[0] = .{
-        .id = .{ .index = 0 },
-        .role = .parameter,
-        .descriptor = .{
-            .element_type = .f32,
-            .dims = try allocator.dupe(i64, &operand_dims),
-            .device_id = 0,
-            .memory_id = 0,
-            .shard_index = 0,
-        },
-    };
-    values[1] = .{
-        .id = .{ .index = 1 },
-        .role = .parameter,
-        .descriptor = .{
-            .element_type = .s32,
-            .dims = try allocator.dupe(i64, &index_dims),
-            .device_id = 0,
-            .memory_id = 0,
-            .shard_index = 0,
-        },
-    };
-    values[2] = .{
-        .id = .{ .index = 2 },
-        .role = .instruction_result,
-        .descriptor = .{
-            .element_type = .f32,
-            .dims = try allocator.dupe(i64, &output_dims),
-            .device_id = 0,
-            .memory_id = 0,
-            .shard_index = 0,
-        },
-    };
-
-    var parameter_shardings = try allocator.alloc(ir.ShardingPlan, 2);
-    parameter_shardings[0] = .{
-        .kind = .replicated,
-        .mesh_name = try allocator.dupe(u8, ""),
-        .device_assignment = try allocator.dupe(i32, &assignment),
-    };
-    parameter_shardings[1] = .{
-        .kind = .replicated,
-        .mesh_name = try allocator.dupe(u8, ""),
-        .device_assignment = try allocator.dupe(i32, &assignment),
-    };
-    var output_shardings = try allocator.alloc(ir.ShardingPlan, 1);
-    output_shardings[0] = .{
-        .kind = .replicated,
-        .mesh_name = try allocator.dupe(u8, ""),
-        .device_assignment = try allocator.dupe(i32, &assignment),
-    };
-
-    var plan = ir.ExecutablePlan{
-        .allocator = allocator,
-        .options = .{
-            .num_replicas = 1,
-            .num_partitions = 1,
-            .device_assignment = try allocator.dupe(i32, &assignment),
-        },
-        .values = values,
-        .parameter_shardings = parameter_shardings,
-        .output_shardings = output_shardings,
-        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 2 }}),
-        .instructions = try allocator.dupe(ir.PlanInstruction, &.{.{
-            .kind = .gather,
-            .inputs = try allocator.dupe(ir.ValueId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
-            .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 2 }}),
-            .dims = try allocator.dupe(i64, &output_dims),
-            .start_index_map = try allocator.dupe(i64, &.{ 0, 1 }),
-            .collapsed_slice_dims = try allocator.dupe(i64, &.{1}),
-            .slice_sizes = try allocator.dupe(i64, &.{ 4, 1 }),
-            .index_vector_dim = 1,
-        }}),
-    };
-    defer plan.deinit();
-
-    const maybe_executable = try b.compileExecutable(allocator, &plan, &assignment);
-    if (maybe_executable) |executable| b.destroyExecutable(executable);
-    try std.testing.expect(maybe_executable == null);
-    var diagnostics = std.Io.Writer.Allocating.init(allocator);
-    defer diagnostics.deinit();
-    try b.writeExecutableLoweringDiagnostic(&plan, &assignment, &diagnostics.writer);
-    const message = diagnostics.writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, message, "op=gather") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "feature=mlx-gather-general-shape") != null);
 }

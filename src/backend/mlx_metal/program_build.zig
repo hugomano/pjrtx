@@ -615,3 +615,170 @@ fn programNodeFusible(node_kind: program_mod.NodeKind) bool {
         else => false,
     };
 }
+
+test "mlx metal backend program owns while cond body subprogram descriptors" {
+    const allocator = std.testing.allocator;
+    const assignment = [_]i32{0};
+
+    const scalar_f32 = ir.BufferDescriptor{
+        .element_type = .f32,
+        .dims = &.{},
+        .device_id = 0,
+        .memory_id = 0,
+        .shard_index = 0,
+    };
+    const scalar_pred = ir.BufferDescriptor{
+        .element_type = .pred,
+        .dims = &.{},
+        .device_id = 0,
+        .memory_id = 0,
+        .shard_index = 0,
+    };
+
+    const values = try allocator.alloc(ir.Value, 2);
+    errdefer allocator.free(values);
+    values[0] = .{
+        .id = .{ .index = 0 },
+        .role = .parameter,
+        .descriptor = scalar_f32,
+    };
+    values[1] = .{
+        .id = .{ .index = 1 },
+        .role = .instruction_result,
+        .descriptor = scalar_f32,
+    };
+
+    var parameter_shardings = try allocator.alloc(ir.ShardingPlan, 1);
+    parameter_shardings[0] = .{
+        .kind = .replicated,
+        .mesh_name = try allocator.dupe(u8, ""),
+        .device_assignment = try allocator.dupe(i32, &assignment),
+    };
+    var output_shardings = try allocator.alloc(ir.ShardingPlan, 1);
+    output_shardings[0] = .{
+        .kind = .replicated,
+        .mesh_name = try allocator.dupe(u8, ""),
+        .device_assignment = try allocator.dupe(i32, &assignment),
+    };
+
+    const cond_args = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32});
+    const cond_returns = try allocator.dupe(ir.BufferDescriptor, &.{scalar_pred});
+    const cond_terminator_ids = try allocator.dupe(ir.RegionValueId, &.{.{ .index = 1 }});
+    const cond_terminator = try allocator.dupe(ir.BufferDescriptor, &.{scalar_pred});
+    const cond_instruction_operands = try allocator.dupe(ir.BufferDescriptor, &.{ scalar_f32, scalar_f32 });
+    const cond_instruction_results = try allocator.dupe(ir.BufferDescriptor, &.{scalar_pred});
+    const cond_instruction_inputs = try allocator.dupe(ir.RegionValueId, &.{ .{ .index = 0 }, .{ .index = 0 } });
+    const cond_instruction_outputs = try allocator.dupe(ir.RegionValueId, &.{.{ .index = 1 }});
+    const cond_instructions = try allocator.dupe(ir.RegionInstruction, &.{.{
+        .kind = .compare,
+        .inputs = cond_instruction_inputs,
+        .outputs = cond_instruction_outputs,
+        .operand_descriptors = cond_instruction_operands,
+        .result_descriptors = cond_instruction_results,
+    }});
+    const cond_values = try allocator.dupe(ir.RegionValue, &.{
+        .{ .id = .{ .index = 0 }, .role = .argument, .descriptor = scalar_f32 },
+        .{ .id = .{ .index = 1 }, .role = .instruction_result, .descriptor = scalar_pred },
+    });
+
+    const body_args = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32});
+    const body_returns = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32});
+    const body_terminator_ids = try allocator.dupe(ir.RegionValueId, &.{.{ .index = 1 }});
+    const body_terminator = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32});
+    const body_instruction_operands = try allocator.dupe(ir.BufferDescriptor, &.{ scalar_f32, scalar_f32 });
+    const body_instruction_results = try allocator.dupe(ir.BufferDescriptor, &.{scalar_f32});
+    const body_instruction_inputs = try allocator.dupe(ir.RegionValueId, &.{ .{ .index = 0 }, .{ .index = 0 } });
+    const body_instruction_outputs = try allocator.dupe(ir.RegionValueId, &.{.{ .index = 1 }});
+    const body_instructions = try allocator.dupe(ir.RegionInstruction, &.{.{
+        .kind = .add,
+        .inputs = body_instruction_inputs,
+        .outputs = body_instruction_outputs,
+        .operand_descriptors = body_instruction_operands,
+        .result_descriptors = body_instruction_results,
+    }});
+    const body_values = try allocator.dupe(ir.RegionValue, &.{
+        .{ .id = .{ .index = 0 }, .role = .argument, .descriptor = scalar_f32 },
+        .{ .id = .{ .index = 1 }, .role = .instruction_result, .descriptor = scalar_f32 },
+    });
+
+    var regions = try allocator.alloc(ir.PlanRegion, 2);
+    regions[0] = .{
+        .id = .{ .index = 0 },
+        .parent_instruction_index = 0,
+        .kind = .while_cond,
+        .values = cond_values,
+        .argument_descriptors = cond_args,
+        .instructions = cond_instructions,
+        .return_descriptors = cond_returns,
+        .terminator_operands = cond_terminator_ids,
+        .terminator_operand_descriptors = cond_terminator,
+    };
+    regions[1] = .{
+        .id = .{ .index = 1 },
+        .parent_instruction_index = 0,
+        .kind = .while_body,
+        .values = body_values,
+        .argument_descriptors = body_args,
+        .instructions = body_instructions,
+        .return_descriptors = body_returns,
+        .terminator_operands = body_terminator_ids,
+        .terminator_operand_descriptors = body_terminator,
+    };
+
+    var plan = ir.ExecutablePlan{
+        .allocator = allocator,
+        .options = .{
+            .num_replicas = 1,
+            .num_partitions = 1,
+            .device_assignment = try allocator.dupe(i32, &assignment),
+        },
+        .values = values,
+        .regions = regions,
+        .parameter_shardings = parameter_shardings,
+        .output_shardings = output_shardings,
+        .output_ids = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
+        .instructions = try allocator.dupe(ir.PlanInstruction, &.{.{
+            .kind = .while_,
+            .inputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 0 }}),
+            .outputs = try allocator.dupe(ir.ValueId, &.{.{ .index = 1 }}),
+            .region_ids = try allocator.dupe(ir.RegionId, &.{ .{ .index = 0 }, .{ .index = 1 } }),
+        }}),
+    };
+    defer plan.deinit();
+
+    var program = try build(allocator, &plan, null);
+    defer program.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), program.nodes.len);
+    try std.testing.expectEqual(program_mod.NodeKind.control_flow, program.nodes[0].kind);
+    try std.testing.expectEqual(@as(usize, 2), program.nodes[0].subprograms.len);
+    try std.testing.expectEqual(@as(usize, 2), program.subprograms.len);
+    try std.testing.expectEqual(@as(usize, 1), program.control_flows.len);
+    try std.testing.expectEqual(@as(?usize, 0), program.nodes[0].control_flow);
+    const control_flow = program.control_flows[0];
+    try std.testing.expectEqual(program_mod.ControlFlowKind.while_loop, control_flow.kind);
+    try std.testing.expectEqual(@as(usize, 0), control_flow.parent_node);
+    try std.testing.expectEqual(program.nodes[0].subprograms[0], control_flow.condition_subprogram);
+    try std.testing.expectEqual(program.nodes[0].subprograms[1], control_flow.body_subprogram);
+    try std.testing.expectEqual(@as(usize, 1), control_flow.state_inputs.len);
+    try std.testing.expectEqual(@as(usize, 1), control_flow.state_outputs.len);
+    try std.testing.expectEqual(@as(u32, 1), control_flow.predicate_output.index);
+    const cond = program.subprograms[program.nodes[0].subprograms[0]];
+    const body = program.subprograms[program.nodes[0].subprograms[1]];
+    try std.testing.expectEqual(ir.RegionKind.while_cond, cond.kind);
+    try std.testing.expectEqual(ir.RegionKind.while_body, body.kind);
+    try std.testing.expectEqual(@as(usize, 2), cond.values.len);
+    try std.testing.expectEqual(ir.RegionValueRole.argument, cond.values[0].role);
+    try std.testing.expectEqual(ir.RegionValueRole.instruction_result, cond.values[1].role);
+    try std.testing.expectEqual(@as(usize, 1), cond.instructions.len);
+    try std.testing.expectEqual(ir.PlanInstructionKind.compare, cond.instructions[0].kind);
+    try std.testing.expectEqual(@as(usize, 2), cond.instructions[0].inputs.len);
+    try std.testing.expectEqual(@as(u32, 0), cond.instructions[0].inputs[0].index);
+    try std.testing.expectEqual(@as(u32, 1), cond.instructions[0].outputs[0].index);
+    try std.testing.expectEqual(@as(u32, 1), cond.terminator_operands[0].index);
+    try std.testing.expectEqual(@as(usize, 1), body.instructions.len);
+    try std.testing.expectEqual(ir.PlanInstructionKind.add, body.instructions[0].kind);
+    try std.testing.expectEqual(@as(u32, 1), body.terminator_operands[0].index);
+    try std.testing.expectEqual(ir.BufferType.pred, cond.return_descriptors[0].element_type);
+    try std.testing.expectEqual(ir.BufferType.f32, body.return_descriptors[0].element_type);
+}

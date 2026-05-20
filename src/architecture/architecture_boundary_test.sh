@@ -23,7 +23,7 @@ if find src -name '*.zig' -print0 | xargs -0 grep -Eq 'src/core'; then
   fail "no Zig source may import src/core"
 fi
 
-if grep -R -Eq '//src/core' src MODULE.bazel; then
+if { grep -R -Eq '//src/core' src; } || { [[ -e MODULE.bazel ]] && grep -Eq '//src/core' MODULE.bazel; }; then
   fail "no Bazel target may depend on //src/core"
 fi
 
@@ -49,6 +49,18 @@ fi
 
 if find src/runtime -name '*.zig' -print0 | xargs -0 grep -Eq 'evalReduce|evalDotGeneral|sortDenseBytes|seedFromBytes|nextRandomU32|readScalarAsF64|writeScalarFromF64|scalarIndexAt|dense host fallback|host shadow'; then
   fail "runtime must not contain CPU operation fallback helpers"
+fi
+
+if grep -Eq 'pub fn init(Elementwise|Compare|Select|Convert|Iota|Reshape|Transpose|Broadcast|Slice|Concatenate|DotGeneral|Reduce|Dynamic|Pad|Gather|Sort|PartitionId|Cholesky|Rng|Clamp|Reverse)' src/runtime/buffer.zig; then
+  fail "runtime buffers must not expose StableHLO op constructors; lowering belongs to compiler/backend programs"
+fi
+
+if grep -Eq 'src/compiler/ir|Elementwise(Binary|Unary)Op|parse.*CustomCallOp' src/runtime/custom_call.zig; then
+  fail "runtime custom-call registration must not parse backend operation names"
+fi
+
+if grep -Eq 'pub const Elementwise(Binary|Unary)Op|pub const CompareOp' src/runtime/runtime.zig; then
+  fail "runtime root must not re-export compiler op enums it does not own"
 fi
 
 if find src/runtime -name '*.zig' -print0 | xargs -0 grep -Eq 'bufferFromHost\(.*\) orelse null|allocator\.dupe\(u8, src\)'; then
@@ -77,6 +89,31 @@ fi
 
 if [[ -e src/backend/synthetic ]]; then
   fail "synthetic backend code must not exist in //src; MLX Metal is the only production backend"
+fi
+
+mlx_c_violations="$(
+  find src/backend/mlx_metal -name '*.zig' ! -name 'mlx_call.zig' -print0 \
+    | xargs -0 grep -En '@import\("c"\)|extern "c"|pjrtx_mlx_metal_' || true
+)"
+if [[ -n "${mlx_c_violations}" ]]; then
+  echo "${mlx_c_violations}" >&2
+  fail "only src/backend/mlx_metal/mlx_call.zig may import translated C or call MLX/Metal C shims"
+fi
+
+if find src/backend/mlx_metal -name '*.zig' -print0 | xargs -0 grep -Eq 'fallbackDevice|synthetic backend'; then
+  fail "MLX Metal backend must not grow fake or synthetic device fallback paths"
+fi
+
+if grep -Eq 'fn (executeProgramNode|executeFusionGroup|traceScheduleFailure|executeRegisteredCustomCall)\(' src/backend/mlx_metal/backend.zig; then
+  fail "MLX Metal backend root must not own execution scheduling bodies"
+fi
+
+if grep -Eq 'fn (instructionIssue|validate[A-Za-z0-9_]*Lowering|supportedScatterAxis)\(' src/backend/mlx_metal/backend.zig; then
+  fail "MLX Metal backend root must not own lowering validation bodies"
+fi
+
+if grep -Eq 'fn (programNodeKind|buildFusionGroups|buildNodeSubprograms|countPlanSubprograms)\(' src/backend/mlx_metal/backend.zig; then
+  fail "MLX Metal backend root must not own program graph construction bodies"
 fi
 
 echo "architecture boundaries OK"

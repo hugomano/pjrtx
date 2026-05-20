@@ -43,6 +43,59 @@ pub const Registration = struct {
     }
 };
 
+fn parseOp(comptime Op: type, name: []const u8, comptime entries: anytype) ?Op {
+    return inline for (entries) |entry| {
+        if (std.mem.eql(u8, name, entry[0])) break entry[1];
+    } else null;
+}
+
+fn parseBinaryOp(name: []const u8) ?ir.ElementwiseBinaryOp {
+    return parseOp(ir.ElementwiseBinaryOp, name, .{
+        .{ "add", ir.ElementwiseBinaryOp.add },
+        .{ "subtract", ir.ElementwiseBinaryOp.subtract },
+        .{ "multiply", ir.ElementwiseBinaryOp.multiply },
+        .{ "divide", ir.ElementwiseBinaryOp.divide },
+        .{ "maximum", ir.ElementwiseBinaryOp.maximum },
+        .{ "minimum", ir.ElementwiseBinaryOp.minimum },
+        .{ "power", ir.ElementwiseBinaryOp.power },
+        .{ "atan2", ir.ElementwiseBinaryOp.atan2 },
+        .{ "remainder", ir.ElementwiseBinaryOp.remainder },
+        .{ "and", ir.ElementwiseBinaryOp.and_ },
+        .{ "or", ir.ElementwiseBinaryOp.or_ },
+        .{ "xor", ir.ElementwiseBinaryOp.xor },
+        .{ "shift_left", ir.ElementwiseBinaryOp.shift_left },
+        .{ "shift_right_logical", ir.ElementwiseBinaryOp.shift_right_logical },
+        .{ "shift_right_arithmetic", ir.ElementwiseBinaryOp.shift_right_arithmetic },
+    });
+}
+
+fn parseUnaryOp(name: []const u8) ?ir.ElementwiseUnaryOp {
+    return parseOp(ir.ElementwiseUnaryOp, name, .{
+        .{ "negate", ir.ElementwiseUnaryOp.negate },
+        .{ "exp", ir.ElementwiseUnaryOp.exp },
+        .{ "expm1", ir.ElementwiseUnaryOp.expm1 },
+        .{ "tanh", ir.ElementwiseUnaryOp.tanh },
+        .{ "sqrt", ir.ElementwiseUnaryOp.sqrt },
+        .{ "rsqrt", ir.ElementwiseUnaryOp.rsqrt },
+        .{ "abs", ir.ElementwiseUnaryOp.abs },
+        .{ "cbrt", ir.ElementwiseUnaryOp.cbrt },
+        .{ "ceil", ir.ElementwiseUnaryOp.ceil },
+        .{ "floor", ir.ElementwiseUnaryOp.floor },
+        .{ "log", ir.ElementwiseUnaryOp.log },
+        .{ "log1p", ir.ElementwiseUnaryOp.log1p },
+        .{ "logistic", ir.ElementwiseUnaryOp.logistic },
+        .{ "sine", ir.ElementwiseUnaryOp.sine },
+        .{ "cosine", ir.ElementwiseUnaryOp.cosine },
+        .{ "not", ir.ElementwiseUnaryOp.not_ },
+        .{ "sign", ir.ElementwiseUnaryOp.sign },
+        .{ "is_finite", ir.ElementwiseUnaryOp.is_finite },
+        .{ "round_nearest_afz", ir.ElementwiseUnaryOp.round_nearest_afz },
+        .{ "round_nearest_even", ir.ElementwiseUnaryOp.round_nearest_even },
+        .{ "popcnt", ir.ElementwiseUnaryOp.popcnt },
+        .{ "count_leading_zeros", ir.ElementwiseUnaryOp.count_leading_zeros },
+    });
+}
+
 /// Names a backend-owned custom-call implementation after lookup.
 /// Public registrations only produce identity/unary/binary specs; built-ins
 /// are reserved by this module and must execute through the backend shim owner.
@@ -96,6 +149,33 @@ pub fn register(registration: Registration) Error!void {
         .spec = spec,
     }) catch return error.OutOfMemory;
     registry_version +|= 1;
+}
+
+/// Registers a named binary operation as a backend custom-call target.
+pub fn registerBinary(target: []const u8, op_name: []const u8) Error!void {
+    const op = parseBinaryOp(op_name) orelse return error.InvalidCustomCall;
+    return register(.{ .target = target, .kind = .binary, .binary_op = op });
+}
+
+/// Registers a named unary operation as a backend custom-call target.
+pub fn registerUnary(target: []const u8, op_name: []const u8) Error!void {
+    const op = parseUnaryOp(op_name) orelse return error.InvalidCustomCall;
+    return register(.{ .target = target, .kind = .unary, .unary_op = op });
+}
+
+/// Registers an identity alias custom-call target.
+pub fn registerIdentity(target: []const u8) Error!void {
+    return register(.{ .target = target, .kind = .identity });
+}
+
+/// Registers the built-in square-root custom-call marker used by tests and JAX smoke.
+pub fn registerUnarySqrt(target: []const u8) Error!void {
+    return register(.{ .target = target, .kind = .unary, .unary_op = .sqrt });
+}
+
+/// Registers the built-in add custom-call marker used by tests and JAX smoke.
+pub fn registerBinaryAdd(target: []const u8) Error!void {
+    return register(.{ .target = target, .kind = .binary, .binary_op = .add });
 }
 
 /// Removes a dynamic custom-call target from the process registry.

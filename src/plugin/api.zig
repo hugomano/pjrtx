@@ -22,55 +22,17 @@ const default_memory_kind = state_mod.default_memory_kind;
 const Executable = state_mod.Executable;
 const ExecutableHandle = abi.Executable(Executable);
 const PjrtEventCallbackStateHandle = abi.UserData(PjrtEventCallbackState);
-const eventCreateReady = events_mod.eventCreateReady;
-const eventCreateFailed = events_mod.eventCreateFailed;
+const PjrtEvent = events_mod.Event;
 const PjRTx_RegisterCustomCallBinary = custom_call.PjRTx_RegisterCustomCallBinary;
 const PjRTx_UnregisterCustomCall = custom_call.PjRTx_UnregisterCustomCall;
 
 var api_storage: c.PJRT_Api = undefined;
 var api_ready = false;
 
-fn ApiTraceCallback(comptime name: []const u8, comptime callback: anytype) type {
-    const Fn = @TypeOf(callback);
-    const info = @typeInfo(Fn).@"fn";
-    if (info.params.len != 1) @compileError("PJRT API callback wrapper expects one args pointer parameter");
-    const Args = info.params[0].type orelse @compileError("PJRT API callback args type is missing");
-    const Return = info.return_type orelse void;
-
-    return struct {
-        fn argsPtr(args: Args) usize {
-            return if (args == null) 0 else @intFromPtr(args);
-        }
-
-        fn argsStructSize(args: Args) usize {
-            if (args == null) return 0;
-            const ArgsChild = @typeInfo(Args).pointer.child;
-            if (!@hasField(ArgsChild, "struct_size")) return 0;
-            return args[0].struct_size;
-        }
-
-        fn call(args: Args) callconv(.c) Return {
-            const start = trace_mod.now();
-            const raw_args_ptr = argsPtr(args);
-            const raw_args_struct_size = argsStructSize(args);
-            if (Return == void) {
-                callback(args);
-                trace_mod.tracePjrtApiCall(name, start, raw_args_ptr, raw_args_struct_size, 0, c.PJRT_Error_Code_OK);
-                return;
-            }
-
-            const result = callback(args);
-            const return_ptr = if (result) |err| @intFromPtr(err) else 0;
-            trace_mod.tracePjrtApiCall(name, start, raw_args_ptr, raw_args_struct_size, return_ptr, errors_mod.errorCode(result));
-            return result;
-        }
-    };
-}
-
 fn installScope(api: *c.PJRT_Api, comptime prefix: []const u8, comptime Api: type) void {
     inline for (@typeInfo(Api).@"struct".decls) |decl| {
         const name = prefix ++ decl.name;
-        @field(api.*, name) = ApiTraceCallback(name, @field(Api, decl.name)).call;
+        @field(api.*, name) = trace_mod.Api.Callback(name, @field(Api, decl.name)).call;
     }
 }
 
@@ -108,13 +70,15 @@ fn initApi() void {
     api_ready = true;
 }
 
-pub fn get() *const c.PJRT_Api {
-    initApi();
-    return &api_storage;
-}
+pub const Table = struct {
+    pub fn get() *const c.PJRT_Api {
+        initApi();
+        return &api_storage;
+    }
+};
 
 fn GetPjrtApi() *const c.PJRT_Api {
-    return get();
+    return Table.get();
 }
 
 test "api table exposes bootstrap PJRT surface" {
@@ -425,7 +389,7 @@ fn testPjrtEventCallback(err: [*c]c.PJRT_Error, user_arg: ?*anyopaque) callconv(
 test "event callbacks bridge PJRT errors and pending runtime transitions" {
     const api = GetPjrtApi();
 
-    const ready_event = eventCreateReady().?;
+    const ready_event = PjrtEvent.ready().?;
     defer {
         var destroy_args = std.mem.zeroes(c.PJRT_Event_Destroy_Args);
         destroy_args.struct_size = c.PJRT_Event_Destroy_Args_STRUCT_SIZE;
@@ -442,7 +406,7 @@ test "event callbacks bridge PJRT errors and pending runtime transitions" {
     try std.testing.expectEqual(@as(usize, 1), ready_state.count);
     try std.testing.expectEqual(@as(usize, 1), ready_state.ready_count);
 
-    const failed_event = eventCreateFailed("buffer has been deleted").?;
+    const failed_event = PjrtEvent.failed("buffer has been deleted").?;
     defer {
         var destroy_args = std.mem.zeroes(c.PJRT_Event_Destroy_Args);
         destroy_args.struct_size = c.PJRT_Event_Destroy_Args_STRUCT_SIZE;

@@ -218,6 +218,9 @@ PJRT client owns a selected backend, topology, devices, memories, transfer
 paths, compilation results, and executable lifecycle. Backend behavior is never
 hidden in ambient global state.
 
+Codebase-wide coding rules live in [`CODING_POLICY.md`](CODING_POLICY.md).
+Agent-facing instructions for future edits live in [`AGENTS.md`](AGENTS.md).
+
 The architecture imports these ZML/v2 principles:
 
 - Platform ownership is explicit: clients select and own the backend they use

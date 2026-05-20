@@ -8,7 +8,7 @@ comptime {
 }
 
 pub export fn GetPjrtApi() *const c.PJRT_Api {
-    return api.get();
+    return api.Table.get();
 }
 
 test {

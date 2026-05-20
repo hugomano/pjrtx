@@ -2,25 +2,36 @@ const runtime = @import("src/runtime");
 const c = @import("c");
 const abi = @import("pjrt_abi.zig");
 const errors = @import("errors.zig");
+const PjrtError = errors.Error;
 const events = @import("events.zig");
 const types = @import("types.zig");
 
-const failedPrecondition = errors.failedPrecondition;
-const internal = errors.internal;
-const invalidArgument = errors.invalidArgument;
-const eventCreatePending = events.eventCreatePending;
-const eventCreateFromRuntime = events.eventCreateFromRuntime;
-const eventSetReady = events.eventSetReady;
+const PjrtEvent = events.Event;
 
 const Buffer = struct {
     ptr: *runtime.Buffer,
+
+    const Api = struct {
+        pub const Destroy = BufferCallback(c.PJRT_Buffer_Destroy_Args, .destroy).call;
+        pub const ElementType = BufferScalarCallback(c.PJRT_Buffer_ElementType_Args, "type", .element_type).call;
+        pub const Dimensions = BufferCallback(c.PJRT_Buffer_Dimensions_Args, .dimensions).call;
+        pub const OnDeviceSizeInBytes = BufferScalarCallback(c.PJRT_Buffer_OnDeviceSizeInBytes_Args, "on_device_size_in_bytes", .on_device_size).call;
+        pub const Device = BufferHandleCallback(c.PJRT_Buffer_Device_Args, "device", .device).call;
+        pub const Memory = BufferHandleCallback(c.PJRT_Buffer_Memory_Args, "memory", .memory).call;
+        pub const DynamicDimensionIndices = BufferCallback(c.PJRT_Buffer_DynamicDimensionIndices_Args, .dynamic_dimensions).call;
+        pub const Delete = BufferCallback(c.PJRT_Buffer_Delete_Args, .delete).call;
+        pub const IsDeleted = BufferScalarCallback(c.PJRT_Buffer_IsDeleted_Args, "is_deleted", .is_deleted).call;
+        pub const IsOnCpu = BufferScalarCallback(c.PJRT_Buffer_IsOnCpu_Args, "is_on_cpu", .is_on_cpu).call;
+        pub const ToHostBuffer = BufferCallback(c.PJRT_Buffer_ToHostBuffer_Args, .to_host).call;
+        pub const ReadyEvent = BufferHandleCallback(c.PJRT_Buffer_ReadyEvent_Args, "event", .ready_event).call;
+    };
 
     fn at(raw: anytype) Buffer {
         return .{ .ptr = abi.Buffer.view(raw) };
     }
 
     fn elementType(self: Buffer) c.PJRT_Buffer_Type {
-        return types.pjrtTypeFromRuntime(self.ptr.element_type);
+        return types.BufferType.toPjrt(self.ptr.element_type);
     }
 
     fn onDeviceSize(self: Buffer) usize {
@@ -44,7 +55,7 @@ const Buffer = struct {
     }
 
     fn readyEvent(self: Buffer) ?*c.PJRT_Event {
-        return eventCreateFromRuntime(self.ptr.ready_event);
+        return PjrtEvent.fromRuntime(self.ptr.ready_event);
     }
 
     fn destroy(raw: ?*c.PJRT_Buffer) void {
@@ -56,25 +67,25 @@ const Buffer = struct {
     }
 
     fn ensureUsable(self: Buffer) ?*c.PJRT_Error {
-        self.ptr.ensureUsable() catch return failedPrecondition("buffer has been deleted or donated");
+        self.ptr.ensureUsable() catch return PjrtError.failedPrecondition("buffer has been deleted or donated");
         return null;
     }
 
     fn ensureReady(self: Buffer) ?*c.PJRT_Error {
         self.ptr.ensureReady() catch |err| return switch (err) {
-            error.BufferNotReady => failedPrecondition("buffer is not ready"),
-            error.BufferReadinessFailed => failedPrecondition("buffer readiness failed"),
+            error.BufferNotReady => PjrtError.failedPrecondition("buffer is not ready"),
+            error.BufferReadinessFailed => PjrtError.failedPrecondition("buffer readiness failed"),
         };
         return null;
     }
 
     fn copyToHost(self: Buffer, dst: []u8) ?*c.PJRT_Error {
         self.ptr.copyToHost(dst) catch |err| return switch (err) {
-            error.DestinationTooSmall => invalidArgument("destination buffer is too small"),
-            error.BufferDeleted, error.BufferDonated => failedPrecondition("buffer has been deleted or donated"),
-            error.BufferNotReady => failedPrecondition("buffer is not ready"),
-            error.BufferReadinessFailed => failedPrecondition("buffer readiness failed"),
-            else => internal("failed to copy buffer to host"),
+            error.DestinationTooSmall => PjrtError.invalidArgument("destination buffer is too small"),
+            error.BufferDeleted, error.BufferDonated => PjrtError.failedPrecondition("buffer has been deleted or donated"),
+            error.BufferNotReady => PjrtError.failedPrecondition("buffer is not ready"),
+            error.BufferReadinessFailed => PjrtError.failedPrecondition("buffer readiness failed"),
+            else => PjrtError.internal("failed to copy buffer to host"),
         };
         return null;
     }
@@ -223,9 +234,9 @@ const ToHost = struct {
         if (self.buffer.ensureUsable()) |err| return err;
         if (self.raw.dst == null) return self.querySize();
         if (self.buffer.ensureReady()) |err| return err;
-        if (self.raw.dst_size < self.buffer.onDeviceSize()) return invalidArgument("destination buffer is too small");
+        if (self.raw.dst_size < self.buffer.onDeviceSize()) return PjrtError.invalidArgument("destination buffer is too small");
 
-        const dst = abi.mutBytes(self.raw.dst, self.buffer.onDeviceSize()) orelse return invalidArgument("destination buffer is null");
+        const dst = abi.Slice.mutBytes(self.raw.dst, self.buffer.onDeviceSize()) orelse return PjrtError.invalidArgument("destination buffer is null");
         if (self.buffer.copyToHost(dst)) |err| return err;
         self.complete();
         return null;
@@ -237,22 +248,9 @@ const ToHost = struct {
     }
 
     fn complete(self: ToHost) void {
-        self.raw.event = eventCreatePending();
-        eventSetReady(self.raw.event);
+        self.raw.event = PjrtEvent.pending();
+        PjrtEvent.setReady(self.raw.event);
     }
 };
 
-pub const Api = struct {
-    pub const Destroy = BufferCallback(c.PJRT_Buffer_Destroy_Args, .destroy).call;
-    pub const ElementType = BufferScalarCallback(c.PJRT_Buffer_ElementType_Args, "type", .element_type).call;
-    pub const Dimensions = BufferCallback(c.PJRT_Buffer_Dimensions_Args, .dimensions).call;
-    pub const OnDeviceSizeInBytes = BufferScalarCallback(c.PJRT_Buffer_OnDeviceSizeInBytes_Args, "on_device_size_in_bytes", .on_device_size).call;
-    pub const Device = BufferHandleCallback(c.PJRT_Buffer_Device_Args, "device", .device).call;
-    pub const Memory = BufferHandleCallback(c.PJRT_Buffer_Memory_Args, "memory", .memory).call;
-    pub const DynamicDimensionIndices = BufferCallback(c.PJRT_Buffer_DynamicDimensionIndices_Args, .dynamic_dimensions).call;
-    pub const Delete = BufferCallback(c.PJRT_Buffer_Delete_Args, .delete).call;
-    pub const IsDeleted = BufferScalarCallback(c.PJRT_Buffer_IsDeleted_Args, "is_deleted", .is_deleted).call;
-    pub const IsOnCpu = BufferScalarCallback(c.PJRT_Buffer_IsOnCpu_Args, "is_on_cpu", .is_on_cpu).call;
-    pub const ToHostBuffer = BufferCallback(c.PJRT_Buffer_ToHostBuffer_Args, .to_host).call;
-    pub const ReadyEvent = BufferHandleCallback(c.PJRT_Buffer_ReadyEvent_Args, "event", .ready_event).call;
-};
+pub const Api = Buffer.Api;

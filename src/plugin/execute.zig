@@ -4,32 +4,33 @@ const runtime = @import("src/runtime");
 const c = @import("c");
 const abi = @import("pjrt_abi.zig");
 const errors = @import("errors.zig");
+const PjrtError = errors.Error;
 const events_mod = @import("events.zig");
 const state = @import("state.zig");
 
 const allocator = state.allocator;
 const Executable = state.Executable;
 const LoadedExecutableHandle = abi.LoadedExecutable(Executable);
-const failedPrecondition = errors.failedPrecondition;
-const internal = errors.internal;
-const invalidArgument = errors.invalidArgument;
-const resourceExhausted = errors.resourceExhausted;
-const unimplemented = errors.unimplemented;
-const eventCreateFromRuntime = events_mod.eventCreateFromRuntime;
-const runtimeEvent = events_mod.runtimeEvent;
+const PjrtEvent = events_mod.Event;
 
-pub fn graphExecuteError(err: runtime.GraphExecuteError) ?*c.PJRT_Error {
+const LoadedExecutable = struct {
+    pub const Api = struct {
+        pub const Execute = ExecuteApiCallback.call;
+    };
+};
+
+fn graphExecuteError(err: runtime.GraphExecuteError) ?*c.PJRT_Error {
     return switch (err) {
-        error.OutOfMemory => internal("failed to allocate executable graph execution state"),
-        error.InvalidArgument => invalidArgument("invalid executable graph arguments or device assignment"),
-        error.UnsupportedElementType => unimplemented("executable graph contains an operation unsupported for this element type"),
-        error.ShapeMismatch => invalidArgument("executable graph shape validation failed during execution"),
-        error.UnsupportedRuntimeFeature => unimplemented("executable graph is not fully lowered to the MLX backend executable"),
-        error.BufferDeleted => failedPrecondition("execute attempted to use a deleted buffer"),
-        error.BufferDonated => failedPrecondition("execute attempted to use a donated buffer"),
-        error.BufferNotReady => failedPrecondition("execute attempted to use a buffer that is not ready"),
-        error.BufferReadinessFailed => failedPrecondition("execute attempted to use a buffer with failed readiness"),
-        error.Internal => internal("failed to execute executable graph"),
+        error.OutOfMemory => PjrtError.internal("failed to allocate executable graph execution state"),
+        error.InvalidArgument => PjrtError.invalidArgument("invalid executable graph arguments or device assignment"),
+        error.UnsupportedElementType => PjrtError.unimplemented("executable graph contains an operation unsupported for this element type"),
+        error.ShapeMismatch => PjrtError.invalidArgument("executable graph shape validation failed during execution"),
+        error.UnsupportedRuntimeFeature => PjrtError.unimplemented("executable graph is not fully lowered to the MLX backend executable"),
+        error.BufferDeleted => PjrtError.failedPrecondition("execute attempted to use a deleted buffer"),
+        error.BufferDonated => PjrtError.failedPrecondition("execute attempted to use a donated buffer"),
+        error.BufferNotReady => PjrtError.failedPrecondition("execute attempted to use a buffer that is not ready"),
+        error.BufferReadinessFailed => PjrtError.failedPrecondition("execute attempted to use a buffer with failed readiness"),
+        error.Internal => PjrtError.internal("failed to execute executable graph"),
     };
 }
 
@@ -54,11 +55,11 @@ const ExecuteOptions = struct {
     fn validate(self: ExecuteOptions, raw_options: ?*c.PJRT_ExecuteOptions, num_args: usize) ?*c.PJRT_Error {
         const raw = raw_options orelse return null;
         if (raw.num_non_donatable_input_indices != 0 and raw.non_donatable_input_indices == null) {
-            return invalidArgument("non_donatable_input_indices count requires a non-null index list");
+            return PjrtError.invalidArgument("non_donatable_input_indices count requires a non-null index list");
         }
         for (self.non_donatable_input_indices) |non_donatable| {
             if (non_donatable < 0 or @as(usize, @intCast(non_donatable)) >= num_args) {
-                return invalidArgument("non_donatable_input_indices contains an out-of-range argument index");
+                return PjrtError.invalidArgument("non_donatable_input_indices contains an out-of-range argument index");
             }
         }
         return null;
@@ -132,7 +133,7 @@ const ExecuteCall = struct {
                     var event_destroy_args = std.mem.zeroes(c.PJRT_Event_Destroy_Args);
                     event_destroy_args.struct_size = c.PJRT_Event_Destroy_Args_STRUCT_SIZE;
                     event_destroy_args.event = event;
-                    _ = events_mod.Api.Destroy(&event_destroy_args);
+                    _ = PjrtEvent.Api.Destroy(&event_destroy_args);
                     events[device_index] = null;
                 }
             }
@@ -141,8 +142,8 @@ const ExecuteCall = struct {
 
     fn completionEventSlot(self: ExecuteCall, device_index: usize, source: runtime.Event) ?*runtime.Event {
         if (self.raw.device_complete_events) |events| {
-            events[device_index] = eventCreateFromRuntime(source) orelse return null;
-            return runtimeEvent(events[device_index].?);
+            events[device_index] = PjrtEvent.fromRuntime(source) orelse return null;
+            return PjrtEvent.runtime(events[device_index].?);
         }
         return null;
     }
@@ -152,7 +153,7 @@ const ExecuteCall = struct {
     }
 
     fn validate(self: ExecuteCall) ?*c.PJRT_Error {
-        if (self.executable.deleted) return failedPrecondition("loaded executable has been deleted");
+        if (self.executable.deleted) return PjrtError.failedPrecondition("loaded executable has been deleted");
         if (self.validateLists()) |err| return err;
         if (self.options.validate(self.raw.options, self.numArgs())) |err| return err;
         return self.validateDonationAliasHazards();
@@ -161,21 +162,21 @@ const ExecuteCall = struct {
     fn validateLists(self: ExecuteCall) ?*c.PJRT_Error {
         const expected_args = self.expectedArgs();
         const expected_outputs = self.expectedOutputs();
-        if (self.numDevices() == 0) return invalidArgument("PjRTx execute requires at least one device");
-        if (self.numDevices() > self.executable.graph.device_ids.len) return invalidArgument("PjRTx execute requested more devices than the executable graph contains");
-        if (self.numArgs() != expected_args) return invalidArgument("PjRTx execute argument count does not match executable parameters");
-        if (expected_args != 0 and self.raw.argument_lists == null) return invalidArgument("PjRTx execute requires non-null argument_lists for executable parameters");
-        if (expected_outputs != 0 and self.raw.output_lists == null) return invalidArgument("PjRTx execute requires non-null output_lists for executable outputs");
+        if (self.numDevices() == 0) return PjrtError.invalidArgument("PjRTx execute requires at least one device");
+        if (self.numDevices() > self.executable.graph.device_ids.len) return PjrtError.invalidArgument("PjRTx execute requested more devices than the executable graph contains");
+        if (self.numArgs() != expected_args) return PjrtError.invalidArgument("PjRTx execute argument count does not match executable parameters");
+        if (expected_args != 0 and self.raw.argument_lists == null) return PjrtError.invalidArgument("PjRTx execute requires non-null argument_lists for executable parameters");
+        if (expected_outputs != 0 and self.raw.output_lists == null) return PjrtError.invalidArgument("PjRTx execute requires non-null output_lists for executable outputs");
         for (0..self.numDevices()) |device_index| {
             if (expected_args != 0 and self.raw.argument_lists[device_index] == null) {
-                return invalidArgument("PjRTx execute requires a non-null argument list for every device");
+                return PjrtError.invalidArgument("PjRTx execute requires a non-null argument list for every device");
             }
             if (expected_outputs != 0 and self.raw.output_lists[device_index] == null) {
-                return invalidArgument("PjRTx execute requires a non-null output list for every device");
+                return PjrtError.invalidArgument("PjRTx execute requires a non-null output list for every device");
             }
             for (0..expected_args) |argument_index| {
                 if (self.raw.argument_lists[device_index][argument_index] == null) {
-                    return invalidArgument("PjRTx execute argument list contains a null buffer");
+                    return PjrtError.invalidArgument("PjRTx execute argument list contains a null buffer");
                 }
             }
         }
@@ -192,7 +193,7 @@ const ExecuteCall = struct {
                     for (0..self.numArgs()) |other_argument_index| {
                         if (donor_device_index == other_device_index and donor_argument_index == other_argument_index) continue;
                         if (self.rawArgument(other_device_index, other_argument_index) == donor_buffer) {
-                            return invalidArgument("donated execute argument aliases another argument");
+                            return PjrtError.invalidArgument("donated execute argument aliases another argument");
                         }
                     }
                 }
@@ -228,7 +229,7 @@ fn executableDonatesParameter(executable: *const Executable, parameter_index: us
     return false;
 }
 
-pub fn cleanupUnassignedExecuteOutputs(outputs: []const *runtime.Buffer, assigned_count: usize) void {
+fn cleanupUnassignedExecuteOutputs(outputs: []const *runtime.Buffer, assigned_count: usize) void {
     if (assigned_count >= outputs.len) return;
     for (outputs[assigned_count..]) |output| output.deinit();
 }
@@ -254,59 +255,72 @@ test "execute cleanup destroys only unassigned runtime outputs" {
     try std.testing.expectEqual(bytes_before_cleanup - second_bytes, client.memories[0].stats.bytes_in_use);
 }
 
-pub fn loadedExecutableExecute(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callconv(.c) ?*c.PJRT_Error {
-    const call = ExecuteCall.init(&args[0]);
-    const executable = call.executable;
-    if (call.validate()) |err| return err;
-    const output_count = call.expectedOutputs();
-    call.clearResults(output_count);
-    var donated_arguments: DonationSet = .{};
-    defer donated_arguments.deinit();
-    for (0..call.numDevices()) |device_index| {
-        const arguments = allocator.alloc(*runtime.Buffer, call.numArgs()) catch {
-            call.cleanupResults(output_count);
-            return internal("failed to allocate executable graph argument list");
+const ExecuteApiCallback = struct {
+    fn call(args: [*c]c.PJRT_LoadedExecutable_Execute_Args) callconv(.c) ?*c.PJRT_Error {
+        const request = ExecuteCall.init(&args[0]);
+        return run(request);
+    }
+
+    fn run(request: ExecuteCall) ?*c.PJRT_Error {
+        const executable = request.executable;
+        if (request.validate()) |err| return err;
+        const output_count = request.expectedOutputs();
+        request.clearResults(output_count);
+        var donated_arguments: DonationSet = .{};
+        defer donated_arguments.deinit();
+        for (0..request.numDevices()) |device_index| {
+            if (runDevice(request, executable, &donated_arguments, device_index, output_count)) |err| return err;
+        }
+        donated_arguments.commit();
+        return null;
+    }
+
+    fn runDevice(request: ExecuteCall, executable: *Executable, donated_arguments: *DonationSet, device_index: usize, output_count: usize) ?*c.PJRT_Error {
+        const arguments = allocator.alloc(*runtime.Buffer, request.numArgs()) catch {
+            request.cleanupResults(output_count);
+            return PjrtError.internal("failed to allocate executable graph argument list");
         };
         defer allocator.free(arguments);
         for (arguments, 0..) |*argument, argument_index| {
-            argument.* = call.argument(device_index, argument_index);
-            if (executableDonatesParameter(executable, argument_index) and !call.options.keepsParameter(argument_index)) {
+            argument.* = request.argument(device_index, argument_index);
+            if (executableDonatesParameter(executable, argument_index) and !request.options.keepsParameter(argument_index)) {
                 donated_arguments.record(argument.*) catch {
-                    call.cleanupResults(output_count);
-                    return internal("failed to record donated executable argument");
+                    request.cleanupResults(output_count);
+                    return PjrtError.internal("failed to record donated executable argument");
                 };
             }
         }
 
         const execute_result = executable.graph.executeDevice(allocator, executable.client, executable.plan, device_index, arguments) catch |err| {
-            call.cleanupResults(output_count);
+            request.cleanupResults(output_count);
             return graphExecuteError(err);
         };
+        return assignDeviceOutputs(request, device_index, output_count, execute_result);
+    }
+
+    fn assignDeviceOutputs(request: ExecuteCall, device_index: usize, output_count: usize, execute_result: runtime.GraphExecuteResult) ?*c.PJRT_Error {
         const outputs = execute_result.outputs;
         defer allocator.free(outputs);
         var assigned_outputs: usize = 0;
         var outputs_transferred = false;
         defer if (!outputs_transferred) cleanupUnassignedExecuteOutputs(outputs, assigned_outputs);
         var stack_completion_event = execute_result.completion_event;
-        const completion_event = call.completionEventSlot(device_index, execute_result.completion_event) orelse &stack_completion_event;
-        if (call.raw.device_complete_events != null and completion_event == &stack_completion_event) {
-            call.cleanupResults(output_count);
-            return internal("failed to allocate execute completion event");
+        const completion_event = request.completionEventSlot(device_index, execute_result.completion_event) orelse &stack_completion_event;
+        if (request.raw.device_complete_events != null and completion_event == &stack_completion_event) {
+            request.cleanupResults(output_count);
+            return PjrtError.internal("failed to allocate execute completion event");
         }
         for (outputs, 0..) |output, output_index| {
-            call.assignOutput(device_index, output_index, output);
+            request.assignOutput(device_index, output_index, output);
             assigned_outputs = output_index + 1;
             output.chainReadyAfter(completion_event) catch {
-                call.cleanupResults(output_count);
-                return resourceExhausted("too many output readiness dependencies for execute completion event");
+                request.cleanupResults(output_count);
+                return PjrtError.resourceExhausted("too many output readiness dependencies for execute completion event");
             };
         }
         outputs_transferred = true;
+        return null;
     }
-    donated_arguments.commit();
-    return null;
-}
-
-pub const LoadedExecutableApi = struct {
-    pub const Execute = loadedExecutableExecute;
 };
+
+pub const LoadedExecutableApi = LoadedExecutable.Api;

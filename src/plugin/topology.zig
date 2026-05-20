@@ -11,11 +11,41 @@ const platform_name = state.platform_name;
 const platform_version = state.platform_version;
 const SerializedTopology = state.SerializedTopology;
 const SerializedTopologyHandle = abi.SerializedTopology(SerializedTopology);
-const makeError = errors.makeError;
-const unimplemented = errors.unimplemented;
+const PjrtError = errors.Error;
+
+const SerializedTopologyView = struct {
+    ptr: *SerializedTopology,
+
+    fn at(raw: *c.PJRT_SerializedTopology) SerializedTopologyView {
+        return .{ .ptr = SerializedTopologyHandle.view(raw) };
+    }
+
+    fn handle(self: SerializedTopologyView) *c.PJRT_SerializedTopology {
+        return SerializedTopologyHandle.handle(self.ptr);
+    }
+
+    fn delete(raw: ?*c.PJRT_SerializedTopology) callconv(.c) void {
+        const opaque_topology = raw orelse return;
+        const topology = at(opaque_topology).ptr;
+        allocator.free(topology.bytes);
+        allocator.destroy(topology);
+    }
+};
 
 const TopologyDescription = struct {
     client: *const runtime.Client,
+
+    const Api = struct {
+        pub const Create = TopologyLifecycle.create;
+        pub const Destroy = TopologyLifecycle.destroy;
+        pub const PlatformName = TopologyCallback(c.PJRT_TopologyDescription_PlatformName_Args, .platform_name).call;
+        pub const PlatformVersion = TopologyCallback(c.PJRT_TopologyDescription_PlatformVersion_Args, .platform_version).call;
+        pub const GetDeviceDescriptions = TopologyCallback(c.PJRT_TopologyDescription_GetDeviceDescriptions_Args, .device_descriptions).call;
+        pub const Serialize = TopologyLifecycle.serialize;
+        pub const Deserialize = TopologyLifecycle.deserialize;
+        pub const Attributes = TopologyCallback(c.PJRT_TopologyDescription_Attributes_Args, .attributes).call;
+        pub const Fingerprint = TopologyCallback(c.PJRT_TopologyDescription_Fingerprint_Args, .fingerprint).call;
+    };
 
     fn at(raw: anytype) TopologyDescription {
         return .{ .client = abi.TopologyDescription.viewConst(raw) };
@@ -62,6 +92,16 @@ const TopologyDescription = struct {
         } };
         return topology;
     }
+
+    fn writeSerialized(self: TopologyDescription, args: anytype) ?*c.PJRT_Error {
+        const topology = self.serialize() orelse return PjrtError.make(c.PJRT_Error_Code_INTERNAL, "failed to serialize topology");
+        const view: SerializedTopologyView = .{ .ptr = topology };
+        args.serialized_bytes = topology.bytes.ptr;
+        args.serialized_bytes_size = topology.bytes.len;
+        args.serialized_topology = view.handle();
+        args.serialized_topology_deleter = SerializedTopologyView.delete;
+        return null;
+    }
 };
 
 const TopologyOp = enum {
@@ -78,8 +118,8 @@ fn TopologyCallback(comptime Args: type, comptime op: TopologyOp) type {
             const args = &raw[0];
             const topology = TopologyDescription.at(args.topology);
             switch (op) {
-                .platform_name => abi.writeBytes("platform_name", "platform_name_size", args, topology.platformName()),
-                .platform_version => abi.writeBytes("platform_version", "platform_version_size", args, topology.platformVersion()),
+                .platform_name => abi.Args.writeBytes("platform_name", "platform_name_size", args, topology.platformName()),
+                .platform_version => abi.Args.writeBytes("platform_version", "platform_version_size", args, topology.platformVersion()),
                 .device_descriptions => {
                     const devices = topology.devices();
                     args.descriptions = abi.DeviceDescription.handleSlice(devices);
@@ -96,39 +136,22 @@ fn TopologyCallback(comptime Args: type, comptime op: TopologyOp) type {
     };
 }
 
-pub fn topologyDescriptionCreate(_: [*c]c.PJRT_TopologyDescription_Create_Args) callconv(.c) ?*c.PJRT_Error {
-    return unimplemented("standalone topology creation is not implemented yet");
-}
-pub fn topologyDescriptionDestroy(_: [*c]c.PJRT_TopologyDescription_Destroy_Args) callconv(.c) ?*c.PJRT_Error {
-    return null;
-}
-pub fn topologySerializedDelete(serialized_topology: ?*c.PJRT_SerializedTopology) callconv(.c) void {
-    if (serialized_topology) |opaque_topology| {
-        const topology = SerializedTopologyHandle.view(opaque_topology);
-        allocator.free(topology.bytes);
-        allocator.destroy(topology);
+const TopologyLifecycle = struct {
+    fn create(_: [*c]c.PJRT_TopologyDescription_Create_Args) callconv(.c) ?*c.PJRT_Error {
+        return PjrtError.unimplemented("standalone topology creation is not implemented yet");
     }
-}
-pub fn topologyDescriptionSerialize(args: [*c]c.PJRT_TopologyDescription_Serialize_Args) callconv(.c) ?*c.PJRT_Error {
-    const topology = TopologyDescription.at(args[0].topology).serialize() orelse return makeError(c.PJRT_Error_Code_INTERNAL, "failed to serialize topology");
 
-    args[0].serialized_bytes = topology.bytes.ptr;
-    args[0].serialized_bytes_size = topology.bytes.len;
-    args[0].serialized_topology = SerializedTopologyHandle.handle(topology);
-    args[0].serialized_topology_deleter = topologySerializedDelete;
-    return null;
-}
-pub fn topologyDescriptionDeserialize(_: [*c]c.PJRT_TopologyDescription_Deserialize_Args) callconv(.c) ?*c.PJRT_Error {
-    return unimplemented("topology deserialization is not implemented yet");
-}
-pub const Api = struct {
-    pub const Create = topologyDescriptionCreate;
-    pub const Destroy = topologyDescriptionDestroy;
-    pub const PlatformName = TopologyCallback(c.PJRT_TopologyDescription_PlatformName_Args, .platform_name).call;
-    pub const PlatformVersion = TopologyCallback(c.PJRT_TopologyDescription_PlatformVersion_Args, .platform_version).call;
-    pub const GetDeviceDescriptions = TopologyCallback(c.PJRT_TopologyDescription_GetDeviceDescriptions_Args, .device_descriptions).call;
-    pub const Serialize = topologyDescriptionSerialize;
-    pub const Deserialize = topologyDescriptionDeserialize;
-    pub const Attributes = TopologyCallback(c.PJRT_TopologyDescription_Attributes_Args, .attributes).call;
-    pub const Fingerprint = TopologyCallback(c.PJRT_TopologyDescription_Fingerprint_Args, .fingerprint).call;
+    fn destroy(_: [*c]c.PJRT_TopologyDescription_Destroy_Args) callconv(.c) ?*c.PJRT_Error {
+        return null;
+    }
+
+    fn serialize(raw: [*c]c.PJRT_TopologyDescription_Serialize_Args) callconv(.c) ?*c.PJRT_Error {
+        return TopologyDescription.at(raw[0].topology).writeSerialized(&raw[0]);
+    }
+
+    fn deserialize(_: [*c]c.PJRT_TopologyDescription_Deserialize_Args) callconv(.c) ?*c.PJRT_Error {
+        return PjrtError.unimplemented("topology deserialization is not implemented yet");
+    }
 };
+
+pub const Api = TopologyDescription.Api;

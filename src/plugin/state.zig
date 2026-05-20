@@ -66,20 +66,24 @@ pub const Executable = struct {
 var attrs_ready = false;
 var attrs: [5]abi.NamedValue = undefined;
 
-pub fn initAttrs() []abi.NamedValue {
-    if (attrs_ready) return attrs[0..];
-    attrs = .{
-        abi.NamedValue.string("plugin_name", plugin_name),
-        abi.NamedValue.string("xla_version", "local"),
-        abi.NamedValue.int64List("stablehlo_current_version", stablehlo_current_version.len, &stablehlo_current_version),
-        abi.NamedValue.int64List("stablehlo_minimum_version", stablehlo_minimum_version.len, &stablehlo_minimum_version),
-        abi.NamedValue.string("pjrtx_default_backend", "metal_mlx"),
-    };
+pub const Attributes = struct {
+    pub fn init() []abi.NamedValue {
+        if (attrs_ready) return attrs[0..];
+        attrs = .{
+            abi.NamedValue.string("plugin_name", plugin_name),
+            abi.NamedValue.string("xla_version", "local"),
+            abi.NamedValue.int64List("stablehlo_current_version", stablehlo_current_version.len, &stablehlo_current_version),
+            abi.NamedValue.int64List("stablehlo_minimum_version", stablehlo_minimum_version.len, &stablehlo_minimum_version),
+            abi.NamedValue.string("pjrtx_default_backend", "metal_mlx"),
+        };
 
-    attrs_ready = true;
-    return attrs[0..];
-}
+        attrs_ready = true;
+        return attrs[0..];
+    }
+};
 
-pub fn clampI64(value: u64) i64 {
-    return @intCast(@min(value, @as(u64, @intCast(std.math.maxInt(i64)))));
-}
+pub const Scalar = struct {
+    pub fn clampI64(value: u64) i64 {
+        return @intCast(@min(value, @as(u64, @intCast(std.math.maxInt(i64)))));
+    }
+};

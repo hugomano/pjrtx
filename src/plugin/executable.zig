@@ -9,8 +9,24 @@ const Executable = state.Executable;
 const ExecutableHandle = abi.Executable(Executable);
 const LoadedExecutableHandle = abi.LoadedExecutable(Executable);
 
+const DeviceAssignment = struct {
+    fn delete(_: ?*c.PJRT_DeviceAssignmentSerialized) callconv(.c) void {}
+};
+
 const ExecutableView = struct {
     ptr: *const Executable,
+
+    const Api = struct {
+        pub const Destroy = ExecutableCallback(c.PJRT_Executable_Destroy_Args, .destroy).call;
+        pub const Name = ExecutableTextCallback(c.PJRT_Executable_Name_Args, "executable_name", "executable_name_size", .name).call;
+        pub const NumReplicas = ExecutableScalarCallback(c.PJRT_Executable_NumReplicas_Args, "num_replicas", .num_replicas).call;
+        pub const NumPartitions = ExecutableScalarCallback(c.PJRT_Executable_NumPartitions_Args, "num_partitions", .num_partitions).call;
+        pub const NumOutputs = ExecutableScalarCallback(c.PJRT_Executable_NumOutputs_Args, "num_outputs", .num_outputs).call;
+        pub const OptimizedProgram = ExecutableCallback(c.PJRT_Executable_OptimizedProgram_Args, .optimized_program).call;
+        pub const Fingerprint = ExecutableTextCallback(c.PJRT_Executable_Fingerprint_Args, "executable_fingerprint", "executable_fingerprint_size", .fingerprint).call;
+        pub const ParameterMemoryKinds = MemoryKindsCallback(c.PJRT_Executable_ParameterMemoryKinds_Args, "num_parameters", .parameters).call;
+        pub const OutputMemoryKinds = MemoryKindsCallback(c.PJRT_Executable_OutputMemoryKinds_Args, "num_outputs", .outputs).call;
+    };
 
     fn at(raw: anytype) ExecutableView {
         return .{ .ptr = ExecutableHandle.viewConst(raw) };
@@ -38,12 +54,23 @@ const ExecutableView = struct {
 
     fn writeText(self: ExecutableView, comptime ptr_field: []const u8, comptime size_field: []const u8, raw: anytype, text: []const u8) void {
         _ = self;
-        abi.writeBytes(ptr_field, size_field, &raw[0], text);
+        abi.Args.writeBytes(ptr_field, size_field, &raw[0], text);
     }
 };
 
 const LoadedExecutable = struct {
     ptr: *Executable,
+
+    const Api = struct {
+        pub const Destroy = LoadedExecutableCallback(c.PJRT_LoadedExecutable_Destroy_Args, .destroy).call;
+        pub const GetExecutable = LoadedExecutableCallback(c.PJRT_LoadedExecutable_GetExecutable_Args, .get_executable).call;
+        pub const AddressableDevices = LoadedExecutableCallback(c.PJRT_LoadedExecutable_AddressableDevices_Args, .addressable_devices).call;
+        pub const AddressableDeviceLogicalIds = LoadedExecutableCallback(c.PJRT_LoadedExecutable_AddressableDeviceLogicalIds_Args, .logical_ids).call;
+        pub const GetDeviceAssignment = LoadedExecutableCallback(c.PJRT_LoadedExecutable_GetDeviceAssignment_Args, .device_assignment).call;
+        pub const Fingerprint = LoadedExecutableTextCallback(c.PJRT_LoadedExecutable_Fingerprint_Args, "executable_fingerprint", "executable_fingerprint_size", .fingerprint).call;
+        pub const Delete = LoadedExecutableCallback(c.PJRT_LoadedExecutable_Delete_Args, .delete).call;
+        pub const IsDeleted = LoadedExecutableCallback(c.PJRT_LoadedExecutable_IsDeleted_Args, .is_deleted).call;
+    };
 
     fn at(raw: anytype) LoadedExecutable {
         return .{ .ptr = LoadedExecutableHandle.view(raw) };
@@ -90,7 +117,7 @@ const LoadedExecutable = struct {
         args.serialized_bytes = null;
         args.serialized_bytes_size = 0;
         args.serialized_device_assignment = null;
-        args.serialized_device_assignment_deleter = deviceAssignmentSerializedDeleter;
+        args.serialized_device_assignment_deleter = DeviceAssignment.delete;
     }
 };
 
@@ -172,7 +199,7 @@ const MemoryKinds = struct {
 
     fn write(self: MemoryKinds, comptime count_field: []const u8, raw: anytype) void {
         @field(raw[0], count_field) = self.kinds.len;
-        raw[0].memory_kinds = abi.stringPtrList(self.kinds);
+        raw[0].memory_kinds = abi.Slice.ptrList(self.kinds);
         raw[0].memory_kind_sizes = self.sizes.ptr;
     }
 };
@@ -249,27 +276,5 @@ fn ExecutableCallback(comptime Args: type, comptime op: ExecutableOp) type {
     };
 }
 
-pub fn deviceAssignmentSerializedDeleter(_: ?*c.PJRT_DeviceAssignmentSerialized) callconv(.c) void {}
-
-pub const ExecutableApi = struct {
-    pub const Destroy = ExecutableCallback(c.PJRT_Executable_Destroy_Args, .destroy).call;
-    pub const Name = ExecutableTextCallback(c.PJRT_Executable_Name_Args, "executable_name", "executable_name_size", .name).call;
-    pub const NumReplicas = ExecutableScalarCallback(c.PJRT_Executable_NumReplicas_Args, "num_replicas", .num_replicas).call;
-    pub const NumPartitions = ExecutableScalarCallback(c.PJRT_Executable_NumPartitions_Args, "num_partitions", .num_partitions).call;
-    pub const NumOutputs = ExecutableScalarCallback(c.PJRT_Executable_NumOutputs_Args, "num_outputs", .num_outputs).call;
-    pub const OptimizedProgram = ExecutableCallback(c.PJRT_Executable_OptimizedProgram_Args, .optimized_program).call;
-    pub const Fingerprint = ExecutableTextCallback(c.PJRT_Executable_Fingerprint_Args, "executable_fingerprint", "executable_fingerprint_size", .fingerprint).call;
-    pub const ParameterMemoryKinds = MemoryKindsCallback(c.PJRT_Executable_ParameterMemoryKinds_Args, "num_parameters", .parameters).call;
-    pub const OutputMemoryKinds = MemoryKindsCallback(c.PJRT_Executable_OutputMemoryKinds_Args, "num_outputs", .outputs).call;
-};
-
-pub const LoadedExecutableApi = struct {
-    pub const Destroy = LoadedExecutableCallback(c.PJRT_LoadedExecutable_Destroy_Args, .destroy).call;
-    pub const GetExecutable = LoadedExecutableCallback(c.PJRT_LoadedExecutable_GetExecutable_Args, .get_executable).call;
-    pub const AddressableDevices = LoadedExecutableCallback(c.PJRT_LoadedExecutable_AddressableDevices_Args, .addressable_devices).call;
-    pub const AddressableDeviceLogicalIds = LoadedExecutableCallback(c.PJRT_LoadedExecutable_AddressableDeviceLogicalIds_Args, .logical_ids).call;
-    pub const GetDeviceAssignment = LoadedExecutableCallback(c.PJRT_LoadedExecutable_GetDeviceAssignment_Args, .device_assignment).call;
-    pub const Fingerprint = LoadedExecutableTextCallback(c.PJRT_LoadedExecutable_Fingerprint_Args, "executable_fingerprint", "executable_fingerprint_size", .fingerprint).call;
-    pub const Delete = LoadedExecutableCallback(c.PJRT_LoadedExecutable_Delete_Args, .delete).call;
-    pub const IsDeleted = LoadedExecutableCallback(c.PJRT_LoadedExecutable_IsDeleted_Args, .is_deleted).call;
-};
+pub const ExecutableApi = ExecutableView.Api;
+pub const LoadedExecutableApi = LoadedExecutable.Api;

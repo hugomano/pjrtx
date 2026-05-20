@@ -166,6 +166,10 @@ pub const NamedValue = extern struct {
         return init(.int64list, key, values[0..]);
     }
 
+    pub fn ptr(values: []NamedValue) [*c]c.PJRT_NamedValue {
+        return @ptrCast(values.ptr);
+    }
+
     pub fn view(inner: c.PJRT_NamedValue) NamedValue {
         return .{ .inner = inner };
     }
@@ -175,12 +179,12 @@ pub const NamedValue = extern struct {
     }
 
     pub fn name(self: NamedValue) []const u8 {
-        return bytes(self.inner.name, self.inner.name_size) orelse &.{};
+        return Slice.bytes(self.inner.name, self.inner.name_size) orelse &.{};
     }
 
     pub fn value(self: NamedValue) Value {
         return switch (self.kind()) {
-            .string => .{ .string = bytes(self.inner.unnamed_0.string_value, self.inner.value_size) orelse &.{} },
+            .string => .{ .string = Slice.bytes(self.inner.unnamed_0.string_value, self.inner.value_size) orelse &.{} },
             .int64 => .{ .int64 = self.inner.unnamed_0.int64_value },
             .int64list => .{ .int64list = self.inner.unnamed_0.int64_array_value[0..self.inner.value_size] },
             .float => .{ .float = self.inner.unnamed_0.float_value },
@@ -196,59 +200,45 @@ pub const NamedValue = extern struct {
     }
 };
 
-pub fn namedValuePtr(values: []NamedValue) [*c]c.PJRT_NamedValue {
-    return @ptrCast(values.ptr);
-}
-
-pub fn stringPtrList(values: [][*c]const u8) [*c][*c]const u8 {
-    return @ptrCast(values.ptr);
-}
-
-pub fn writeBytes(comptime ptr_field: []const u8, comptime len_field: []const u8, args: anytype, value: []const u8) void {
-    @field(args, ptr_field) = value.ptr;
-    @field(args, len_field) = value.len;
-}
-
-pub fn bytes(ptr: [*c]const u8, len: usize) ?[]const u8 {
-    if (ptr == null and len != 0) return null;
-    if (len == 0) return &.{};
-    return ptr[0..len];
-}
-
-pub fn mutBytes(ptr: ?*anyopaque, len: usize) ?[]u8 {
-    if (ptr == null and len != 0) return null;
-    if (len == 0) return &.{};
-    return @as([*]u8, @ptrCast(ptr.?))[0..len];
-}
-
-pub fn constBytes(ptr: ?*const anyopaque, len: usize) ?[]const u8 {
-    if (ptr == null and len != 0) return null;
-    if (len == 0) return &.{};
-    return @as([*]const u8, @ptrCast(ptr.?))[0..len];
-}
-
-pub fn as(comptime T: type, ptr: anytype) *T {
-    return view(T, ptr);
-}
-
-pub fn asConst(comptime T: type, ptr: anytype) *const T {
-    return viewConst(T, ptr);
-}
-
-pub fn out(comptime T: type, ptr: anytype) T {
-    return @ptrCast(ptr);
-}
-
-pub fn outConst(comptime T: type, ptr: anytype) T {
-    return @ptrCast(@constCast(ptr));
-}
-
-pub fn deviceIndex(client: *const runtime.Client, device: *const runtime.Device) ?usize {
-    for (client.devices, 0..) |*candidate, i| {
-        if (candidate == device or candidate.id == device.id) return i;
+pub const Slice = struct {
+    pub fn ptrList(values: [][*c]const u8) [*c][*c]const u8 {
+        return @ptrCast(values.ptr);
     }
-    return null;
-}
+
+    pub fn bytes(ptr: [*c]const u8, len: usize) ?[]const u8 {
+        if (ptr == null and len != 0) return null;
+        if (len == 0) return &.{};
+        return ptr[0..len];
+    }
+
+    pub fn mutBytes(ptr: ?*anyopaque, len: usize) ?[]u8 {
+        if (ptr == null and len != 0) return null;
+        if (len == 0) return &.{};
+        return @as([*]u8, @ptrCast(ptr.?))[0..len];
+    }
+
+    pub fn constBytes(ptr: ?*const anyopaque, len: usize) ?[]const u8 {
+        if (ptr == null and len != 0) return null;
+        if (len == 0) return &.{};
+        return @as([*]const u8, @ptrCast(ptr.?))[0..len];
+    }
+};
+
+pub const Args = struct {
+    pub fn writeBytes(comptime ptr_field: []const u8, comptime len_field: []const u8, args: anytype, value: []const u8) void {
+        @field(args, ptr_field) = value.ptr;
+        @field(args, len_field) = value.len;
+    }
+};
+
+pub const Placement = struct {
+    pub fn deviceIndex(client: *const runtime.Client, device: *const runtime.Device) ?usize {
+        for (client.devices, 0..) |*candidate, i| {
+            if (candidate == device or candidate.id == device.id) return i;
+        }
+        return null;
+    }
+};
 
 test "named value helpers build PJRT strings and lists" {
     const text = NamedValue.string("name", "value");

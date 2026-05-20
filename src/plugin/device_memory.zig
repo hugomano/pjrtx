@@ -2,13 +2,22 @@ const runtime = @import("src/runtime");
 const c = @import("c");
 const abi = @import("pjrt_abi.zig");
 const errors = @import("errors.zig");
+const PjrtError = errors.Error;
 const state = @import("state.zig");
 
 const allocator = state.allocator;
-const internal = errors.internal;
 
 const DeviceDescription = struct {
     device: *runtime.Device,
+
+    const Api = struct {
+        pub const Id = DeviceDescriptionScalar(c.PJRT_DeviceDescription_Id_Args, "id", .id).call;
+        pub const ProcessIndex = DeviceDescriptionScalar(c.PJRT_DeviceDescription_ProcessIndex_Args, "process_index", .process_index).call;
+        pub const Attributes = DeviceDescriptionCallback(c.PJRT_DeviceDescription_Attributes_Args, .attributes).call;
+        pub const Kind = DeviceDescriptionText(c.PJRT_DeviceDescription_Kind_Args, "device_kind", "device_kind_size", .kind).call;
+        pub const DebugString = DeviceDescriptionText(c.PJRT_DeviceDescription_DebugString_Args, "debug_string", "debug_string_size", .debug_string).call;
+        pub const ToString = DeviceDescriptionText(c.PJRT_DeviceDescription_ToString_Args, "to_string", "to_string_size", .debug_string).call;
+    };
 
     fn at(raw: anytype) DeviceDescription {
         return .{ .device = abi.DeviceDescription.view(raw) };
@@ -33,6 +42,16 @@ const DeviceDescription = struct {
 
 const Device = struct {
     ptr: *runtime.Device,
+
+    const Api = struct {
+        pub const GetDescription = DeviceCallback(c.PJRT_Device_GetDescription_Args, .description).call;
+        pub const IsAddressable = DeviceCallback(c.PJRT_Device_IsAddressable_Args, .is_addressable).call;
+        pub const LocalHardwareId = DeviceCallback(c.PJRT_Device_LocalHardwareId_Args, .local_hardware_id).call;
+        pub const AddressableMemories = DeviceCallback(c.PJRT_Device_AddressableMemories_Args, .addressable_memories).call;
+        pub const DefaultMemory = DeviceCallback(c.PJRT_Device_DefaultMemory_Args, .default_memory).call;
+        pub const MemoryStats = DeviceCallback(c.PJRT_Device_MemoryStats_Args, .memory_stats).call;
+        pub const GetAttributes = DeviceCallback(c.PJRT_Device_GetAttributes_Args, .attributes).call;
+    };
 
     fn at(raw: anytype) Device {
         return .{ .ptr = abi.Device.view(raw) };
@@ -66,19 +85,27 @@ const Device = struct {
 
     fn writeAttributes(self: Device, args: anytype) ?*c.PJRT_Error {
         const owned = allocator.create(DeviceAttributes) catch {
-            return internal("failed to allocate device attributes");
+            return PjrtError.internal("failed to allocate device attributes");
         };
         owned.* = DeviceAttributes.init(self.ptr);
-        args.attributes = abi.namedValuePtr(owned.attrs[0..]);
+        args.attributes = abi.NamedValue.ptr(owned.attrs[0..]);
         args.num_attributes = owned.attrs.len;
         args.device_attributes = DeviceAttributesHandle.handle(owned);
-        args.attributes_deleter = deviceAttributesDelete;
+        args.attributes_deleter = DeviceAttributes.delete;
         return null;
     }
 };
 
 const Memory = struct {
     ptr: *runtime.Memory,
+
+    const Api = struct {
+        pub const Id = MemoryCallback(c.PJRT_Memory_Id_Args, .id).call;
+        pub const Kind = MemoryText(c.PJRT_Memory_Kind_Args, "kind", "kind_size", .kind).call;
+        pub const DebugString = MemoryText(c.PJRT_Memory_DebugString_Args, "debug_string", "debug_string_size", .debug_string).call;
+        pub const ToString = MemoryText(c.PJRT_Memory_ToString_Args, "to_string", "to_string_size", .debug_string).call;
+        pub const AddressableByDevices = MemoryCallback(c.PJRT_Memory_AddressableByDevices_Args, .addressable_devices).call;
+    };
 
     fn at(raw: anytype) Memory {
         return .{ .ptr = abi.Memory.view(raw) };
@@ -114,8 +141,8 @@ const DeviceAttribute = enum {
     fn namedValue(comptime attr: DeviceAttribute, device: *const runtime.Device) abi.NamedValue {
         return switch (attr) {
             .name => abi.NamedValue.string("device_name", device.name),
-            .registry_id => abi.NamedValue.int64("pjrtx_registry_id", state.clampI64(device.registry_id)),
-            .recommended_working_set_size => abi.NamedValue.int64("pjrtx_recommended_working_set_size", state.clampI64(device.memory_bytes)),
+            .registry_id => abi.NamedValue.int64("pjrtx_registry_id", state.Scalar.clampI64(device.registry_id)),
+            .recommended_working_set_size => abi.NamedValue.int64("pjrtx_recommended_working_set_size", state.Scalar.clampI64(device.memory_bytes)),
             .has_unified_memory => abi.NamedValue.int64("pjrtx_has_unified_memory", if (device.has_unified_memory) 1 else 0),
             .default_memory_id => abi.NamedValue.int64("pjrtx_default_memory_id", device.default_memory_id),
         };
@@ -132,6 +159,10 @@ const DeviceAttributes = struct {
         }
         return .{ .attrs = attrs };
     }
+
+    fn delete(raw: ?*c.PJRT_Device_Attributes) callconv(.c) void {
+        if (raw) |opaque_attrs| allocator.destroy(DeviceAttributesHandle.view(opaque_attrs));
+    }
 };
 
 const DeviceAttributesHandle = abi.DeviceAttributes(DeviceAttributes);
@@ -141,7 +172,7 @@ fn set(comptime field: []const u8, raw: anytype, value: anytype) void {
 }
 
 fn setText(comptime ptr_field: []const u8, comptime len_field: []const u8, raw: anytype, value: []const u8) void {
-    abi.writeBytes(ptr_field, len_field, &raw[0], value);
+    abi.Args.writeBytes(ptr_field, len_field, &raw[0], value);
 }
 
 fn DeviceDescriptionScalar(
@@ -211,19 +242,19 @@ const MemoryStats = struct {
     }
 
     fn writeCore(self: MemoryStats) void {
-        self.args.bytes_in_use = state.clampI64(self.stats.totalBytesInUse());
-        self.args.peak_bytes_in_use = state.clampI64(self.stats.peakTotalBytesInUse());
+        self.args.bytes_in_use = state.Scalar.clampI64(self.stats.totalBytesInUse());
+        self.args.peak_bytes_in_use = state.Scalar.clampI64(self.stats.peakTotalBytesInUse());
         self.args.peak_bytes_in_use_is_set = true;
-        self.args.num_allocs = state.clampI64(self.stats.live_allocs +| self.stats.executable_cache_resident_entries);
+        self.args.num_allocs = state.Scalar.clampI64(self.stats.live_allocs +| self.stats.executable_cache_resident_entries);
         self.args.num_allocs_is_set = true;
-        self.args.largest_alloc_size = state.clampI64(@max(self.stats.largest_alloc_size, self.stats.executable_cache_largest_resident_bytes));
+        self.args.largest_alloc_size = state.Scalar.clampI64(@max(self.stats.largest_alloc_size, self.stats.executable_cache_largest_resident_bytes));
         self.args.largest_alloc_size_is_set = true;
     }
 
     fn writeCapacity(self: MemoryStats) void {
-        self.args.bytes_limit = state.clampI64(self.stats.capacity_bytes);
+        self.args.bytes_limit = state.Scalar.clampI64(self.stats.capacity_bytes);
         self.args.bytes_limit_is_set = true;
-        self.args.largest_free_block_bytes = state.clampI64(self.freeBytes());
+        self.args.largest_free_block_bytes = state.Scalar.clampI64(self.freeBytes());
         self.args.largest_free_block_bytes_is_set = true;
         self.args.bytes_reservable_limit = self.args.largest_free_block_bytes;
         self.args.bytes_reservable_limit_is_set = true;
@@ -298,33 +329,6 @@ fn MemoryCallback(comptime Args: type, comptime op: MemoryOp) type {
     };
 }
 
-pub fn deviceAttributesDelete(device_attributes: ?*c.PJRT_Device_Attributes) callconv(.c) void {
-    if (device_attributes) |opaque_attrs| allocator.destroy(DeviceAttributesHandle.view(opaque_attrs));
-}
-
-pub const DeviceDescriptionApi = struct {
-    pub const Id = DeviceDescriptionScalar(c.PJRT_DeviceDescription_Id_Args, "id", .id).call;
-    pub const ProcessIndex = DeviceDescriptionScalar(c.PJRT_DeviceDescription_ProcessIndex_Args, "process_index", .process_index).call;
-    pub const Attributes = DeviceDescriptionCallback(c.PJRT_DeviceDescription_Attributes_Args, .attributes).call;
-    pub const Kind = DeviceDescriptionText(c.PJRT_DeviceDescription_Kind_Args, "device_kind", "device_kind_size", .kind).call;
-    pub const DebugString = DeviceDescriptionText(c.PJRT_DeviceDescription_DebugString_Args, "debug_string", "debug_string_size", .debug_string).call;
-    pub const ToString = DeviceDescriptionText(c.PJRT_DeviceDescription_ToString_Args, "to_string", "to_string_size", .debug_string).call;
-};
-
-pub const DeviceApi = struct {
-    pub const GetDescription = DeviceCallback(c.PJRT_Device_GetDescription_Args, .description).call;
-    pub const IsAddressable = DeviceCallback(c.PJRT_Device_IsAddressable_Args, .is_addressable).call;
-    pub const LocalHardwareId = DeviceCallback(c.PJRT_Device_LocalHardwareId_Args, .local_hardware_id).call;
-    pub const AddressableMemories = DeviceCallback(c.PJRT_Device_AddressableMemories_Args, .addressable_memories).call;
-    pub const DefaultMemory = DeviceCallback(c.PJRT_Device_DefaultMemory_Args, .default_memory).call;
-    pub const MemoryStats = DeviceCallback(c.PJRT_Device_MemoryStats_Args, .memory_stats).call;
-    pub const GetAttributes = DeviceCallback(c.PJRT_Device_GetAttributes_Args, .attributes).call;
-};
-
-pub const MemoryApi = struct {
-    pub const Id = MemoryCallback(c.PJRT_Memory_Id_Args, .id).call;
-    pub const Kind = MemoryText(c.PJRT_Memory_Kind_Args, "kind", "kind_size", .kind).call;
-    pub const DebugString = MemoryText(c.PJRT_Memory_DebugString_Args, "debug_string", "debug_string_size", .debug_string).call;
-    pub const ToString = MemoryText(c.PJRT_Memory_ToString_Args, "to_string", "to_string_size", .debug_string).call;
-    pub const AddressableByDevices = MemoryCallback(c.PJRT_Memory_AddressableByDevices_Args, .addressable_devices).call;
-};
+pub const DeviceDescriptionApi = DeviceDescription.Api;
+pub const DeviceApi = Device.Api;
+pub const MemoryApi = Memory.Api;

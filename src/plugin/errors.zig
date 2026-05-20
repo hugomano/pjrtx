@@ -48,7 +48,7 @@ fn ErrorVoidCallback(comptime Args: type, comptime op: ErrorOp) type {
             const args = &raw[0];
             const err = ErrorView.atConst(args.@"error");
             switch (op) {
-                .message => abi.writeBytes("message", "message_size", args, err.message()),
+                .message => abi.Args.writeBytes("message", "message_size", args, err.message()),
                 .code => @compileError("PJRT error code callback returns PJRT_Error"),
             }
         }
@@ -93,8 +93,8 @@ fn PluginCallback(comptime Args: type, comptime op: PluginOp) type {
             switch (op) {
                 .initialize => {},
                 .attributes => {
-                    const attrs = state.initAttrs();
-                    raw[0].attributes = abi.namedValuePtr(attrs);
+                    const attrs = state.Attributes.init();
+                    raw[0].attributes = abi.NamedValue.ptr(attrs);
                     raw[0].num_attributes = attrs.len;
                 },
             }
@@ -103,48 +103,68 @@ fn PluginCallback(comptime Args: type, comptime op: PluginOp) type {
     };
 }
 
-pub fn makeError(code: c.PJRT_Error_Code, message: []const u8) ?*c.PJRT_Error {
-    const err = allocator.create(PjrtxError) catch return null;
-    err.* = .{
-        .base = .{ .vtable = null },
-        .code = code,
-        .message = allocator.dupe(u8, message) catch {
-            allocator.destroy(err);
-            return null;
-        },
+pub const Error = struct {
+    pub const Api = struct {
+        pub const Destroy = ErrorDestroyCallback(c.PJRT_Error_Destroy_Args).call;
+        pub const Message = ErrorVoidCallback(c.PJRT_Error_Message_Args, .message).call;
+        pub const GetCode = ErrorCallback(c.PJRT_Error_GetCode_Args, .code).call;
+        pub const ForEachPayload = ErrorPayloadCallback(c.PJRT_Error_ForEachPayload_Args).call;
     };
-    return ErrorHandle.handle(err);
-}
-pub fn errorCode(raw: ?*c.PJRT_Error) c.PJRT_Error_Code {
-    const err = raw orelse return c.PJRT_Error_Code_OK;
-    return ErrorView.atConst(err).code();
-}
-pub fn invalidArgument(message: []const u8) ?*c.PJRT_Error {
-    return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, message);
-}
-pub fn failedPrecondition(message: []const u8) ?*c.PJRT_Error {
-    return makeError(c.PJRT_Error_Code_FAILED_PRECONDITION, message);
-}
-pub fn internal(message: []const u8) ?*c.PJRT_Error {
-    return makeError(c.PJRT_Error_Code_INTERNAL, message);
-}
-pub fn notFound(message: []const u8) ?*c.PJRT_Error {
-    return makeError(c.PJRT_Error_Code_NOT_FOUND, message);
-}
-pub fn resourceExhausted(message: []const u8) ?*c.PJRT_Error {
-    return makeError(c.PJRT_Error_Code_RESOURCE_EXHAUSTED, message);
-}
-pub fn unimplemented(message: []const u8) ?*c.PJRT_Error {
-    return makeError(c.PJRT_Error_Code_UNIMPLEMENTED, message);
-}
-pub const ErrorApi = struct {
-    pub const Destroy = ErrorDestroyCallback(c.PJRT_Error_Destroy_Args).call;
-    pub const Message = ErrorVoidCallback(c.PJRT_Error_Message_Args, .message).call;
-    pub const GetCode = ErrorCallback(c.PJRT_Error_GetCode_Args, .code).call;
-    pub const ForEachPayload = ErrorPayloadCallback(c.PJRT_Error_ForEachPayload_Args).call;
+
+    pub fn make(code_: c.PJRT_Error_Code, message_: []const u8) ?*c.PJRT_Error {
+        const err = allocator.create(PjrtxError) catch return null;
+        err.* = .{
+            .base = .{ .vtable = null },
+            .code = code_,
+            .message = allocator.dupe(u8, message_) catch {
+                allocator.destroy(err);
+                return null;
+            },
+        };
+        return ErrorHandle.handle(err);
+    }
+
+    pub fn code(raw: ?*c.PJRT_Error) c.PJRT_Error_Code {
+        const err = raw orelse return c.PJRT_Error_Code_OK;
+        return ErrorView.atConst(err).code();
+    }
+
+    pub fn message(raw: ?*c.PJRT_Error) ?[]const u8 {
+        const err = raw orelse return null;
+        return ErrorView.atConst(err).message();
+    }
+
+    pub fn invalidArgument(message_: []const u8) ?*c.PJRT_Error {
+        return make(c.PJRT_Error_Code_INVALID_ARGUMENT, message_);
+    }
+
+    pub fn failedPrecondition(message_: []const u8) ?*c.PJRT_Error {
+        return make(c.PJRT_Error_Code_FAILED_PRECONDITION, message_);
+    }
+
+    pub fn internal(message_: []const u8) ?*c.PJRT_Error {
+        return make(c.PJRT_Error_Code_INTERNAL, message_);
+    }
+
+    pub fn notFound(message_: []const u8) ?*c.PJRT_Error {
+        return make(c.PJRT_Error_Code_NOT_FOUND, message_);
+    }
+
+    pub fn resourceExhausted(message_: []const u8) ?*c.PJRT_Error {
+        return make(c.PJRT_Error_Code_RESOURCE_EXHAUSTED, message_);
+    }
+
+    pub fn unimplemented(message_: []const u8) ?*c.PJRT_Error {
+        return make(c.PJRT_Error_Code_UNIMPLEMENTED, message_);
+    }
 };
 
-pub const PluginApi = struct {
-    pub const Initialize = PluginCallback(c.PJRT_Plugin_Initialize_Args, .initialize).call;
-    pub const Attributes = PluginCallback(c.PJRT_Plugin_Attributes_Args, .attributes).call;
+pub const Plugin = struct {
+    pub const Api = struct {
+        pub const Initialize = PluginCallback(c.PJRT_Plugin_Initialize_Args, .initialize).call;
+        pub const Attributes = PluginCallback(c.PJRT_Plugin_Attributes_Args, .attributes).call;
+    };
 };
+
+pub const ErrorApi = Error.Api;
+pub const PluginApi = Plugin.Api;

@@ -18,24 +18,15 @@ const Executable = state.Executable;
 const LoadedExecutableHandle = abi.LoadedExecutable(Executable);
 const AsyncHostToDeviceTransferManager = async_h2d.AsyncHostToDeviceTransferManager;
 const ShapeSpec = async_h2d.ShapeSpec;
-const asyncH2DHandle = async_h2d.asyncH2DHandle;
-const makeError = errors.makeError;
-const internal = errors.internal;
-const invalidArgument = errors.invalidArgument;
-const notFound = errors.notFound;
-const unimplemented = errors.unimplemented;
-const eventCreatePending = events.eventCreatePending;
-const eventSetReady = events.eventSetReady;
-const denseByteSize = types.denseByteSize;
-const fillMemoryKindArrays = types.fillMemoryKindArrays;
-const runtimeTypeFromPjrt = types.runtimeTypeFromPjrt;
-const executableCacheMaxBytesFromEnv = trace_mod.executableCacheMaxBytesFromEnv;
+const PjrtError = errors.Error;
+const PjrtEvent = events.Event;
+const executableCacheMaxBytesFromEnv = trace_mod.Env.executableCacheMaxBytes;
 
 const ClientCreateConfig = struct {
     backend_kind: runtime.BackendKind = .metal_mlx,
 };
 
-pub fn clientCreateConfigFromArgs(args: c.PJRT_Client_Create_Args) !ClientCreateConfig {
+fn clientCreateConfigFromArgs(args: c.PJRT_Client_Create_Args) !ClientCreateConfig {
     var config: ClientCreateConfig = .{};
     if (args.create_options != null) {
         for (0..args.num_options) |i| {
@@ -56,6 +47,27 @@ pub fn clientCreateConfigFromArgs(args: c.PJRT_Client_Create_Args) !ClientCreate
 }
 const ClientView = struct {
     ptr: *runtime.Client,
+
+    const Api = struct {
+        pub const Create = ClientCreate.call;
+        pub const Destroy = ClientDestroy.call;
+        pub const PlatformName = ClientTextCallback(c.PJRT_Client_PlatformName_Args, "platform_name", "platform_name_size", .platform_name).call;
+        pub const ProcessIndex = ClientProcessIndex.call;
+        pub const PlatformVersion = ClientTextCallback(c.PJRT_Client_PlatformVersion_Args, "platform_version", "platform_version_size", .platform_version).call;
+        pub const TopologyDescription = ClientTopologyDescription.call;
+        pub const Devices = ClientDeviceListCallback(c.PJRT_Client_Devices_Args, "devices", "num_devices").call;
+        pub const AddressableDevices = ClientDeviceListCallback(c.PJRT_Client_AddressableDevices_Args, "addressable_devices", "num_addressable_devices").call;
+        pub const LookupDevice = ClientLookupDevice.call;
+        pub const LookupAddressableDevice = ClientLookupAddressableDevice.call;
+        pub const AddressableMemories = ClientAddressableMemories.call;
+        pub const Compile = ClientCompile.call;
+        pub const DefaultDeviceAssignment = ClientDefaultDeviceAssignment.call;
+        pub const BufferFromHostBuffer = ClientBufferFromHostBuffer.call;
+        pub const CreateUninitializedBuffer = ClientCreateUninitializedBuffer.call;
+        pub const CreateBuffersForAsyncHostToDevice = ClientCreateBuffersForAsyncHostToDevice.call;
+        pub const DmaMap = ClientDmaMap.call;
+        pub const DmaUnmap = ClientDmaUnmap.call;
+    };
 
     fn at(raw: anytype) ClientView {
         return .{ .ptr = abi.Client.view(raw) };
@@ -102,7 +114,7 @@ fn ClientTextCallback(
     return struct {
         fn call(raw: [*c]Args) callconv(.c) ?*c.PJRT_Error {
             const client = ClientView.at(raw[0].client);
-            abi.writeBytes(ptr_field, size_field, &raw[0], switch (text) {
+            abi.Args.writeBytes(ptr_field, size_field, &raw[0], switch (text) {
                 .platform_name => client.platformName(),
                 .platform_version => client.platformVersion(),
             });
@@ -131,7 +143,7 @@ const BufferPlacement = struct {
     fn forHostBuffer(client: *runtime.Client, device_arg: ?*c.PJRT_Device, memory_arg: ?*c.PJRT_Memory) ?BufferPlacement {
         const device = if (device_arg) |dev| abi.Device.view(dev) else &client.devices[0];
         const memory = if (memory_arg) |mem| abi.Memory.view(mem) else device.default_memory;
-        const shard_index = abi.deviceIndex(client, device) orelse return null;
+        const shard_index = abi.Placement.deviceIndex(client, device) orelse return null;
         return .{
             .client = client,
             .device = device,
@@ -149,7 +161,7 @@ const BufferPlacement = struct {
             if (memory.addressable_devices.len == 0) return error.MemoryHasNoDevices;
             break :blk memory.addressable_devices[0];
         };
-        const shard_index = abi.deviceIndex(client, device) orelse return error.DeviceNotInClient;
+        const shard_index = abi.Placement.deviceIndex(client, device) orelse return error.DeviceNotInClient;
         if (!memory.isAddressableBy(device)) return error.MemoryNotAddressable;
         return .{
             .client = client,
@@ -172,16 +184,16 @@ const HostBufferRequest = struct {
     fn decode(raw: *allowzero c.PJRT_Client_BufferFromHostBuffer_Args, out: *HostBufferRequest) ?*c.PJRT_Error {
         const client = abi.Client.view(raw.client);
         const placement = BufferPlacement.forHostBuffer(client, raw.device, raw.memory) orelse {
-            return invalidArgument("buffer device does not belong to client");
+            return PjrtError.invalidArgument("buffer device does not belong to client");
         };
         const dims = raw.dims[0..raw.num_dims];
-        const byte_size = denseByteSize(raw.type, dims);
+        const byte_size = types.BufferType.denseByteSize(raw.type, dims);
         out.* = .{
             .placement = placement,
-            .element_type = runtimeTypeFromPjrt(raw.type),
+            .element_type = types.BufferType.fromPjrt(raw.type),
             .dims = dims,
             .byte_size = byte_size,
-            .data = abi.constBytes(raw.data, byte_size) orelse return invalidArgument("source buffer data is null"),
+            .data = abi.Slice.constBytes(raw.data, byte_size) orelse return PjrtError.invalidArgument("source buffer data is null"),
         };
         return null;
     }
@@ -196,15 +208,15 @@ const DeviceBufferRequest = struct {
     fn decode(raw: *allowzero c.PJRT_Client_CreateUninitializedBuffer_Args, out: *DeviceBufferRequest) ?*c.PJRT_Error {
         const client = abi.Client.view(raw.client);
         const placement = BufferPlacement.forDeviceBuffer(client, raw.device, raw.memory) catch |err| return switch (err) {
-            error.MemoryHasNoDevices => invalidArgument("memory is not addressable by any device"),
-            error.DeviceNotInClient => invalidArgument("buffer device does not belong to client"),
-            error.MemoryNotAddressable => invalidArgument("memory is not addressable by requested device"),
+            error.MemoryHasNoDevices => PjrtError.invalidArgument("memory is not addressable by any device"),
+            error.DeviceNotInClient => PjrtError.invalidArgument("buffer device does not belong to client"),
+            error.MemoryNotAddressable => PjrtError.invalidArgument("memory is not addressable by requested device"),
         };
         const dims = raw.shape_dims[0..raw.shape_num_dims];
-        const byte_size = denseByteSize(raw.shape_element_type, dims);
+        const byte_size = types.BufferType.denseByteSize(raw.shape_element_type, dims);
         out.* = .{
             .placement = placement,
-            .element_type = runtimeTypeFromPjrt(raw.shape_element_type),
+            .element_type = types.BufferType.fromPjrt(raw.shape_element_type),
             .dims = dims,
             .byte_size = byte_size,
         };
@@ -234,7 +246,7 @@ const CompileCall = struct {
 
     fn fail(err: runtime.CompileProgramError, diagnostics: []const u8) ?*c.PJRT_Error {
         const text = if (diagnostics.len != 0) diagnostics else defaultErrorMessage(err);
-        return makeError(errorCode(err), text);
+        return PjrtError.make(errorCode(err), text);
     }
 
     fn errorCode(err: runtime.CompileProgramError) c.PJRT_Error_Code {
@@ -264,14 +276,14 @@ const CompileCall = struct {
 const ClientCreate = struct {
     fn call(args: [*c]c.PJRT_Client_Create_Args) callconv(.c) ?*c.PJRT_Error {
         const config = clientCreateConfigFromArgs(args[0]) catch {
-            return invalidArgument("invalid PjRTx client create option");
+            return PjrtError.invalidArgument("invalid PjRTx client create option");
         };
         const client = runtime.createClient(allocator, .{
             .backend_kind = config.backend_kind,
             .device_count = 1,
             .executable_cache_max_resident_bytes = executableCacheMaxBytesFromEnv(),
         }) catch {
-            return internal("failed to create PjRTx client");
+            return PjrtError.internal("failed to create PjRTx client");
         };
         args[0].client = abi.Client.handle(client);
         return null;
@@ -301,7 +313,7 @@ const ClientTopologyDescription = struct {
 
 const ClientLookupDevice = struct {
     fn call(args: [*c]c.PJRT_Client_LookupDevice_Args) callconv(.c) ?*c.PJRT_Error {
-        const device = ClientView.at(args[0].client).lookupDevice(args[0].id) orelse return notFound("device id not found");
+        const device = ClientView.at(args[0].client).lookupDevice(args[0].id) orelse return PjrtError.notFound("device id not found");
         args[0].device = abi.Device.handle(@constCast(device));
         return null;
     }
@@ -309,7 +321,7 @@ const ClientLookupDevice = struct {
 
 const ClientLookupAddressableDevice = struct {
     fn call(args: [*c]c.PJRT_Client_LookupAddressableDevice_Args) callconv(.c) ?*c.PJRT_Error {
-        const device = ClientView.at(args[0].client).lookupDevice(args[0].local_hardware_id) orelse return notFound("local hardware id not found");
+        const device = ClientView.at(args[0].client).lookupDevice(args[0].local_hardware_id) orelse return PjrtError.notFound("local hardware id not found");
         args[0].addressable_device = abi.Device.handle(@constCast(device));
         return null;
     }
@@ -339,7 +351,7 @@ const ClientCompile = struct {
 
         const plan = compiled.plan;
 
-        const logical_ids = allocator.alloc(c.PJRT_LogicalDeviceIds, plan.options.numDevices()) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable logical device ids");
+        const logical_ids = allocator.alloc(c.PJRT_LogicalDeviceIds, plan.options.numDevices()) catch return PjrtError.make(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable logical device ids");
         errdefer allocator.free(logical_ids);
         for (logical_ids, 0..) |*id, index| {
             id.* = .{
@@ -348,19 +360,19 @@ const ClientCompile = struct {
             };
         }
 
-        const parameter_memory_kinds = allocator.alloc([*c]const u8, plan.parameter_shardings.len) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate parameter memory kind table");
+        const parameter_memory_kinds = allocator.alloc([*c]const u8, plan.parameter_shardings.len) catch return PjrtError.make(c.PJRT_Error_Code_INTERNAL, "failed to allocate parameter memory kind table");
         errdefer allocator.free(parameter_memory_kinds);
-        const parameter_memory_kind_sizes = allocator.alloc(usize, plan.parameter_shardings.len) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate parameter memory kind sizes");
+        const parameter_memory_kind_sizes = allocator.alloc(usize, plan.parameter_shardings.len) catch return PjrtError.make(c.PJRT_Error_Code_INTERNAL, "failed to allocate parameter memory kind sizes");
         errdefer allocator.free(parameter_memory_kind_sizes);
-        fillMemoryKindArrays(parameter_memory_kinds, parameter_memory_kind_sizes);
+        types.MemoryKind.fillDefault(parameter_memory_kinds, parameter_memory_kind_sizes);
 
-        const output_memory_kinds = allocator.alloc([*c]const u8, plan.output_shardings.len) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate output memory kind table");
+        const output_memory_kinds = allocator.alloc([*c]const u8, plan.output_shardings.len) catch return PjrtError.make(c.PJRT_Error_Code_INTERNAL, "failed to allocate output memory kind table");
         errdefer allocator.free(output_memory_kinds);
-        const output_memory_kind_sizes = allocator.alloc(usize, plan.output_shardings.len) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate output memory kind sizes");
+        const output_memory_kind_sizes = allocator.alloc(usize, plan.output_shardings.len) catch return PjrtError.make(c.PJRT_Error_Code_INTERNAL, "failed to allocate output memory kind sizes");
         errdefer allocator.free(output_memory_kind_sizes);
-        fillMemoryKindArrays(output_memory_kinds, output_memory_kind_sizes);
+        types.MemoryKind.fillDefault(output_memory_kinds, output_memory_kind_sizes);
 
-        const executable = allocator.create(Executable) catch return makeError(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable");
+        const executable = allocator.create(Executable) catch return PjrtError.make(c.PJRT_Error_Code_INTERNAL, "failed to allocate executable");
         executable.* = .{
             .client = client,
             .plan = compiled.plan,
@@ -382,7 +394,7 @@ const ClientDefaultDeviceAssignment = struct {
         const client = abi.Client.view(args[0].client);
         const needed: usize = @intCast(args[0].num_replicas * args[0].num_partitions);
         if (needed > client.devices.len or needed > args[0].default_assignment_size) {
-            return makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "invalid default device assignment request");
+            return PjrtError.make(c.PJRT_Error_Code_INVALID_ARGUMENT, "invalid default device assignment request");
         }
         for (0..needed) |i| args[0].default_assignment[i] = @intCast(i);
         return null;
@@ -397,13 +409,13 @@ const ClientBufferFromHostBuffer = struct {
         _ = placement.client.trimExecutableCacheForAllocation(placement.memory, request.byte_size);
         const buffer = placement.client.createHostBufferFromBytes(allocator, request.element_type, request.dims, placement.device, placement.memory, placement.shard_index, request.data) catch |err| {
             return switch (err) {
-                error.InvalidArgument => makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "memory is not addressable by requested device"),
-                else => makeError(c.PJRT_Error_Code_INTERNAL, "failed to create host buffer copy"),
+                error.InvalidArgument => PjrtError.make(c.PJRT_Error_Code_INVALID_ARGUMENT, "memory is not addressable by requested device"),
+                else => PjrtError.make(c.PJRT_Error_Code_INTERNAL, "failed to create host buffer copy"),
             };
         };
         args[0].buffer = abi.Buffer.handle(buffer);
-        args[0].done_with_host_buffer = eventCreatePending();
-        eventSetReady(args[0].done_with_host_buffer);
+        args[0].done_with_host_buffer = PjrtEvent.pending();
+        PjrtEvent.setReady(args[0].done_with_host_buffer);
         return null;
     }
 };
@@ -416,9 +428,9 @@ const ClientCreateUninitializedBuffer = struct {
         _ = placement.client.trimExecutableCacheForAllocation(placement.memory, request.byte_size);
         const buffer = placement.client.createDeviceBuffer(allocator, request.element_type, request.dims, placement.device, placement.memory, placement.shard_index) catch |err| {
             return switch (err) {
-                error.InvalidArgument => makeError(c.PJRT_Error_Code_INVALID_ARGUMENT, "memory is not addressable by requested device"),
-                error.UnsupportedElementType, error.UnsupportedRuntimeFeature => makeError(c.PJRT_Error_Code_UNIMPLEMENTED, "backend cannot allocate requested buffer type"),
-                else => makeError(c.PJRT_Error_Code_INTERNAL, "failed to create device buffer"),
+                error.InvalidArgument => PjrtError.make(c.PJRT_Error_Code_INVALID_ARGUMENT, "memory is not addressable by requested device"),
+                error.UnsupportedElementType, error.UnsupportedRuntimeFeature => PjrtError.make(c.PJRT_Error_Code_UNIMPLEMENTED, "backend cannot allocate requested buffer type"),
+                else => PjrtError.make(c.PJRT_Error_Code_INTERNAL, "failed to create device buffer"),
             };
         };
         args[0].buffer = abi.Buffer.handle(buffer);
@@ -431,22 +443,22 @@ const ClientCreateBuffersForAsyncHostToDevice = struct {
         const client = abi.Client.view(args[0].client);
         const memory = if (args[0].memory) |mem| abi.Memory.view(mem) else client.devices[0].default_memory;
         if (args[0].shape_specs == null and args[0].num_shape_specs != 0) {
-            return invalidArgument("shape specs are null");
+            return PjrtError.invalidArgument("shape specs are null");
         }
         const raw_shape_specs = args[0].shape_specs[0..args[0].num_shape_specs];
         const shape_specs = allocator.alloc(ShapeSpec, raw_shape_specs.len) catch {
-            return internal("failed to allocate async shape specs");
+            return PjrtError.internal("failed to allocate async shape specs");
         };
         defer allocator.free(shape_specs);
         for (raw_shape_specs, shape_specs) |raw, *shape_spec| shape_spec.* = ShapeSpec.fromPjrt(raw);
         const manager = AsyncHostToDeviceTransferManager.create(client, memory, shape_specs) catch |err| {
             return switch (err) {
-                error.InvalidArgument => invalidArgument("memory is not addressable by any device"),
-                error.UnsupportedRuntimeFeature, error.UnsupportedElementType => unimplemented("backend cannot allocate async transfer buffer"),
-                else => internal("failed to create async host-to-device transfer manager"),
+                error.InvalidArgument => PjrtError.invalidArgument("memory is not addressable by any device"),
+                error.UnsupportedRuntimeFeature, error.UnsupportedElementType => PjrtError.unimplemented("backend cannot allocate async transfer buffer"),
+                else => PjrtError.internal("failed to create async host-to-device transfer manager"),
             };
         };
-        args[0].transfer_manager = asyncH2DHandle(manager);
+        args[0].transfer_manager = AsyncHostToDeviceTransferManager.handle(manager);
         return null;
     }
 };
@@ -463,23 +475,4 @@ const ClientDmaUnmap = struct {
     }
 };
 
-pub const Api = struct {
-    pub const Create = ClientCreate.call;
-    pub const Destroy = ClientDestroy.call;
-    pub const PlatformName = ClientTextCallback(c.PJRT_Client_PlatformName_Args, "platform_name", "platform_name_size", .platform_name).call;
-    pub const ProcessIndex = ClientProcessIndex.call;
-    pub const PlatformVersion = ClientTextCallback(c.PJRT_Client_PlatformVersion_Args, "platform_version", "platform_version_size", .platform_version).call;
-    pub const TopologyDescription = ClientTopologyDescription.call;
-    pub const Devices = ClientDeviceListCallback(c.PJRT_Client_Devices_Args, "devices", "num_devices").call;
-    pub const AddressableDevices = ClientDeviceListCallback(c.PJRT_Client_AddressableDevices_Args, "addressable_devices", "num_addressable_devices").call;
-    pub const LookupDevice = ClientLookupDevice.call;
-    pub const LookupAddressableDevice = ClientLookupAddressableDevice.call;
-    pub const AddressableMemories = ClientAddressableMemories.call;
-    pub const Compile = ClientCompile.call;
-    pub const DefaultDeviceAssignment = ClientDefaultDeviceAssignment.call;
-    pub const BufferFromHostBuffer = ClientBufferFromHostBuffer.call;
-    pub const CreateUninitializedBuffer = ClientCreateUninitializedBuffer.call;
-    pub const CreateBuffersForAsyncHostToDevice = ClientCreateBuffersForAsyncHostToDevice.call;
-    pub const DmaMap = ClientDmaMap.call;
-    pub const DmaUnmap = ClientDmaUnmap.call;
-};
+pub const Api = ClientView.Api;

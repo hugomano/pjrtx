@@ -4,22 +4,13 @@ const runtime = @import("src/runtime");
 const c = @import("c");
 const abi = @import("pjrt_abi.zig");
 const errors = @import("errors.zig");
+const PjrtError = errors.Error;
 const events = @import("events.zig");
 const state = @import("state.zig");
 const types = @import("types.zig");
 
 const allocator = state.allocator;
-const failedPrecondition = errors.failedPrecondition;
-const internal = errors.internal;
-const invalidArgument = errors.invalidArgument;
-const resourceExhausted = errors.resourceExhausted;
-const unimplemented = errors.unimplemented;
-const eventCreatePending = events.eventCreatePending;
-const eventSetFailed = events.eventSetFailed;
-const eventSetReady = events.eventSetReady;
-const copyBytesWithIo = types.copyBytesWithIo;
-const denseByteSize = types.denseByteSize;
-const runtimeTypeFromPjrt = types.runtimeTypeFromPjrt;
+const PjrtEvent = events.Event;
 const ManagerHandle = abi.AsyncHostToDeviceTransferManager(AsyncHostToDeviceTransferManager);
 
 const TransferIndex = struct {
@@ -41,7 +32,7 @@ const DataTransferRequest = struct {
     is_last: bool,
 
     fn init(raw: *allowzero c.PJRT_AsyncHostToDeviceTransferManager_TransferData_Args) DecodeError!DataTransferRequest {
-        const manager = asyncH2DManager(raw.transfer_manager);
+        const manager = AsyncHostToDeviceTransferManager.at(raw.transfer_manager);
         const index = manager.index(raw.buffer_index) catch return error.InvalidIndex;
         if (raw.offset < 0 or raw.transfer_size < 0) return error.NegativeRange;
         const offset: usize = @intCast(raw.offset);
@@ -52,18 +43,18 @@ const DataTransferRequest = struct {
             .manager = manager,
             .index = index,
             .offset = offset,
-            .bytes = abi.constBytes(raw.data, transfer_size) orelse return error.NullData,
+            .bytes = abi.Slice.constBytes(raw.data, transfer_size) orelse return error.NullData,
             .is_last = raw.is_last_transfer,
         };
     }
 
     fn decodeError(err: DecodeError) ?*c.PJRT_Error {
         return switch (err) {
-            error.InvalidIndex => invalidArgument("async transfer buffer index is out of range"),
-            error.NegativeRange => invalidArgument("async transfer offset and size must be non-negative"),
-            error.NullData => invalidArgument("async transfer data is null"),
-            error.RangeTooLarge => invalidArgument("async transfer range exceeds buffer size"),
-            error.SizeMismatch => invalidArgument("async literal size does not match target buffer"),
+            error.InvalidIndex => PjrtError.invalidArgument("async transfer buffer index is out of range"),
+            error.NegativeRange => PjrtError.invalidArgument("async transfer offset and size must be non-negative"),
+            error.NullData => PjrtError.invalidArgument("async transfer data is null"),
+            error.RangeTooLarge => PjrtError.invalidArgument("async transfer range exceeds buffer size"),
+            error.SizeMismatch => PjrtError.invalidArgument("async literal size does not match target buffer"),
         };
     }
 
@@ -76,16 +67,16 @@ const LiteralTransferRequest = struct {
     bytes: []const u8,
 
     fn init(raw: *allowzero c.PJRT_AsyncHostToDeviceTransferManager_TransferLiteral_Args) DataTransferRequest.DecodeError!LiteralTransferRequest {
-        const manager = asyncH2DManager(raw.transfer_manager);
+        const manager = AsyncHostToDeviceTransferManager.at(raw.transfer_manager);
         const index = manager.index(raw.buffer_index) catch return error.InvalidIndex;
         const dims = raw.shape_dims[0..raw.shape_num_dims];
-        const byte_size = denseByteSize(raw.shape_element_type, dims);
+        const byte_size = types.BufferType.denseByteSize(raw.shape_element_type, dims);
         if (byte_size != manager.bufferByteSize(index)) return error.SizeMismatch;
         if (raw.data == null and byte_size != 0) return error.NullData;
         return .{
             .manager = manager,
             .index = index,
-            .bytes = abi.constBytes(raw.data, byte_size) orelse return error.NullData,
+            .bytes = abi.Slice.constBytes(raw.data, byte_size) orelse return error.NullData,
         };
     }
 };
@@ -94,8 +85,8 @@ const CompletionEvent = struct {
     slot: *allowzero ?*c.PJRT_Event,
 
     fn create(slot: *allowzero ?*c.PJRT_Event) ?*c.PJRT_Error {
-        slot.* = eventCreatePending();
-        if (slot.* == null) return resourceExhausted("failed to allocate async transfer event");
+        slot.* = PjrtEvent.pending();
+        if (slot.* == null) return PjrtError.resourceExhausted("failed to allocate async transfer event");
         return null;
     }
 
@@ -104,11 +95,11 @@ const CompletionEvent = struct {
     }
 
     fn fail(self: CompletionEvent, message: []const u8) void {
-        eventSetFailed(self.slot.*, message);
+        PjrtEvent.setFailed(self.slot.*, message);
     }
 
     fn ready(self: CompletionEvent) void {
-        eventSetReady(self.slot.*);
+        PjrtEvent.setReady(self.slot.*);
     }
 };
 
@@ -120,9 +111,9 @@ pub const ShapeSpec = struct {
     pub fn fromPjrt(raw: c.PJRT_ShapeSpec) ShapeSpec {
         const dims = raw.dims[0..raw.num_dims];
         return .{
-            .element_type = runtimeTypeFromPjrt(raw.element_type),
+            .element_type = types.BufferType.fromPjrt(raw.element_type),
             .dims = dims,
-            .byte_size = denseByteSize(raw.element_type, dims),
+            .byte_size = types.BufferType.denseByteSize(raw.element_type, dims),
         };
     }
 };
@@ -139,10 +130,30 @@ pub const AsyncHostToDeviceTransferManager = struct {
     retrieved: []bool,
     completed: []bool,
 
+    pub const Api = struct {
+        pub const Destroy = ManagerDestroy.call;
+        pub const TransferData = AsyncTransferData.call;
+        pub const RetrieveBuffer = AsyncRetrieveBuffer.call;
+        pub const Device = AsyncDevice.call;
+        pub const BufferCount = AsyncBufferCount.call;
+        pub const BufferSize = AsyncBufferSize.call;
+        pub const SetBufferError = AsyncSetBufferError.call;
+        pub const AddMetadata = AsyncAddMetadata.call;
+        pub const TransferLiteral = AsyncTransferLiteral.call;
+    };
+
+    pub fn at(manager: ?*c.PJRT_AsyncHostToDeviceTransferManager) *AsyncHostToDeviceTransferManager {
+        return ManagerHandle.view(manager);
+    }
+
+    pub fn handle(manager: *AsyncHostToDeviceTransferManager) *c.PJRT_AsyncHostToDeviceTransferManager {
+        return ManagerHandle.handle(manager);
+    }
+
     pub fn create(client: *runtime.Client, memory: *runtime.Memory, shape_specs: []const ShapeSpec) !*AsyncHostToDeviceTransferManager {
         if (memory.addressable_devices.len == 0) return error.InvalidArgument;
         const device = memory.addressable_devices[0];
-        const shard_index = abi.deviceIndex(client, device) orelse return error.InvalidArgument;
+        const shard_index = abi.Placement.deviceIndex(client, device) orelse return error.InvalidArgument;
 
         const manager = try allocator.create(AsyncHostToDeviceTransferManager);
         errdefer allocator.destroy(manager);
@@ -247,7 +258,7 @@ pub const AsyncHostToDeviceTransferManager = struct {
         if (self.backend_transfers[i]) |transfer| {
             try self.client.writeAsyncHostToDeviceTransfer(transfer, offset, bytes);
         } else {
-            try copyBytesWithIo(self.staging[i][offset .. offset + bytes.len], bytes);
+            try types.Bytes.copy(self.staging[i][offset .. offset + bytes.len], bytes);
         }
         self.written[i] = @max(self.written[i], offset + bytes.len);
     }
@@ -287,16 +298,9 @@ pub const AsyncHostToDeviceTransferManager = struct {
     }
 };
 
-pub fn asyncH2DManager(manager: ?*c.PJRT_AsyncHostToDeviceTransferManager) *AsyncHostToDeviceTransferManager {
-    return ManagerHandle.view(manager);
-}
-pub fn asyncH2DHandle(manager: *AsyncHostToDeviceTransferManager) *c.PJRT_AsyncHostToDeviceTransferManager {
-    return ManagerHandle.handle(manager);
-}
-
 const ManagerDestroy = struct {
     fn call(args: [*c]c.PJRT_AsyncHostToDeviceTransferManager_Destroy_Args) callconv(.c) ?*c.PJRT_Error {
-        if (args[0].transfer_manager) |manager| asyncH2DManager(manager).deinit();
+        if (args[0].transfer_manager) |manager| AsyncHostToDeviceTransferManager.at(manager).deinit();
         return null;
     }
 };
@@ -308,8 +312,8 @@ const AsyncTransferData = struct {
 
         manager.writeBytes(request.index, request.offset, request.bytes) catch |err| {
             return switch (err) {
-                error.BufferCopyFailed => internal("backend async transfer write failed"),
-                else => internal("failed to write backend async transfer"),
+                error.BufferCopyFailed => PjrtError.internal("backend async transfer write failed"),
+                else => PjrtError.internal("failed to write backend async transfer"),
             };
         };
 
@@ -325,11 +329,11 @@ const AsyncTransferData = struct {
                 completion.fail(message);
                 manager.failBuffer(request.index, message);
                 return switch (err) {
-                    error.IncompleteTransfer => invalidArgument("async transfer completed before full buffer was written"),
-                    error.ShapeMismatch => invalidArgument("async transfer data does not match buffer shape"),
-                    error.BufferDeleted, error.BufferDonated => failedPrecondition("async transfer buffer is deleted or donated"),
-                    error.UnsupportedRuntimeFeature, error.UnsupportedElementType => unimplemented("backend cannot import async transfer buffer"),
-                    else => internal("failed to install async transfer buffer"),
+                    error.IncompleteTransfer => PjrtError.invalidArgument("async transfer completed before full buffer was written"),
+                    error.ShapeMismatch => PjrtError.invalidArgument("async transfer data does not match buffer shape"),
+                    error.BufferDeleted, error.BufferDonated => PjrtError.failedPrecondition("async transfer buffer is deleted or donated"),
+                    error.UnsupportedRuntimeFeature, error.UnsupportedElementType => PjrtError.unimplemented("backend cannot import async transfer buffer"),
+                    else => PjrtError.internal("failed to install async transfer buffer"),
                 };
             };
         }
@@ -344,7 +348,7 @@ const AsyncTransferLiteral = struct {
         const request = LiteralTransferRequest.init(&args[0]) catch |err| return DataTransferRequest.decodeError(err);
         const manager = request.manager;
         manager.writeBytes(request.index, 0, request.bytes) catch {
-            return internal("failed to write backend async transfer literal");
+            return PjrtError.internal("failed to write backend async transfer literal");
         };
         if (CompletionEvent.create(&args[0].done_with_h2d_transfer)) |err| return err;
         const completion = CompletionEvent.at(&args[0].done_with_h2d_transfer);
@@ -352,10 +356,10 @@ const AsyncTransferLiteral = struct {
             completion.fail("failed to install async transfer literal");
             manager.failBuffer(request.index, "failed to install async transfer literal");
             return switch (err) {
-                error.ShapeMismatch => invalidArgument("async literal data does not match buffer shape"),
-                error.BufferDeleted, error.BufferDonated => failedPrecondition("async literal buffer is deleted or donated"),
-                error.UnsupportedRuntimeFeature, error.UnsupportedElementType => unimplemented("backend cannot import async transfer literal"),
-                else => internal("failed to install async transfer literal"),
+                error.ShapeMismatch => PjrtError.invalidArgument("async literal data does not match buffer shape"),
+                error.BufferDeleted, error.BufferDonated => PjrtError.failedPrecondition("async literal buffer is deleted or donated"),
+                error.UnsupportedRuntimeFeature, error.UnsupportedElementType => PjrtError.unimplemented("backend cannot import async transfer literal"),
+                else => PjrtError.internal("failed to install async transfer literal"),
             };
         };
         completion.ready();
@@ -365,9 +369,9 @@ const AsyncTransferLiteral = struct {
 
 const AsyncRetrieveBuffer = struct {
     fn call(args: [*c]c.PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer_Args) callconv(.c) ?*c.PJRT_Error {
-        const manager = asyncH2DManager(args[0].transfer_manager);
+        const manager = AsyncHostToDeviceTransferManager.at(args[0].transfer_manager);
         const i = manager.index(args[0].buffer_index) catch {
-            return invalidArgument("async transfer buffer index is out of range");
+            return PjrtError.invalidArgument("async transfer buffer index is out of range");
         };
         args[0].buffer_out = abi.Buffer.handle(manager.retrieve(i));
         return null;
@@ -376,7 +380,7 @@ const AsyncRetrieveBuffer = struct {
 
 const AsyncDevice = struct {
     fn call(args: [*c]c.PJRT_AsyncHostToDeviceTransferManager_Device_Args) callconv(.c) ?*c.PJRT_Error {
-        const manager = asyncH2DManager(args[0].transfer_manager);
+        const manager = AsyncHostToDeviceTransferManager.at(args[0].transfer_manager);
         args[0].device_out = abi.Device.handle(manager.device);
         return null;
     }
@@ -384,7 +388,7 @@ const AsyncDevice = struct {
 
 const AsyncBufferCount = struct {
     fn call(args: [*c]c.PJRT_AsyncHostToDeviceTransferManager_BufferCount_Args) callconv(.c) ?*c.PJRT_Error {
-        const manager = asyncH2DManager(args[0].transfer_manager);
+        const manager = AsyncHostToDeviceTransferManager.at(args[0].transfer_manager);
         args[0].buffer_count = manager.buffers.len;
         return null;
     }
@@ -392,9 +396,9 @@ const AsyncBufferCount = struct {
 
 const AsyncBufferSize = struct {
     fn call(args: [*c]c.PJRT_AsyncHostToDeviceTransferManager_BufferSize_Args) callconv(.c) ?*c.PJRT_Error {
-        const manager = asyncH2DManager(args[0].transfer_manager);
+        const manager = AsyncHostToDeviceTransferManager.at(args[0].transfer_manager);
         const i = manager.index(args[0].buffer_index) catch {
-            return invalidArgument("async transfer buffer index is out of range");
+            return PjrtError.invalidArgument("async transfer buffer index is out of range");
         };
         args[0].buffer_size = manager.bufferByteSize(i);
         return null;
@@ -403,11 +407,11 @@ const AsyncBufferSize = struct {
 
 const AsyncSetBufferError = struct {
     fn call(args: [*c]c.PJRT_AsyncHostToDeviceTransferManager_SetBufferError_Args) callconv(.c) ?*c.PJRT_Error {
-        const manager = asyncH2DManager(args[0].transfer_manager);
+        const manager = AsyncHostToDeviceTransferManager.at(args[0].transfer_manager);
         const i = manager.index(args[0].buffer_index) catch {
-            return invalidArgument("async transfer buffer index is out of range");
+            return PjrtError.invalidArgument("async transfer buffer index is out of range");
         };
-        const message = abi.bytes(args[0].error_message, args[0].error_message_size) orelse "async transfer buffer failed";
+        const message = abi.Slice.bytes(args[0].error_message, args[0].error_message_size) orelse "async transfer buffer failed";
         manager.buffers[i].ready_event.setFailed(message);
         return null;
     }
@@ -419,14 +423,4 @@ const AsyncAddMetadata = struct {
     }
 };
 
-pub const Api = struct {
-    pub const Destroy = ManagerDestroy.call;
-    pub const TransferData = AsyncTransferData.call;
-    pub const RetrieveBuffer = AsyncRetrieveBuffer.call;
-    pub const Device = AsyncDevice.call;
-    pub const BufferCount = AsyncBufferCount.call;
-    pub const BufferSize = AsyncBufferSize.call;
-    pub const SetBufferError = AsyncSetBufferError.call;
-    pub const AddMetadata = AsyncAddMetadata.call;
-    pub const TransferLiteral = AsyncTransferLiteral.call;
-};
+pub const Api = AsyncHostToDeviceTransferManager.Api;

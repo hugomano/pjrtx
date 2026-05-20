@@ -15,6 +15,7 @@ PLUGIN_SRCS = [
     "pjrt_abi.zig",
     "state.zig",
     "topology.zig",
+    "trace_render.zig",
     "trace.zig",
     "types.zig",
 ]

@@ -3,6 +3,27 @@ const std = @import("std");
 const ir = @import("src/compiler/ir");
 const mlx_call = @import("mlx_call.zig");
 
+/// Static MLX/Metal backend capabilities reported to the runtime.
+pub const Capabilities = struct {
+    /// Stable backend name used in diagnostics and compile-cache keys.
+    name: []const u8,
+    /// Whether runtime buffers are backed by device-resident MLX/Metal storage.
+    supports_device_buffers: bool,
+    /// Whether the backend device memory model is unified with host-visible memory.
+    supports_unified_memory: bool,
+    /// Whether execution may complete asynchronously through backend events.
+    supports_async_execution: bool = false,
+};
+
+/// Returns the capabilities of the concrete MLX/Metal backend.
+pub fn capabilities() Capabilities {
+    return .{
+        .name = "metal_mlx",
+        .supports_device_buffers = true,
+        .supports_unified_memory = true,
+    };
+}
+
 /// Enumerates MLX/Metal devices and converts runtime metadata into compiler IR descriptors.
 pub const DeviceList = struct {
     /// Copies device descriptors for the backend boundary; caller owns the returned slice.

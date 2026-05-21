@@ -13,14 +13,14 @@ any replacement generic backend facade.
 Keep responsibilities strict:
 
 - `runtime.zig`: package root only. It may import domain modules and re-export
-  public runtime contracts, but it should not own lifecycle, lowering, cache, or
-  execution implementation bodies.
+  public runtime contracts, but it should not own lifecycle, cache, residency,
+  or execution implementation bodies.
 - `client.zig`: client lifecycle, topology ownership, compile orchestration.
 - `device_memory.zig`: devices, memories, topology, memory stats.
 - `event.zig`: readiness state, callbacks, dependency chaining.
 - `buffer.zig`: buffer lifecycle, placement, donation, backend handle ownership.
 - `executable_cache.zig`: executable fingerprints, residency, trimming, stats.
-- `executable.zig`: compiled executable metadata and owned graph lifetime.
+- `executable.zig`: compiled executable metadata and owned residency lifetime.
 - `execution.zig`: per-device dispatch, donation aliasing, output wrapping.
 - `custom_call.zig`: runtime custom-call registration API.
 
@@ -51,8 +51,8 @@ Parallel agents must receive disjoint write sets:
   constructors, and buffer tests.
 - `execution.zig`: per-device dispatch, output wrapping, completion-event
   adaptation, donation aliasing, and execution tests.
-- `executable.zig`: compiled executable metadata, graph construction, lowering
-  options, backend executable handles, and graph lifetime tests.
+- `executable.zig`: compiled executable metadata, schedule construction, backend
+  residency options, backend executable handles, and residency lifetime tests.
 - `client.zig`: client lifecycle, topology/device enumeration, compile
   orchestration, executable-cache locking, async transfer entrypoints, and
   client/cache tests.

@@ -319,6 +319,308 @@ pub const Pair = struct {
     second: Buffer,
 };
 
+/// Opaque backend-buffer pair returned by max-reduction-with-indices.
+pub const ReduceMaxWithIndicesResult = struct {
+    /// Device buffer containing reduced values.
+    values: *anyopaque,
+    /// Device buffer containing selected indices.
+    indices: *anyopaque,
+};
+
+/// Opaque backend-buffer pair returned by windowed max-reduction-with-indices.
+pub const ReduceWindowMaxWithIndicesResult = struct {
+    /// Device buffer containing reduced values.
+    values: *anyopaque,
+    /// Device buffer containing selected indices.
+    indices: *anyopaque,
+};
+
+/// Opaque backend-buffer pair returned by random bit generation.
+pub const RngBitGeneratorResult = struct {
+    /// Device buffer containing the updated RNG state.
+    state: *anyopaque,
+    /// Device buffer containing generated random bits.
+    bits: *anyopaque,
+};
+
+/// Runtime-facing opaque buffer operations owned by the MLX/Metal buffer layer.
+pub const Opaque = struct {
+    /// Copies host bytes into a device-resident opaque buffer handle.
+    pub fn fromHost(device_local_hardware_id: i32, element_type: ir.BufferType, dims: []const i64, src: []const u8) Error!?*anyopaque {
+        return maybeHandle(try Buffer.fromHost(device_local_hardware_id, element_type, dims, src));
+    }
+
+    /// Allocates a zero-initialized device-resident opaque buffer handle.
+    pub fn zeros(device_local_hardware_id: i32, element_type: ir.BufferType, dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try Buffer.zeros(device_local_hardware_id, element_type, dims));
+    }
+
+    /// Creates an opaque iota buffer handle.
+    pub fn iota(device_local_hardware_id: i32, element_type: ir.BufferType, dims: []const i64, iota_dimension: i64) Error!?*anyopaque {
+        return maybeHandle(try Buffer.iota(device_local_hardware_id, element_type, dims, iota_dimension));
+    }
+
+    /// Creates an opaque partition-id scalar buffer handle.
+    pub fn partitionId(device_local_hardware_id: i32, element_type: ir.BufferType, partition_id: u32) Error!?*anyopaque {
+        return maybeHandle(try Buffer.partitionId(device_local_hardware_id, element_type, partition_id));
+    }
+
+    /// Clones an opaque buffer handle.
+    pub fn clone(src: *anyopaque) Error!?*anyopaque {
+        return maybeHandle(try ref(src).clone());
+    }
+
+    /// Creates an opaque zero buffer with the same shape and type as another handle.
+    pub fn zeroLike(src: *anyopaque) Error!?*anyopaque {
+        return maybeHandle(try ref(src).zeroLike());
+    }
+
+    /// Combines real and imaginary opaque handles into a complex buffer.
+    pub fn complex(real: *anyopaque, imag: *anyopaque, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try Buffer.complex(ref(real), ref(imag), output_dims));
+    }
+
+    /// Extracts the real part from an opaque complex buffer handle.
+    pub fn realPart(src: *anyopaque, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try ref(src).realPart(output_dims));
+    }
+
+    /// Extracts the imaginary part from an opaque complex buffer handle.
+    pub fn imagPart(src: *anyopaque, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try ref(src).imagPart(output_dims));
+    }
+
+    /// Converts an opaque buffer handle to another element type.
+    pub fn convert(src: *anyopaque, output_type: ir.BufferType) Error!?*anyopaque {
+        return maybeHandle(try ref(src).convert(output_type));
+    }
+
+    /// Reinterprets an opaque buffer handle with a new element type and shape.
+    pub fn bitcast(src: *anyopaque, output_type: ir.BufferType, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try ref(src).bitcast(output_type, output_dims));
+    }
+
+    /// Applies an elementwise binary operation to two opaque buffer handles.
+    pub fn binary(lhs: *anyopaque, rhs: *anyopaque, op: ir.ElementwiseBinaryOp) Error!?*anyopaque {
+        return maybeHandle(try Buffer.binary(ref(lhs), ref(rhs), op));
+    }
+
+    /// Applies an elementwise binary operation with explicit output dimensions.
+    pub fn binaryWithOutputDims(lhs: *anyopaque, rhs: *anyopaque, op: ir.ElementwiseBinaryOp, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try Buffer.binaryWithOutputDims(ref(lhs), ref(rhs), op, output_dims));
+    }
+
+    /// Applies an elementwise unary operation to an opaque buffer handle.
+    pub fn unary(src: *anyopaque, op: ir.ElementwiseUnaryOp) Error!?*anyopaque {
+        return maybeHandle(try ref(src).unary(op));
+    }
+
+    /// Reshapes an opaque buffer handle.
+    pub fn reshape(src: *anyopaque, dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try ref(src).reshape(dims));
+    }
+
+    /// Transposes an opaque buffer handle.
+    pub fn transpose(src: *anyopaque, permutation: []const i64) Error!?*anyopaque {
+        return maybeHandle(try ref(src).transpose(permutation));
+    }
+
+    /// Broadcasts an opaque buffer handle into explicit output dimensions.
+    pub fn broadcastInDim(src: *anyopaque, broadcast_dimensions: []const i64, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try ref(src).broadcastInDim(broadcast_dimensions, output_dims));
+    }
+
+    /// Slices an opaque buffer handle.
+    pub fn slice(src: *anyopaque, start_indices: []const i64, limit_indices: []const i64, strides: []const i64, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try ref(src).slice(start_indices, limit_indices, strides, output_dims));
+    }
+
+    /// Dynamically slices an opaque buffer handle.
+    pub fn dynamicSlice(src: *anyopaque, start_buffers: []const *anyopaque, slice_sizes: []const i64, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try ref(src).dynamicSlice(refs(start_buffers), slice_sizes, output_dims));
+    }
+
+    /// Dynamically updates an opaque buffer handle.
+    pub fn dynamicUpdateSlice(src: *anyopaque, update: *anyopaque, start_buffers: []const *anyopaque, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try ref(src).dynamicUpdateSlice(ref(update), refs(start_buffers), output_dims));
+    }
+
+    /// Pads an opaque buffer handle.
+    pub fn pad(src: *anyopaque, padding_value: *anyopaque, edge_padding_low: []const i64, edge_padding_high: []const i64, interior_padding: []const i64, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try ref(src).pad(ref(padding_value), edge_padding_low, edge_padding_high, interior_padding, output_dims));
+    }
+
+    /// Reverses dimensions of an opaque buffer handle.
+    pub fn reverse(src: *anyopaque, dimensions: []const i64, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try ref(src).reverse(dimensions, output_dims));
+    }
+
+    /// Concatenates two opaque buffer handles.
+    pub fn concatenate(lhs: *anyopaque, rhs: *anyopaque, dimension: i64, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try Buffer.concatenate(ref(lhs), ref(rhs), dimension, output_dims));
+    }
+
+    /// Gathers from an opaque operand handle along one axis.
+    pub fn gatherAxis(operand: *anyopaque, indices: *anyopaque, axis: i64, index_vector_dim: i64, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try Buffer.gatherAxis(ref(operand), ref(indices), axis, index_vector_dim, output_dims));
+    }
+
+    /// Gathers from an opaque operand handle using explicit dimension-number metadata.
+    pub fn gather(operand: *anyopaque, indices: *anyopaque, start_index_map: []const i64, collapsed_slice_dims: []const i64, operand_batching_dims: []const i64, start_indices_batching_dims: []const i64, index_vector_dim: i64, slice_sizes: []const i64, offset_dims: []const i64, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try Buffer.gather(ref(operand), ref(indices), start_index_map, collapsed_slice_dims, operand_batching_dims, start_indices_batching_dims, index_vector_dim, slice_sizes, offset_dims, output_dims));
+    }
+
+    /// Scatters updates into an opaque operand handle along one axis.
+    pub fn scatterAxis(operand: *anyopaque, indices: *anyopaque, updates: *anyopaque, axis: i64, index_vector_dim: i64, update_kind: ir.ScatterUpdateKind, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try Buffer.scatterAxis(ref(operand), ref(indices), ref(updates), axis, index_vector_dim, update_kind, output_dims));
+    }
+
+    /// Scatters updates into an opaque operand handle using explicit dimension-number metadata.
+    pub fn scatter(operand: *anyopaque, indices: *anyopaque, updates: *anyopaque, scatter_dims_to_operand_dims: []const i64, inserted_window_dims: []const i64, update_window_dims: []const i64, input_batching_dims: []const i64, scatter_indices_batching_dims: []const i64, index_vector_dim: i64, update_kind: ir.ScatterUpdateKind, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try Buffer.scatter(ref(operand), ref(indices), ref(updates), scatter_dims_to_operand_dims, inserted_window_dims, update_window_dims, input_batching_dims, scatter_indices_batching_dims, index_vector_dim, update_kind, output_dims));
+    }
+
+    /// Sorts an opaque buffer handle along one dimension.
+    pub fn sort(src: *anyopaque, dimension: i64, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try ref(src).sort(dimension, output_dims));
+    }
+
+    /// Returns sorted indices for an opaque buffer handle.
+    pub fn argsort(src: *anyopaque, dimension: i64, output_type: ir.BufferType, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try ref(src).argsort(dimension, output_type, output_dims));
+    }
+
+    /// Takes values from an opaque buffer handle using indices along one axis.
+    pub fn takeAlongAxis(src: *anyopaque, indices: *anyopaque, dimension: i64, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try ref(src).takeAlongAxis(ref(indices), dimension, output_dims));
+    }
+
+    /// Runs dot-general with opaque buffer handles.
+    pub fn dotGeneral(lhs: *anyopaque, rhs: *anyopaque, lhs_batch_dimensions: []const i64, rhs_batch_dimensions: []const i64, lhs_contracting_dimensions: []const i64, rhs_contracting_dimensions: []const i64, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try Buffer.dotGeneral(ref(lhs), ref(rhs), lhs_batch_dimensions, rhs_batch_dimensions, lhs_contracting_dimensions, rhs_contracting_dimensions, output_dims));
+    }
+
+    /// Runs convolution with opaque buffer handles.
+    pub fn convolution(lhs: *anyopaque, rhs: *anyopaque, window_strides: []const i64, padding_low: []const i64, padding_high: []const i64, lhs_dilation: []const i64, rhs_dilation: []const i64, window_reversal: []const bool, feature_group_count: i64, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try Buffer.convolution(ref(lhs), ref(rhs), window_strides, padding_low, padding_high, lhs_dilation, rhs_dilation, window_reversal, feature_group_count, output_dims));
+    }
+
+    /// Runs an FFT operation on an opaque buffer handle.
+    pub fn fft(src: *anyopaque, kind: ir.FftKind, fft_lengths: []const i64, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try ref(src).fft(kind, fft_lengths, output_dims));
+    }
+
+    /// Runs a random distribution operation using opaque bound handles.
+    pub fn rng(a: *anyopaque, b: *anyopaque, distribution: ir.RngDistribution, output_type: ir.BufferType, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try Buffer.rng(ref(a), ref(b), distribution, output_type, output_dims));
+    }
+
+    /// Runs random bit generation and returns opaque state plus bits handles.
+    pub fn rngBitGenerator(state: *anyopaque, output_type: ir.BufferType, output_dims: []const i64) Error!?RngBitGeneratorResult {
+        const pair = (try Buffer.rngBitGenerator(ref(state), output_type, output_dims)) orelse return null;
+        return .{ .state = pair.first.toHandle(), .bits = pair.second.toHandle() };
+    }
+
+    /// Runs Cholesky decomposition on an opaque buffer handle.
+    pub fn cholesky(src: *anyopaque, lower: bool, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try ref(src).cholesky(lower, output_dims));
+    }
+
+    /// Runs triangular solve with opaque buffer handles.
+    pub fn triangularSolve(a: *anyopaque, b: *anyopaque, left_side: bool, lower: bool, unit_diagonal: bool, transpose_a: ir.TriangularSolveTranspose, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try Buffer.triangularSolve(ref(a), ref(b), left_side, lower, unit_diagonal, transpose_a, output_dims));
+    }
+
+    /// Runs a reduction operation on an opaque buffer handle.
+    pub fn reduce(src: *anyopaque, op: ir.PlanInstructionKind, dimensions: []const i64, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try ref(src).reduce(op, dimensions, output_dims));
+    }
+
+    /// Runs max-reduction and returns opaque values plus indices handles.
+    pub fn reduceMaxWithIndices(values: *anyopaque, indices: *anyopaque, dimensions: []const i64, output_dims: []const i64) Error!?ReduceMaxWithIndicesResult {
+        const pair = (try Buffer.reduceMaxWithIndices(ref(values), ref(indices), dimensions, output_dims)) orelse return null;
+        return .{ .values = pair.first.toHandle(), .indices = pair.second.toHandle() };
+    }
+
+    /// Runs a windowed reduction operation on an opaque buffer handle.
+    pub fn reduceWindow(src: *anyopaque, op: ir.PlanInstructionKind, window_dimensions: []const i64, window_strides: []const i64, base_dilations: []const i64, window_dilations: []const i64, padding_low: []const i64, padding_high: []const i64, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try ref(src).reduceWindow(op, window_dimensions, window_strides, base_dilations, window_dilations, padding_low, padding_high, output_dims));
+    }
+
+    /// Runs windowed max-reduction and returns opaque values plus indices handles.
+    pub fn reduceWindowMaxWithIndices(values: *anyopaque, indices: *anyopaque, window_dimensions: []const i64, window_strides: []const i64, base_dilations: []const i64, window_dilations: []const i64, padding_low: []const i64, padding_high: []const i64, output_dims: []const i64) Error!?ReduceWindowMaxWithIndicesResult {
+        const pair = (try Buffer.reduceWindowMaxWithIndices(ref(values), ref(indices), window_dimensions, window_strides, base_dilations, window_dilations, padding_low, padding_high, output_dims)) orelse return null;
+        return .{ .values = pair.first.toHandle(), .indices = pair.second.toHandle() };
+    }
+
+    /// Compares two opaque buffer handles.
+    pub fn compare(lhs: *anyopaque, rhs: *anyopaque, direction: ir.CompareOp, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try Buffer.compare(ref(lhs), ref(rhs), direction, output_dims));
+    }
+
+    /// Selects between opaque buffer handles using an opaque predicate handle.
+    pub fn select(pred: *anyopaque, on_true: *anyopaque, on_false: *anyopaque, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try Buffer.select(ref(pred), ref(on_true), ref(on_false), output_dims));
+    }
+
+    /// Clamps an opaque value handle between minimum and maximum handles.
+    pub fn clamp(min: *anyopaque, value: *anyopaque, max: *anyopaque, output_dims: []const i64) Error!?*anyopaque {
+        return maybeHandle(try Buffer.clamp(ref(min), ref(value), ref(max), output_dims));
+    }
+
+    /// Runs the while-compare-add backend fast path over opaque handles.
+    pub fn whileF32CompareAdd(state: *anyopaque, limit: *anyopaque, step: *anyopaque, compare_direction: ir.CompareOp, update_op: ir.ElementwiseBinaryOp, output_dims: []const i64, max_iterations: u64) Error!?*anyopaque {
+        return maybeHandle(try Buffer.whileF32CompareAdd(ref(state), ref(limit), ref(step), compare_direction, update_op, output_dims, max_iterations));
+    }
+
+    /// Runs the built-in binary-add custom call over opaque handles.
+    pub fn customBinaryAddF32(lhs: *anyopaque, rhs: *anyopaque) Error!?*anyopaque {
+        return maybeHandle(try Buffer.customBinaryAddF32(ref(lhs), ref(rhs)));
+    }
+
+    /// Runs the built-in scaled dot-product attention custom call over opaque handles.
+    pub fn customScaledDotProductAttention(q: *anyopaque, k: *anyopaque, v: *anyopaque, token_index: *anyopaque) Error!?*anyopaque {
+        return maybeHandle(try Buffer.customScaledDotProductAttention(ref(q), ref(k), ref(v), ref(token_index)));
+    }
+
+    /// Forces an opaque buffer handle to evaluate.
+    pub fn eval(buffer: *anyopaque) Error!void {
+        try ref(buffer).eval();
+    }
+
+    /// Forces opaque buffer handles to evaluate as a single backend call.
+    pub fn evalMany(buffers: []const *anyopaque) Error!void {
+        if (!mlx_call.bufferEvalMany(handles(refs(buffers)))) return error.CommandSubmissionFailed;
+    }
+
+    /// Copies an opaque buffer handle into host memory.
+    pub fn copyToHost(src: *anyopaque, dst: []u8) Error!void {
+        try ref(src).copyToHost(dst);
+    }
+
+    /// Reports whether an opaque buffer still owns a host shadow allocation.
+    pub fn hasHostShadow(src: *anyopaque) bool {
+        return ref(src).hasHostShadow();
+    }
+
+    /// Destroys an opaque buffer handle.
+    pub fn destroy(buffer: *anyopaque) void {
+        ref(buffer).destroy();
+    }
+
+    fn ref(handle: *anyopaque) Buffer {
+        return Buffer.fromHandle(handle);
+    }
+
+    fn refs(handles_: []const *anyopaque) []const Buffer {
+        return @ptrCast(handles_);
+    }
+
+    fn maybeHandle(buffer: ?Buffer) ?*anyopaque {
+        return if (buffer) |value| value.toHandle() else null;
+    }
+};
+
 /// Error set produced by typed MLX/Metal buffer operations.
 pub const Error = error{
     UnsupportedElementType,

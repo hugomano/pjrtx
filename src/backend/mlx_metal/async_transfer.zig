@@ -1,5 +1,4 @@
 const ir = @import("src/compiler/ir");
-const buffer = @import("buffer.zig");
 const mlx_call = @import("mlx_call.zig");
 
 /// Typed owner-side wrapper for an MLX/Metal async host-to-device transfer.
@@ -29,15 +28,39 @@ pub const AsyncTransfer = struct {
         if (!mlx_call.asyncH2DWrite(self.handle, offset, src)) return error.BufferCopyFailed;
     }
 
-    /// Finishes this transfer and returns the completed MLX/Metal buffer.
-    pub fn finish(self: AsyncTransfer) Error!?buffer.Buffer {
+    /// Finishes this transfer and returns the completed opaque MLX/Metal buffer.
+    pub fn finish(self: AsyncTransfer) Error!?*anyopaque {
         const handle = mlx_call.asyncH2DFinish(self.handle) orelse return error.BufferAllocationFailed;
-        return buffer.Buffer.fromHandle(@ptrCast(handle));
+        return @ptrCast(handle);
     }
 
     /// Destroys this transfer without producing a completed buffer.
     pub fn destroy(self: AsyncTransfer) void {
         mlx_call.asyncH2DDestroy(self.handle);
+    }
+};
+
+/// Runtime-facing opaque async transfer operations owned by the transfer layer.
+pub const Opaque = struct {
+    /// Begins an opaque MLX/Metal async host-to-device transfer.
+    pub fn begin(device_local_hardware_id: i32, element_type: ir.BufferType, dims: []const i64, byte_size: usize) Error!?*anyopaque {
+        const transfer = try AsyncTransfer.begin(device_local_hardware_id, element_type, dims, byte_size);
+        return if (transfer) |value| value.toHandle() else null;
+    }
+
+    /// Writes one byte range into an opaque async transfer handle.
+    pub fn write(transfer: *anyopaque, offset: usize, src: []const u8) Error!void {
+        try AsyncTransfer.fromHandle(transfer).write(offset, src);
+    }
+
+    /// Finishes an opaque async transfer handle and returns the completed opaque buffer handle.
+    pub fn finish(transfer: *anyopaque) Error!?*anyopaque {
+        return try AsyncTransfer.fromHandle(transfer).finish();
+    }
+
+    /// Destroys an opaque async transfer handle without producing a buffer.
+    pub fn destroy(transfer: *anyopaque) void {
+        AsyncTransfer.fromHandle(transfer).destroy();
     }
 };
 

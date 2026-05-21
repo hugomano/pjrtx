@@ -11,42 +11,42 @@ pub const CustomCallRegistrationError = backend_api.Error;
 
 /// Registers a fully typed custom-call target with the Metal/MLX backend.
 pub fn registerCustomCall(registration: CustomCallRegistration) CustomCallRegistrationError!void {
-    var backend_impl = backend_api.create();
-    return backend_impl.registerCustomCall(registration);
+    const backend = backend_api.create();
+    return backend.registerCustomCall(registration);
 }
 
 /// Registers a named binary custom-call target with backend-owned validation.
 pub fn registerBinaryCustomCall(target: []const u8, op_name: []const u8) CustomCallRegistrationError!void {
-    var backend_impl = backend_api.create();
-    return backend_impl.registerBinaryCustomCall(target, op_name);
+    const backend = backend_api.create();
+    return backend.registerBinaryCustomCall(target, op_name);
 }
 
 /// Registers an identity custom-call target whose execution aliases its input.
 pub fn registerIdentityCustomCall(target: []const u8) CustomCallRegistrationError!void {
-    var backend_impl = backend_api.create();
-    return backend_impl.registerIdentityCustomCall(target);
+    const backend = backend_api.create();
+    return backend.registerIdentityCustomCall(target);
 }
 
 /// Registers a named unary custom-call target with backend-owned validation.
 pub fn registerUnaryCustomCall(target: []const u8, op_name: []const u8) CustomCallRegistrationError!void {
-    var backend_impl = backend_api.create();
-    return backend_impl.registerUnaryCustomCall(target, op_name);
+    const backend = backend_api.create();
+    return backend.registerUnaryCustomCall(target, op_name);
 }
 
 /// Registers the built-in square-root custom-call marker.
 pub fn registerUnarySqrtCustomCall(target: []const u8) CustomCallRegistrationError!void {
-    var backend_impl = backend_api.create();
-    return backend_impl.registerUnarySqrtCustomCall(target);
+    const backend = backend_api.create();
+    return backend.registerUnarySqrtCustomCall(target);
 }
 
 /// Registers the built-in binary add custom-call marker.
 pub fn registerBinaryAddCustomCall(target: []const u8) CustomCallRegistrationError!void {
-    var backend_impl = backend_api.create();
-    return backend_impl.registerBinaryAddCustomCall(target);
+    const backend = backend_api.create();
+    return backend.registerBinaryAddCustomCall(target);
 }
 
 /// Removes a custom-call target from the Metal/MLX backend registry.
 pub fn unregisterCustomCall(target: []const u8) void {
-    var backend_impl = backend_api.create();
-    backend_impl.unregisterCustomCall(target);
+    const backend = backend_api.create();
+    backend.unregisterCustomCall(target);
 }

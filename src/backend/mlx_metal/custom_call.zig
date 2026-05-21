@@ -2,6 +2,8 @@ const std = @import("std");
 
 const ir = @import("src/compiler/ir");
 
+const io = std.Io.Threaded.global_single_threaded.io();
+
 /// Errors owned by the MLX custom-call registry boundary.
 /// Callers should map these names into the backend package error set.
 pub const Error = error{
@@ -126,7 +128,7 @@ pub const BuiltinBinaryAddF32Target = "pjrtx.mlx_metal.custom_binary_add_f32";
 /// Built-in target implemented by the MLX/Metal attention shim.
 pub const ScaledDotProductAttentionTarget = "pjrtx.mlx_metal.scaled_dot_product_attention";
 
-var mutex: std.atomic.Mutex = .unlocked;
+var mutex: std.Io.Mutex = .init;
 var registry: std.StringHashMapUnmanaged(Entry) = .empty;
 var registry_version: u64 = 0;
 
@@ -212,11 +214,11 @@ pub fn lookup(target: []const u8) ?Spec {
 }
 
 fn lock() void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    mutex.lockUncancelable(io);
 }
 
 fn unlock() void {
-    mutex.unlock();
+    mutex.unlock(io);
 }
 
 test "custom-call registration validates operation payloads" {

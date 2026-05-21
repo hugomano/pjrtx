@@ -22,18 +22,18 @@ pub const Execution = struct {
     };
 };
 
-fn graphExecuteError(err: runtime.GraphExecuteError) ?*c.PJRT_Error {
+fn executionError(err: runtime.ExecutionError) ?*c.PJRT_Error {
     return switch (err) {
-        error.OutOfMemory => PjrtError.internal("failed to allocate executable graph execution state"),
-        error.InvalidArgument => PjrtError.invalidArgument("invalid executable graph arguments or device assignment"),
-        error.UnsupportedElementType => PjrtError.unimplemented("executable graph contains an operation unsupported for this element type"),
-        error.ShapeMismatch => PjrtError.invalidArgument("executable graph shape validation failed during execution"),
-        error.UnsupportedRuntimeFeature => PjrtError.unimplemented("executable graph is not fully lowered to the MLX backend executable"),
+        error.OutOfMemory => PjrtError.internal("failed to allocate executable execution state"),
+        error.InvalidArgument => PjrtError.invalidArgument("invalid executable arguments or device assignment"),
+        error.UnsupportedElementType => PjrtError.unimplemented("executable contains an operation unsupported for this element type"),
+        error.ShapeMismatch => PjrtError.invalidArgument("executable shape validation failed during execution"),
+        error.UnsupportedRuntimeFeature => PjrtError.unimplemented("executable is not fully lowered to the MLX backend executable"),
         error.BufferDeleted => PjrtError.failedPrecondition("execute attempted to use a deleted buffer"),
         error.BufferDonated => PjrtError.failedPrecondition("execute attempted to use a donated buffer"),
         error.BufferNotReady => PjrtError.failedPrecondition("execute attempted to use a buffer that is not ready"),
         error.BufferReadinessFailed => PjrtError.failedPrecondition("execute attempted to use a buffer with failed readiness"),
-        error.Internal => PjrtError.internal("failed to execute executable graph"),
+        error.Internal => PjrtError.internal("failed to execute executable"),
     };
 }
 
@@ -163,7 +163,7 @@ const ExecuteCall = struct {
         const expected_args = self.expectedArgs();
         const expected_outputs = self.expectedOutputs();
         if (self.numDevices() == 0) return PjrtError.invalidArgument("PjRTx execute requires at least one device");
-        if (self.numDevices() > self.executable.graphDeviceCount()) return PjrtError.invalidArgument("PjRTx execute requested more devices than the executable graph contains");
+        if (self.numDevices() > self.executable.deviceCount()) return PjrtError.invalidArgument("PjRTx execute requested more devices than the executable contains");
         if (self.numArgs() != expected_args) return PjrtError.invalidArgument("PjRTx execute argument count does not match executable parameters");
         if (expected_args != 0 and self.raw.argument_lists == null) return PjrtError.invalidArgument("PjRTx execute requires non-null argument_lists for executable parameters");
         if (expected_outputs != 0 and self.raw.output_lists == null) return PjrtError.invalidArgument("PjRTx execute requires non-null output_lists for executable outputs");
@@ -250,7 +250,7 @@ const ExecuteApiCallback = struct {
     fn runDevice(request: ExecuteCall, executable: *Executable, donated_arguments: *DonationSet, device_index: usize, output_count: usize) ?*c.PJRT_Error {
         const arguments = plugin.allocator().alloc(*runtime.Buffer, request.numArgs()) catch {
             request.cleanupResults(output_count);
-            return PjrtError.internal("failed to allocate executable graph argument list");
+            return PjrtError.internal("failed to allocate executable argument list");
         };
         defer plugin.allocator().free(arguments);
         for (arguments, 0..) |*argument, argument_index| {
@@ -265,12 +265,12 @@ const ExecuteApiCallback = struct {
 
         const execute_result = executable.executeDevice(device_index, arguments) catch |err| {
             request.cleanupResults(output_count);
-            return graphExecuteError(err);
+            return executionError(err);
         };
         return assignDeviceOutputs(request, device_index, output_count, execute_result);
     }
 
-    fn assignDeviceOutputs(request: ExecuteCall, device_index: usize, output_count: usize, execute_result: runtime.GraphExecuteResult) ?*c.PJRT_Error {
+    fn assignDeviceOutputs(request: ExecuteCall, device_index: usize, output_count: usize, execute_result: runtime.ExecutionResult) ?*c.PJRT_Error {
         const outputs = execute_result.outputs;
         defer plugin.allocator().free(outputs);
         var assigned_outputs: usize = 0;
@@ -303,15 +303,15 @@ test "execute cleanup destroys only unassigned runtime outputs" {
     const dims = [_]i64{4};
     const first_data = [_]u8{ 1, 2, 3, 4 };
     const second_data = [_]u8{ 5, 6, 7, 8 };
-    const first = try client.createHostBufferFromBytes(test_allocator, .u8, &dims, &client.devices[0], &client.memories[0], 0, &first_data);
+    const first = try client.createHostBufferFromBytes(test_allocator, .u8, &dims, client.defaultDevice(), client.defaultMemory(), 0, &first_data);
     defer first.deinit();
-    const second = try client.createHostBufferFromBytes(test_allocator, .u8, &dims, &client.devices[0], &client.memories[0], 0, &second_data);
+    const second = try client.createHostBufferFromBytes(test_allocator, .u8, &dims, client.defaultDevice(), client.defaultMemory(), 0, &second_data);
 
-    const bytes_before_cleanup = client.memories[0].stats.bytes_in_use;
-    const second_bytes: u64 = @intCast(second.byte_size);
+    const bytes_before_cleanup = client.defaultMemory().stats.bytes_in_use;
+    const second_bytes: u64 = @intCast(second.onDeviceSizeInBytes());
     var outputs = [_]*runtime.Buffer{ first, second };
     cleanupUnassignedExecuteOutputs(&outputs, 1);
 
     try first.ensureUsable();
-    try std.testing.expectEqual(bytes_before_cleanup - second_bytes, client.memories[0].stats.bytes_in_use);
+    try std.testing.expectEqual(bytes_before_cleanup - second_bytes, client.defaultMemory().stats.bytes_in_use);
 }

@@ -2,6 +2,11 @@ const std = @import("std");
 
 const io = std.Io.Threaded.global_single_threaded.io();
 
+/// Returns the backend IO handle used for timestamps and non-cancelable locks.
+pub fn backendIo() std.Io {
+    return io;
+}
+
 /// Aggregates one backend executable invocation profile.
 /// Times are recorded in microseconds and saturating-add into executable stats.
 pub const Execute = struct {
@@ -88,6 +93,30 @@ pub const ScheduleItemSnapshot = struct {
     group_ops: ?[]const []const u8 = null,
 };
 
+/// Summary values required to render a backend schedule failure trace.
+pub const ScheduleFailureSnapshot = struct {
+    schedule_kind: []const u8,
+    schedule_index: usize,
+    schedule_count: usize,
+    err: []const u8,
+    node_kind: ?[]const u8 = null,
+    instruction_index: ?usize = null,
+    op: ?[]const u8 = null,
+    output_value: ?usize = null,
+    dtype: ?[]const u8 = null,
+    rank: ?usize = null,
+    group_first_node: ?usize = null,
+    group_last_node: ?usize = null,
+    group_node_count: ?usize = null,
+};
+
+/// Summary values required to render a materialization failure trace.
+pub const MaterializationFailureSnapshot = struct {
+    detail: []const u8,
+    value_index: usize,
+    reason: []const u8,
+};
+
 /// Returns whether backend profile events should be collected.
 pub fn enabled() bool {
     return envFlag("PJRTX_PROFILE");
@@ -95,9 +124,19 @@ pub fn enabled() bool {
 
 /// Returns whether per-schedule-item profile events should be emitted.
 pub fn verbose() bool {
-    const value = std.c.getenv("PJRTX_PROFILE") orelse return false;
-    const text = std.mem.span(value);
+    const text = envText("PJRTX_PROFILE") orelse return false;
     return std.ascii.eqlIgnoreCase(text, "verbose") or std.ascii.eqlIgnoreCase(text, "2");
+}
+
+/// Returns whether backend trace diagnostics should be emitted.
+pub fn traceEnabled() bool {
+    return envText("PJRTX_TRACE") != null;
+}
+
+/// Returns whether MLX compiled-program creation is enabled for executables.
+pub fn programCompileEnabled() bool {
+    const text = envText("PJRTX_MLX_PROGRAM_COMPILE") orelse return true;
+    return text.len == 0 or (!std.mem.eql(u8, text, "0") and !std.ascii.eqlIgnoreCase(text, "false"));
 }
 
 /// Starts a monotonic timer when profiling is enabled.
@@ -202,10 +241,60 @@ pub fn writeScheduleItem(snapshot: ScheduleItemSnapshot, elapsed_us: u64) void {
     std.debug.print("\n", .{});
 }
 
+/// Emits a backend schedule failure trace event.
+pub fn writeScheduleFailure(snapshot: ScheduleFailureSnapshot) void {
+    if (!traceEnabled()) return;
+    std.debug.print(
+        "pjrtx_trace event=backend_execute_error schedule_kind={s} schedule_index={d} schedule_count={d} err={s}",
+        .{ snapshot.schedule_kind, snapshot.schedule_index, snapshot.schedule_count, snapshot.err },
+    );
+    if (snapshot.node_kind) |node_kind| {
+        std.debug.print(" node_kind={s}", .{node_kind});
+    }
+    if (snapshot.instruction_index) |instruction_index| {
+        std.debug.print(" instruction={d}", .{instruction_index});
+    }
+    if (snapshot.op) |op| {
+        std.debug.print(" op={s}", .{op});
+    }
+    if (snapshot.output_value) |output_value| {
+        std.debug.print(" output_value={d}", .{output_value});
+    }
+    if (snapshot.dtype) |dtype| {
+        std.debug.print(" dtype={s}", .{dtype});
+    }
+    if (snapshot.rank) |rank| {
+        std.debug.print(" rank={d}", .{rank});
+    }
+    if (snapshot.group_first_node) |first_node| {
+        std.debug.print(" group_first_node={d}", .{first_node});
+    }
+    if (snapshot.group_last_node) |last_node| {
+        std.debug.print(" group_last_node={d}", .{last_node});
+    }
+    if (snapshot.group_node_count) |node_count| {
+        std.debug.print(" group_nodes={d}", .{node_count});
+    }
+    std.debug.print("\n", .{});
+}
+
+/// Emits a materialization failure trace event.
+pub fn writeMaterializationFailure(snapshot: MaterializationFailureSnapshot) void {
+    if (!traceEnabled()) return;
+    std.debug.print(
+        "pjrtx_trace event=materialization_error detail={s} value={d} reason={s}\n",
+        .{ snapshot.detail, snapshot.value_index, snapshot.reason },
+    );
+}
+
 fn envFlag(comptime name: [:0]const u8) bool {
-    const value = std.c.getenv(name) orelse return false;
-    const text = std.mem.span(value);
+    const text = envText(name) orelse return false;
     return text.len != 0 and !std.mem.eql(u8, text, "0") and !std.ascii.eqlIgnoreCase(text, "false");
+}
+
+fn envText(comptime name: [:0]const u8) ?[]const u8 {
+    const value = std.c.getenv(name) orelse return null;
+    return std.mem.span(value);
 }
 
 fn nowTimestamp() std.Io.Timestamp {

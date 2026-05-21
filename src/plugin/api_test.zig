@@ -63,7 +63,7 @@ test "plugin attributes and client create expose backend selection" {
         _ = api.PJRT_Client_Destroy.?(&destroy_args);
     }
 
-    try std.testing.expect(handles.Client.ref(create_args.client).devices.len != 0);
+    try std.testing.expect(handles.Client.ref(create_args.client).deviceCount() != 0);
 }
 test "PJRT memory stats include resident executable cache bytes" {
     const api = GetPjrtApi();
@@ -234,17 +234,17 @@ test "PJRT compile trims idle resident executable cache under memory pressure" {
         _ = api.PJRT_LoadedExecutable_Destroy.?(&destroy_args);
     }
 
-    const large_resident_bytes = client.executable_cache.stats.resident_bytes;
+    const large_resident_bytes = client.executableCacheStats().resident_bytes;
     try std.testing.expect(large_resident_bytes >= 32);
-    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.resident_entries);
+    try std.testing.expectEqual(@as(u64, 1), client.executableCacheStats().resident_entries);
 
     var large_delete_args = std.mem.zeroes(c.PJRT_LoadedExecutable_Delete_Args);
     large_delete_args.struct_size = c.PJRT_LoadedExecutable_Delete_Args_STRUCT_SIZE;
     large_delete_args.executable = large_compile_args.executable;
     try expectOk(api.PJRT_LoadedExecutable_Delete.?(&large_delete_args));
-    try std.testing.expectEqual(large_resident_bytes, client.executable_cache.stats.resident_bytes);
+    try std.testing.expectEqual(large_resident_bytes, client.executableCacheStats().resident_bytes);
 
-    client.memories[0].stats.capacity_bytes = 4;
+    client.defaultMemory().stats.capacity_bytes = 4;
 
     const small_module =
         \\module {
@@ -283,11 +283,11 @@ test "PJRT compile trims idle resident executable cache under memory pressure" {
     try std.testing.expectEqual(@as(u64, 1), small_trim.evicted_entries);
     try std.testing.expectEqual(@as(u64, 0), small_trim.remaining_resident_bytes);
     try std.testing.expect(!small_trim.still_over_capacity);
-    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.pressure_trim_requests);
-    try std.testing.expectEqual(large_resident_bytes, client.executable_cache.stats.pressure_trimmed_bytes);
-    try std.testing.expectEqual(@as(u64, 0), client.executable_cache.stats.pressure_trim_failures);
-    try std.testing.expectEqual(@as(u64, 1), client.executable_cache.stats.resident_entries);
-    try std.testing.expectEqual(@as(u64, 4), client.executable_cache.stats.resident_bytes);
+    try std.testing.expectEqual(@as(u64, 1), client.executableCacheStats().pressure_trim_requests);
+    try std.testing.expectEqual(large_resident_bytes, client.executableCacheStats().pressure_trimmed_bytes);
+    try std.testing.expectEqual(@as(u64, 0), client.executableCacheStats().pressure_trim_failures);
+    try std.testing.expectEqual(@as(u64, 1), client.executableCacheStats().resident_entries);
+    try std.testing.expectEqual(@as(u64, 4), client.executableCacheStats().resident_bytes);
 }
 fn expectOk(err: [*c]c.PJRT_Error) !void {
     if (err) |actual| {

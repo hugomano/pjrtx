@@ -257,7 +257,7 @@ pub const TransferManager = struct {
     fn deinit(self: *TransferManager) void {
         for (self.backend_transfers, self.completed, self.buffers) |transfer, done, buffer| {
             if (!done) {
-                buffer.ready_event.setFailed("async transfer manager destroyed before completion");
+                buffer.failReadiness("async transfer manager destroyed before completion");
                 self.client.destroyAsyncHostToDeviceTransfer(transfer);
             }
         }
@@ -277,7 +277,7 @@ pub const TransferManager = struct {
     }
 
     fn bufferByteSize(self: *const TransferManager, i: usize) usize {
-        return self.buffers[i].byte_size;
+        return self.buffers[i].onDeviceSizeInBytes();
     }
 
     fn writeBytes(self: *TransferManager, i: usize, offset: usize, bytes: []const u8) runtime.AsyncTransferWriteError!void {
@@ -297,7 +297,7 @@ pub const TransferManager = struct {
     }
 
     fn failBuffer(self: *TransferManager, i: usize, message: []const u8) void {
-        self.buffers[i].ready_event.setFailed(message);
+        self.buffers[i].failReadiness(message);
     }
 
     fn retrieve(self: *TransferManager, i: usize) *runtime.Buffer {
@@ -308,10 +308,10 @@ pub const TransferManager = struct {
     fn finishBuffer(self: *TransferManager, i: usize) AsyncTransferFailure.InstallError!void {
         if (self.completed[i]) return error.InvalidArgument;
         const buffer = self.buffers[i];
-        _ = self.client.trimExecutableCacheForAllocation(self.memory, buffer.byte_size);
+        _ = self.client.trimExecutableCacheForAllocation(self.memory, buffer.onDeviceSizeInBytes());
         try self.client.finishAsyncHostToDeviceTransfer(buffer, self.backend_transfers[i]);
-        buffer.memory.stats.host_to_device_bytes += @intCast(buffer.byte_size);
-        buffer.ready_event.setReady();
+        buffer.recordHostToDeviceTransfer();
+        buffer.markReady();
         self.completed[i] = true;
     }
 
@@ -415,7 +415,7 @@ const AsyncSetBufferError = struct {
             return PjrtError.invalidArgument("async transfer buffer index is out of range");
         };
         const message = abi.Slice.bytes(args[0].error_message, args[0].error_message_size) orelse "async transfer buffer failed";
-        manager.buffers[i].ready_event.setFailed(message);
+        manager.buffers[i].failReadiness(message);
         return null;
     }
 };

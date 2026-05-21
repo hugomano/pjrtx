@@ -43,6 +43,14 @@ if grep -Eq 'PjrtxMlx|pjrtx_mlx|mlx_metal_api' src/plugin/plugin.zig; then
   fail "plugin must not import or mention MLX C shim symbols"
 fi
 
+if find src/plugin -name '*.zig' -print0 | xargs -0 grep -Eq '@import\("src/(compiler|backend|core)'; then
+  fail "plugin must stay a PJRT-to-runtime adapter and must not import compiler/backend/core packages"
+fi
+
+if grep -Eq '@import\("src/runtime"|@import\("src/compiler"|@import\("src/backend' src/plugin/pjrt_abi.zig; then
+  fail "raw PJRT ABI helpers must not import runtime, compiler, or backend packages"
+fi
+
 if find src/runtime -name '*.zig' -print0 | xargs -0 grep -Eq 'executeInstruction|runtime_fallback|fallback_instruction_count|allow_runtime_fallback|test_only_runtime_fallback'; then
   fail "runtime must not contain an instruction-interpreter fallback"
 fi
@@ -63,12 +71,200 @@ if grep -Eq 'pub const Elementwise(Binary|Unary)Op|pub const CompareOp' src/runt
   fail "runtime root must not re-export compiler op enums it does not own"
 fi
 
+if grep -Eq 'pub const (CompileOptions|PlanInstruction|ShardingPlan) = ir\.' src/runtime/runtime.zig; then
+  fail "runtime root must not re-export compiler plan internals that callers can import from compiler IR"
+fi
+
+if grep -Eq 'pub const (ExecutableCacheEntry|CachedBackendExecutable|ExecutableCacheStats)' src/runtime/runtime.zig; then
+  fail "runtime root must not re-export executable-cache internals"
+fi
+
+if grep -Eq '^pub const Entry\b' src/runtime/executable_cache.zig; then
+  fail "executable cache entries must stay private; use opaque cache leases across runtime modules"
+fi
+
+if grep -Eq 'pub const (ExecutableCache|DonationAliasStats|GraphNodeKind|GraphNode|BackendCompileOptions|BackendResidency|ExecutableContext)\b' src/runtime/runtime.zig; then
+  fail "runtime root must not re-export owner-module internals that are not plugin/runtime entrypoint contracts"
+fi
+
+if grep -Eq 'pub const Topology\b' src/runtime/runtime.zig; then
+  fail "runtime root must expose device and memory handles, not topology implementation details"
+fi
+
+if find src/runtime src/plugin -name '*.zig' -print0 | xargs -0 grep -Eq '\bGraphExecute(Result|Error)\b|graphExecuteError'; then
+  fail "compiled executable execution must use runtime ExecutionResult/ExecutionError vocabulary, not graph-level public names"
+fi
+
+if find src/runtime src/plugin -name '*.zig' -print0 | xargs -0 grep -Eq 'ExecutableGraph|\.graph\b|graphDeviceCount|releaseGraph'; then
+  fail "CompiledExecutable must be the only runtime executable owner; graph internals must not be reachable contracts"
+fi
+
+if grep -Eq 'pub const (ExecutablePlan|ExecutableGraph)\b' src/runtime/runtime.zig; then
+  fail "runtime root must not re-export executable plan or graph internals"
+fi
+
+if grep -Eq 'pub const executeDevice\b' src/runtime/runtime.zig; then
+  fail "runtime root must expose compiled-executable execution, not lower-level graph dispatch"
+fi
+
+if grep -Eq '@import\("src/compiler"\)|@import\("compile_options\.zig"\)' src/runtime/client.zig; then
+  fail "runtime client must call compile_pipeline instead of importing compiler and compile-options owners"
+fi
+
+if grep -Eq 'fn (parseCompileOptions|analyzeProgram|makeExecutablePlan|verifyPlan|allocExecutableFingerprint|updateInstructionFingerprint|updateTargetDeviceFingerprint|updateShardingFingerprint)\(' src/runtime/client.zig; then
+  fail "runtime client must not own compile-pipeline or executable-fingerprint helpers"
+fi
+
+if grep -Eq 'fn (testShardingPlan|addU8ExecutablePlanForTest|constantU8ExecutablePlanForTest|cacheEntrySnapshotForTest)\(' src/runtime/client.zig; then
+  fail "runtime client test fixtures must live under ClientTestSupport, not production-looking free functions"
+fi
+
+if grep -Eq 'fn testShardingPlan\(' src/runtime/executable.zig; then
+  fail "runtime executable test fixtures must live under ExecutableTestSupport, not production-looking free functions"
+fi
+
+if grep -Eq 'pub fn (acquireCachedBackendExecutable|releaseCachedBackendExecutable)\(' src/runtime/client.zig; then
+  fail "runtime client cache acquire/release plumbing must stay private behind executableContext callbacks"
+fi
+
+if grep -Eq 'descriptor\.(name|debug_string)|addressable_memories = device_memories|addressable_devices = memory_devices' src/runtime/client.zig; then
+  fail "runtime client must construct topology through device_memory.DeviceMemoryTopology"
+fi
+
+if grep -Eq '\.executable_residency\.cache\b|\.executable_cache\b|executable_cache_mutex' src/runtime/client.zig; then
+  fail "runtime client must use ExecutableResidencyCache behavior instead of reading cache internals"
+fi
+
+if grep -Eq '\.device_memory\.(devices|memories|device_handles|memory_handles)\b' src/runtime/client.zig; then
+  fail "runtime client must use DeviceMemoryTopology methods instead of reading topology storage fields"
+fi
+
+if grep -Eq '\.backend\.(beginAsyncHostToDeviceTransfer|writeAsyncHostToDeviceTransfer|finishAsyncHostToDeviceTransfer|destroyAsyncHostToDeviceTransfer)\b' src/runtime/client.zig; then
+  fail "runtime client must route async H2D operations through AsyncHostTransfer"
+fi
+
+if grep -Eq 'pub fn executeDevice\(' src/runtime/execution.zig; then
+  fail "runtime execution must expose compiled-executable dispatch, not graph-level executeDevice"
+fi
+
+if grep -Eq 'allocator\.alloc\([^)]*value_(handles|owned)|var value_(handles|owned) =' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution value-handle table allocation must stay behind ValueBindings"
+fi
+
+if grep -Eq '^fn (executeProgramNode|executeControlFlowNode|whilePatternOperandHandle|whileStepOperandHandle|executeLoopInvariantRegionInstruction|loopInvariantRegionOperandHandle)\(' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution node and control-flow dispatch must stay behind ProgramNodeDispatch and ControlFlowDispatch owners"
+fi
+
+if grep -Eq '^fn (releaseDeadInputs|releaseDeadFusionGroupValues|evalMaterializationBoundaryRange|traceMaterializationFailure)\(' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution liveness and materialization work must stay behind named owner structs"
+fi
+
+if grep -Eq '^fn executeRegisteredCustomCall\(' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal custom-call execution must stay behind a backend-local dispatch owner"
+fi
+
+if grep -Eq 'fn (mlxMetalBackendForTest|initMlxMetalClientForTest|testShardingPlan|addU8ExecutablePlanForTest|constantU8ExecutablePlanForTest)\(' src/runtime/execution.zig; then
+  fail "runtime execution test fixtures must live under a named testing owner, not production-looking free functions"
+fi
+
+if grep -Eq 'fn (backendOutputMatchesPlan|planOutputBytes|donatedParameterAliasForOutput|planDonatesParameter)\(' src/runtime/execution.zig; then
+  fail "runtime execution must query CompiledExecutable for output and donation facts"
+fi
+
+if grep -Eq '^pub const (DonationAliasStats|GraphNodeKind|GraphNode|BackendResidency)\b' src/runtime/executable.zig; then
+  fail "runtime executable internals must stay private behind CompiledExecutable owner methods"
+fi
+
+if grep -Eq 'residencyStatus\(' src/runtime/executable.zig src/runtime/client.zig src/runtime/execution.zig; then
+  fail "runtime executable cache/residency observations must use narrow CompiledExecutable methods"
+fi
+
+if find src/runtime -name '*.zig' -print0 | xargs -0 grep -Eq 'LoweringOptions|LoweringPipeline|\.lowering'; then
+  fail "runtime must describe backend executable residency, not own a lowering pipeline"
+fi
+
+if find src/runtime -name '*.zig' -print0 | xargs -0 grep -Eq '^const io = std\.Io\.Threaded\.global_single_threaded\.io\(\);'; then
+  fail "runtime IO handles must be owned by lifecycle objects instead of file-level globals"
+fi
+
+if grep -Eq 'entry\.ref_count' src/runtime/executable.zig; then
+  fail "compiled executable residency must release cache entries through the executable-cache owner"
+fi
+
+cache_entry_leaks="$(
+  find src/runtime src/plugin -name '*.zig' ! -path 'src/runtime/executable_cache.zig' ! -path 'src/runtime/client.zig' -print0 \
+    | xargs -0 grep -En 'executable_cache\.get|executable_cache\.stats\b|executable_cache\.entrySnapshot|entry\.(backend_executable|ref_count|compile_latency_us)' || true
+)"
+if [[ -n "${cache_entry_leaks}" ]]; then
+  echo "${cache_entry_leaks}" >&2
+  fail "executable cache entries and counters must be observed through cache/client snapshot APIs"
+fi
+
+graph_field_leaks="$(
+  find src/runtime src/plugin -name '*.zig' ! -path 'src/runtime/executable.zig' ! -path 'src/runtime/executable_cache.zig' ! -path 'src/runtime/executable_residency.zig' ! -path 'src/runtime/executable_schedule.zig' -print0 \
+    | xargs -0 grep -En '\.(backend_executable|backend_residency|device_ids|last_compile_cache_trim|last_execute_cache_trim|last_backend_completion|donation_alias_stats)\b' || true
+)"
+if [[ -n "${graph_field_leaks}" ]]; then
+  echo "${graph_field_leaks}" >&2
+  fail "executable residency bookkeeping must be observed through owner methods"
+fi
+
+runtime_context_field_leaks="$(
+  grep -En 'context\.(backend|devices)\b' src/runtime/execution.zig src/runtime/executable.zig || true
+)"
+if [[ -n "${runtime_context_field_leaks}" ]]; then
+  echo "${runtime_context_field_leaks}" >&2
+  fail "runtime executable/execution code must use Context methods instead of reading owned storage fields"
+fi
+
+buffer_storage_field_leaks="$(
+  find src/runtime src/plugin -name '*.zig' ! -path 'src/runtime/buffer.zig' -print0 \
+    | xargs -0 grep -En '\.backend_buffer\b|\.storage\.(handle|backend|accounted_bytes)\b' || true
+)"
+if [[ -n "${buffer_storage_field_leaks}" ]]; then
+  echo "${buffer_storage_field_leaks}" >&2
+  fail "runtime/plugin code must use Buffer storage methods instead of reading backend_buffer directly"
+fi
+
+if grep -Eq 'ptr\.(element_type|byte_size|deleted|device|memory|dims|ready_event)\b' src/plugin/buffer.zig; then
+  fail "plugin buffer metadata must use runtime Buffer accessors instead of reading buffer fields"
+fi
+
+if grep -Eq 'deleted: bool|deleted = (true|false)' src/runtime/buffer.zig; then
+  fail "runtime Buffer deletion state must be represented by BufferState, not a duplicate boolean"
+fi
+
+if grep -Eq '\.ready_event\b|buffer\.(byte_size|memory)\b' src/plugin/async_h2d.zig; then
+  fail "plugin async H2D must use runtime Buffer readiness/accounting methods instead of mutating buffer fields"
+fi
+
+if grep -Eq 'client\.(backend|devices|memories|executable_cache)\b' src/runtime/execution.zig; then
+  fail "runtime execution must use client/execution context APIs instead of reading client-owned storage fields"
+fi
+
+if find src/runtime -name '*.zig' -print0 | xargs -0 grep -Eq '\bbackend_impl\b'; then
+  fail "runtime must use the concrete backend noun instead of legacy backend_impl abstraction vocabulary"
+fi
+
 if find src/runtime -name '*.zig' -print0 | xargs -0 grep -Eq 'bufferFromHost\(.*\) orelse null|allocator\.dupe\(u8, src\)'; then
   fail "host imports must materialize backend device storage, not host-only buffers"
 fi
 
 if grep -Eq 'loadedExecutableExecuteLegacy|dense host fallback' src/plugin/plugin.zig; then
   fail "plugin execute path must stay graph/backend-only; no legacy or host fallback executor"
+fi
+
+if grep -Eq 'runtime\.executeDevice|\.plan\.deinit\(\)|\.graph\.deinit\(\)|plugin\.allocator\(\)\.free\(executable\.(fingerprint|optimized_program)\)' src/plugin/executable.zig; then
+  fail "plugin loaded executables must own runtime CompiledExecutable as one object instead of dismantling runtime internals"
+fi
+
+plugin_client_field_leaks="$(
+  find src/plugin -name '*.zig' -print0 \
+    | xargs -0 grep -En 'client\.(devices|memories|device_handles|memory_handles|topology)\b|\.(device_handles|memory_handles)\b|handles\.Client\.ref\([^)]*\)\.(devices|memories|device_handles|memory_handles|topology)\b' || true
+)"
+if [[ -n "${plugin_client_field_leaks}" ]]; then
+  echo "${plugin_client_field_leaks}" >&2
+  fail "plugin must use runtime Client topology/placement accessors instead of reading client-owned storage"
 fi
 
 if grep -Eq '//src/runtime|//src/backend' src/compiler/BUILD.bazel; then
@@ -112,8 +308,122 @@ if grep -Eq 'fn (instructionIssue|validate[A-Za-z0-9_]*Lowering|supportedScatter
   fail "MLX Metal backend root must not own lowering validation bodies"
 fi
 
+if grep -Eq '^fn (instructionIssue|validate[A-Za-z0-9_]*Lowering|validate[A-Za-z0-9_]*CustomCall|inputDescriptor|dimsEqual|valid[A-Za-z0-9_]*Shape|isSupported(Float|Integer|Comparable)|dotGeneralIsMatmulLike|regionValueById|matchWhileF32LtAddPattern|descriptorsEqual)\(' src/backend/mlx_metal/lowering.zig; then
+  fail "MLX Metal lowering facade must stay a package surface; implementation belongs in lowering owner modules"
+fi
+
+if grep -Eq '^fn validate[A-Za-z0-9_]*CustomCall|custom_call_mod\.lookup' src/backend/mlx_metal/lowering_rules.zig; then
+  fail "MLX Metal custom-call lowering legality must stay in lowering_custom_call.zig"
+fi
+
+if grep -Eq '^fn (inputDescriptor|dimsEqual|valid[A-Za-z0-9_]*Shape|isSupported(Float|Integer|Comparable)|dotGeneralIsMatmulLike|supported(Gather|Scatter)Axis|scatterUpdateShapeMatchesAxis|gatherOutputShapeMatchesTake)\(' src/backend/mlx_metal/lowering_rules.zig; then
+  fail "MLX Metal shape and dtype predicates must stay in lowering_shapes.zig"
+fi
+
+if grep -Eq '^fn (regionValueById|matchWhileF32LtAddPattern|descriptorsEqual|regionValueIsArgumentIndex|whileStepOperandFromRegionValue|loopInvariantProducerInstructionIndex)\(' src/backend/mlx_metal/lowering_rules.zig; then
+  fail "MLX Metal while/region pattern matching must stay in lowering_control_flow.zig"
+fi
+
+if grep -Eq '^(pub )?fn validate(Bitcast|PartitionId|Rng|RngBitGenerator|OptimizationBarrier|Tuple|GetTupleElement|Binary|Unary|Complex|RealImag|Compare|Select|Clamp|Transpose|BroadcastInDim|Slice|DynamicSlice|DynamicUpdateSlice|Concatenate|Pad|Gather|Scatter|Sort|TopK|DotGeneral|Convolution|Cholesky|TriangularSolve|Fft|Reduce|ReduceWindow|While)' src/backend/mlx_metal/lowering_rules.zig; then
+  fail "MLX Metal lowering_rules.zig must route validation; family validators belong to lowering_* owner modules"
+fi
+
+if grep -Eq '^fn (convMetadataLen|convReversalLen|defaultSpatialDims)\(' src/backend/mlx_metal/lowering_rules.zig; then
+  fail "MLX Metal linalg helper validation must stay in lowering_linalg.zig"
+fi
+
 if grep -Eq 'fn (programNodeKind|buildFusionGroups|buildNodeSubprograms|countPlanSubprograms)\(' src/backend/mlx_metal/backend.zig; then
   fail "MLX Metal backend root must not own program graph construction bodies"
+fi
+
+if grep -Eq 'std\.c\.getenv|PJRTX_MLX_PROGRAM_COMPILE' src/backend/mlx_metal/backend.zig; then
+  fail "MLX Metal backend root must not own executable compile policy; executable ownership belongs in executable.zig"
+fi
+
+if grep -Eq 'buffer_mod\.Buffer|bufferRef|bufferRefs|maybeBufferHandle' src/backend/mlx_metal/backend.zig; then
+  fail "MLX Metal backend root must not own opaque buffer decoding; buffer ownership belongs in buffer.zig"
+fi
+
+if grep -Eq 'async_transfer_mod\.AsyncTransfer|\.toHandle\(' src/backend/mlx_metal/backend.zig; then
+  fail "MLX Metal backend root must not own opaque async-transfer decoding; async transfer ownership belongs in async_transfer.zig"
+fi
+
+if grep -Eq '^fn ' src/backend/mlx_metal/backend.zig; then
+  fail "MLX Metal backend root must stay package surface only; implementation functions belong in owner modules"
+fi
+
+backend_env_leaks="$(
+  find src/backend/mlx_metal -name '*.zig' ! -name 'profiling.zig' -print0 \
+    | xargs -0 grep -En 'std\.c\.getenv|PJRTX_(TRACE|PROFILE|MLX_PROGRAM_COMPILE)' || true
+)"
+if [[ -n "${backend_env_leaks}" ]]; then
+  echo "${backend_env_leaks}" >&2
+  fail "MLX Metal backend environment knobs must be read through profiling.zig"
+fi
+
+if grep -Eq 'std\.atomic\.Mutex|spinLoopHint' src/backend/mlx_metal/custom_call.zig; then
+  fail "MLX Metal custom-call registry must use std.Io.Mutex instead of spin-loop registry locks"
+fi
+
+if find src/backend/mlx_metal -name '*.zig' -print0 | xargs -0 grep -Eq 'std\.atomic\.Mutex|spinLoopHint'; then
+  fail "MLX Metal backend synchronization must use std.Io.Mutex instead of spin-loop mutexes"
+fi
+
+if grep -Eq '@import\("execution\.zig"\)' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution module must not import itself to recover local types"
+fi
+
+if grep -Eq '^const backend = struct' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution must use owned module types directly instead of a fake local backend namespace"
+fi
+
+if grep -Eq '\bBackend\b|backend_impl|create\(\)' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution must not thread an empty backend facade through owned execution helpers"
+fi
+
+if grep -Eq 'TestBackend|createTestBackend' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution tests must call owned module APIs directly instead of local backend facades"
+fi
+
+if grep -Eq 'async_transfer_mod|AsyncHostToDeviceTransferHandle|fn (beginAsyncHostToDeviceTransfer|writeAsyncHostToDeviceTransfer|finishAsyncHostToDeviceTransfer|destroyAsyncHostToDeviceTransfer|allocateBuffer|zeroLike|profileEnabled|profileVerbose|profileStart|profileElapsedUs|lookupCustomCall|matchWhileF32LtAddPattern|regionValueById|supportedScatterAxis|executableBinaryOp|executableUnaryOp)\(' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution must call owned async-transfer, profiling, lowering, and custom-call modules directly instead of local forwarding wrappers"
+fi
+
+if grep -Eq 'std\.debug\.print' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution must pass trace/profile snapshots to profiling.zig instead of rendering text directly"
+fi
+
+if grep -Eq 'bufferRef|bufferRefs|maybeBufferHandle|fn (iota|partitionId|cloneBuffer|complex|realPart|imagPart|convert|bitcast|binary|binaryWithOutputDims|unary|reshape|transpose|broadcastInDim|slice|dynamicSlice|dynamicUpdateSlice|pad|reverse|concatenate|gatherAxis|gather|scatterAxis|scatter|sort|argsort|takeAlongAxis|dotGeneral|convolution|fft|rng|rngBitGenerator|cholesky|triangularSolve|reduce|reduceMaxWithIndices|reduceWindow|reduceWindowMaxWithIndices|compare|select|clamp|whileF32CompareAdd|copyToHost|destroyBuffer|evalBuffers|evalBuffer)\(' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution must use buffer_mod.Opaque for opaque buffer operations instead of local buffer forwarding wrappers"
+fi
+
+if grep -Eq 'pub fn destroy(ConstantHandles|CompiledPrograms|ArgumentCaptureStates)' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution must not re-export executable teardown helpers owned by executable.zig"
+fi
+
+if grep -Eq 'fn (executableStats|recordSuccessfulExecute|recordFusionGroupExecute|recordCompiledProgramExecute|recordCapturedProgramExecute|recordMaterializationEval|recordReleasedIntermediateValues|recordBorrowedConstantNode|recordExecuteProfile|lockExecutableStats|unlockExecutableStats|destroyExecutable)\(' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution must not own executable stats, locks, or teardown; executable ownership belongs in executable.zig"
+fi
+
+if grep -Eq 'fn (argumentCaptureMatches|rememberArgumentCaptureBaseline|resetArgumentCaptureState)\(' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution must mutate argument-capture state through executable-owned methods"
+fi
+
+if grep -Eq 'fn (constantIndex|whileConstantIndex)\(' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution must use executable-owned residency indexing helpers directly"
+fi
+
+if grep -Eq 'fn (executableSupportsInstruction|validElementwiseBroadcast|dotGeneralIsMatmulLike|validGatherShape|isSupported(Float|Integer|Comparable))\(' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution must not own lowering validation helpers; lowering ownership belongs in lowering.zig"
+fi
+
+backend_buffer_decode_leaks="$(
+  find src/backend/mlx_metal -name '*.zig' ! -name 'buffer.zig' -print0 \
+    | xargs -0 grep -En 'Buffer\.fromHandle' || true
+)"
+if [[ -n "${backend_buffer_decode_leaks}" ]]; then
+  echo "${backend_buffer_decode_leaks}" >&2
+  fail "MLX Metal opaque buffer decoding must stay in buffer.zig"
 fi
 
 echo "architecture boundaries OK"

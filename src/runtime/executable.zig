@@ -4,266 +4,317 @@ const ir = @import("src/compiler/ir");
 
 const device_memory = @import("device_memory.zig");
 const executable_cache = @import("executable_cache.zig");
+const executable_residency = @import("executable_residency.zig");
+const executable_schedule = @import("executable_schedule.zig");
+const execution_context = @import("execution_context.zig");
 
-const Device = device_memory.Device;
-const Memory = device_memory.Memory;
-const CachedBackendExecutable = executable_cache.Retained;
-const ExecutableCacheEntry = executable_cache.Entry;
+const DeviceMemoryTopology = device_memory.DeviceMemoryTopology;
 const ExecutableCacheTrim = executable_cache.Trim;
+const ExecutableResidency = executable_residency.Residency;
+const ExecutableSchedule = executable_schedule.Schedule;
+const ScheduleNode = executable_schedule.Node;
+const ScheduleNodeKind = executable_schedule.NodeKind;
 
-/// Aggregates donated-output aliasing performed during graph execution.
-pub const DonationAliasStats = struct {
-    output_count: usize = 0,
-    output_bytes: usize = 0,
+/// Error set for acquiring a cached or freshly compiled backend executable.
+pub const CacheAcquireError = execution_context.CacheAcquireError;
+
+/// Carries optional backend diagnostics and cache identity into residency creation.
+pub const BackendCompileOptions = executable_residency.CompileOptions;
+
+/// Narrow runtime surface needed by executable residency and execution.
+pub const Context = execution_context.Context;
+
+/// Describes a donated parameter that may back an output buffer.
+pub const OutputAlias = struct {
+    parameter_index: usize,
+    kind: ir.OutputAliasKind,
 };
 
-/// Owns the compiler plan and resident runtime graph returned by compilation.
+/// Owns the compiler plan and resident backend executable returned by compilation.
 pub const CompiledExecutable = struct {
     plan: *ir.ExecutablePlan,
-    graph: ExecutableGraph,
+    schedule: ExecutableSchedule,
+    residency: ExecutableResidency,
     optimized_program: []u8,
     fingerprint: []u8,
     cache_hit: bool,
     backend_stats: backend_api.ExecutableStats,
+    resident_released: bool = false,
 
-    /// Releases graph residency, optimized program text, fingerprint, and plan.
+    /// Builds a compiled executable from owned compile artifacts and acquires backend residency.
+    pub fn initResident(
+        allocator: std.mem.Allocator,
+        context: Context,
+        plan: *ir.ExecutablePlan,
+        optimized_program: []u8,
+        fingerprint: []u8,
+        cache_hit: bool,
+        diagnostics: *std.Io.Writer,
+    ) error{ UnsupportedRuntimeFeature, OutOfMemory, Internal }!CompiledExecutable {
+        var resident = ResidentExecutable.init(allocator, context, plan, .{
+            .diagnostic_writer = diagnostics,
+            .cache_fingerprint = fingerprint,
+        }) catch |err| switch (err) {
+            error.UnsupportedRuntimeFeature => return error.UnsupportedRuntimeFeature,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.Internal,
+        };
+        errdefer resident.deinit();
+
+        return .{
+            .plan = plan,
+            .schedule = resident.schedule,
+            .residency = resident.residency,
+            .optimized_program = optimized_program,
+            .fingerprint = fingerprint,
+            .cache_hit = cache_hit,
+            .backend_stats = resident.residency.backendExecutableStats() orelse .{},
+        };
+    }
+
+    /// Releases backend residency, optimized program text, fingerprint, and plan.
     pub fn deinit(self: *CompiledExecutable, allocator: std.mem.Allocator) void {
-        self.graph.deinit();
+        self.releaseResidentStorage();
         allocator.free(self.fingerprint);
         allocator.free(self.optimized_program);
         self.plan.deinit();
         allocator.destroy(self.plan);
         self.* = undefined;
     }
-};
 
-/// Error set for acquiring a cached or freshly compiled backend executable.
-pub const CacheAcquireError = std.mem.Allocator.Error || backend_api.Error || error{UnsupportedRuntimeFeature};
+    /// Releases backend residency while keeping executable metadata queryable.
+    pub fn releaseResidentStorage(self: *CompiledExecutable) void {
+        if (self.resident_released) return;
+        self.residency.deinit();
+        self.schedule.deinit();
+        self.resident_released = true;
+    }
 
-/// Callback used by executable graphs to acquire a resident backend executable.
-pub const AcquireCachedExecutableFn = *const fn (*anyopaque, std.mem.Allocator, []const u8, *const ir.ExecutablePlan, []const i32) CacheAcquireError!?CachedBackendExecutable;
+    /// Returns the number of PJRT parameters expected on each execution device.
+    pub fn parameterCount(self: *const CompiledExecutable) usize {
+        return self.plan.parameter_shardings.len;
+    }
 
-/// Callback used by executable graphs to release a retained cache entry.
-pub const ReleaseCachedExecutableFn = *const fn (*anyopaque, *ExecutableCacheEntry) void;
+    /// Returns the number of PJRT outputs produced on each execution device.
+    pub fn outputCount(self: *const CompiledExecutable) usize {
+        return self.plan.output_ids.len;
+    }
 
-/// Callback used by execution to trim resident executable cache for output allocation.
-pub const TrimExecutableCacheFn = *const fn (*anyopaque, *Memory, usize) ExecutableCacheTrim;
+    /// Returns the total bytes required for all outputs on one execution device.
+    pub fn outputByteSize(self: *const CompiledExecutable) !usize {
+        var total: usize = 0;
+        for (self.plan.output_ids) |value_id| {
+            if (value_id.index >= self.plan.values.len) return error.InvalidGraph;
+            const descriptor = self.plan.values[value_id.index].descriptor;
+            total = try std.math.add(usize, total, ir.denseByteSize(descriptor.element_type, descriptor.dims));
+        }
+        return total;
+    }
 
-/// Narrow runtime surface needed by executable lowering and execution.
-pub const Context = struct {
-    backend: backend_api.Backend,
-    devices: []Device,
-    user_context: ?*anyopaque = null,
-    acquire_cached_executable: ?AcquireCachedExecutableFn = null,
-    release_cached_executable: ?ReleaseCachedExecutableFn = null,
-    trim_executable_cache: ?TrimExecutableCacheFn = null,
+    /// Returns the number of per-device execution slots embedded in this executable.
+    pub fn deviceCount(self: *const CompiledExecutable) usize {
+        return self.schedule.deviceCount();
+    }
 
-    /// Finds a device by stable PJRT id within the context topology.
-    pub fn lookupDevice(self: Context, id: i32) ?*const Device {
-        for (self.devices) |*device| {
-            if (device.id == id) return device;
+    /// Returns whether backend residency is available for execution.
+    pub fn hasResidentBackendExecutable(self: *const CompiledExecutable) bool {
+        return self.residency.hasBackendExecutable();
+    }
+
+    /// Returns the number of compiler instructions represented by the resident backend program.
+    pub fn residentProgramInstructionCount(self: *const CompiledExecutable) usize {
+        return self.residency.programInstructionCount();
+    }
+
+    /// Returns whether backend executable acquisition reused a resident cache entry.
+    pub fn backendExecutableCacheReused(self: *const CompiledExecutable) bool {
+        return self.residency.cacheReused();
+    }
+
+    /// Returns the stable PJRT device id assigned to one executable device slot.
+    pub fn deviceIdAt(self: *const CompiledExecutable, index: usize) ?i32 {
+        return self.schedule.deviceIdAt(index);
+    }
+
+    /// Returns the number of logical devices selected by compile options.
+    pub fn executableDeviceCount(self: *const CompiledExecutable) usize {
+        return self.plan.options.numDevices();
+    }
+
+    /// Returns the number of replicas requested by compile options.
+    pub fn numReplicas(self: *const CompiledExecutable) i32 {
+        return self.plan.options.num_replicas;
+    }
+
+    /// Returns the number of partitions requested by compile options.
+    pub fn numPartitions(self: *const CompiledExecutable) i32 {
+        return self.plan.options.num_partitions;
+    }
+
+    /// Returns the stable executable fingerprint string.
+    pub fn fingerprintText(self: *const CompiledExecutable) []const u8 {
+        return self.fingerprint;
+    }
+
+    /// Returns the optimized program text retained for PJRT metadata queries.
+    pub fn optimizedProgramText(self: *const CompiledExecutable) []const u8 {
+        return self.optimized_program;
+    }
+
+    /// Returns whether executing may consume ownership of a parameter buffer.
+    pub fn donatesParameter(self: *const CompiledExecutable, parameter_index: usize) bool {
+        for (self.plan.donated_parameter_indices) |candidate| {
+            if (candidate == parameter_index) return true;
+        }
+        return false;
+    }
+
+    /// Returns the donated parameter that may alias a given output, if any.
+    pub fn donatedParameterAliasForOutput(self: *const CompiledExecutable, output_index: usize) ?OutputAlias {
+        for (self.plan.output_aliases) |alias| {
+            if (alias.output_index == output_index and self.donatesParameter(alias.parameter_index)) {
+                return .{ .parameter_index = alias.parameter_index, .kind = alias.kind };
+            }
+        }
+        if (output_index >= self.plan.output_ids.len) return null;
+        const output_id = self.plan.output_ids[output_index];
+        var parameter_index: usize = 0;
+        for (self.plan.values) |value| {
+            if (value.role != .parameter) continue;
+            if (value.id.index == output_id.index) {
+                return if (self.donatesParameter(parameter_index)) .{ .parameter_index = parameter_index, .kind = .identity } else null;
+            }
+            parameter_index += 1;
         }
         return null;
     }
 
-    fn acquireCachedExecutable(self: Context, allocator: std.mem.Allocator, fingerprint: []const u8, plan: *const ir.ExecutablePlan, device_local_hardware_ids: []const i32) CacheAcquireError!?CachedBackendExecutable {
-        const callback = self.acquire_cached_executable orelse return null;
-        const user_context = self.user_context orelse return null;
-        return callback(user_context, allocator, fingerprint, plan, device_local_hardware_ids);
+    /// Returns true when a backend output matches the compiler-owned output descriptor.
+    pub fn backendOutputMatches(self: *const CompiledExecutable, output_index: usize, output: backend_api.ExecutableOutput) bool {
+        if (output_index >= self.plan.output_ids.len) return false;
+        const value_id = self.plan.output_ids[output_index];
+        if (value_id.index >= self.plan.values.len) return false;
+        const descriptor = self.plan.values[value_id.index].descriptor;
+        if (output.element_type != descriptor.element_type) return false;
+        if (!std.mem.eql(i64, output.dims, descriptor.dims)) return false;
+        if (output.byte_size != ir.denseByteSize(descriptor.element_type, descriptor.dims)) return false;
+        return true;
     }
 
-    fn releaseCachedExecutable(self: Context, entry: *ExecutableCacheEntry) void {
-        if (self.release_cached_executable) |callback| {
-            if (self.user_context) |user_context| callback(user_context, entry);
-        } else if (entry.ref_count != 0) {
-            entry.ref_count -= 1;
-        }
+    /// Returns backend executable statistics with runtime donation aliases included.
+    pub fn backendExecutableStats(self: *const CompiledExecutable) ?backend_api.ExecutableStats {
+        return self.residency.backendExecutableStats();
     }
 
-    /// Requests executable-cache pressure relief before execution allocates outputs.
-    pub fn trimExecutableCacheForAllocation(self: Context, memory: *Memory, allocation_bytes: usize) ExecutableCacheTrim {
-        const callback = self.trim_executable_cache orelse return .{ .requested_bytes = @intCast(allocation_bytes) };
-        const user_context = self.user_context orelse return .{ .requested_bytes = @intCast(allocation_bytes) };
-        return callback(user_context, memory, allocation_bytes);
-    }
-};
-
-/// Classifies runtime graph nodes without exposing compiler instruction names.
-pub const GraphNodeKind = enum {
-    constant,
-    parameter,
-    compute,
-    collective,
-    custom_call,
-    control_flow,
-    structural,
-};
-
-/// Describes one scheduled plan instruction on one assigned runtime device.
-pub const GraphNode = struct {
-    instruction_index: usize,
-    device_index: usize,
-    device_id: i32,
-    kind: GraphNodeKind,
-};
-
-/// Carries optional lowering diagnostics and cache identity into graph creation.
-pub const LoweringOptions = struct {
-    diagnostic_writer: ?*std.Io.Writer = null,
-    cache_fingerprint: ?[]const u8 = null,
-};
-
-/// Records the runtime lowering outcome needed by execution and diagnostics.
-pub const LoweringPipeline = struct {
-    backend_executable_ready: bool,
-    backend_executable_cache_reused: bool = false,
-    lowered_instruction_count: usize,
-};
-
-/// Owns the resident backend executable and per-device runtime graph metadata.
-pub const ExecutableGraph = struct {
-    allocator: std.mem.Allocator,
-    backend: backend_api.Backend,
-    device_ids: []i32,
-    device_local_hardware_ids: []i32,
-    nodes: []GraphNode,
-    backend_executable: ?backend_api.ExecutableHandle = null,
-    backend_executable_cache_entry: ?*ExecutableCacheEntry = null,
-    context: Context,
-    lowering: LoweringPipeline,
-    last_compile_cache_trim: ExecutableCacheTrim = .{},
-    last_execute_cache_trim: ExecutableCacheTrim = .{},
-    last_backend_completion: backend_api.ExecutionCompletion = .{},
-    donation_alias_stats: DonationAliasStats = .{},
-
-    /// Builds an executable graph for the provided runtime context and plan.
-    pub fn init(allocator: std.mem.Allocator, context: Context, plan: *const ir.ExecutablePlan) !ExecutableGraph {
-        return initWithOptions(allocator, context, plan, .{});
+    /// Returns the compile-time executable-cache trimming outcome.
+    pub fn compileCacheTrim(self: *const CompiledExecutable) ExecutableCacheTrim {
+        return self.residency.compileCacheTrim();
     }
 
-    /// Builds an executable graph and optionally acquires a cached backend executable.
-    pub fn initWithOptions(allocator: std.mem.Allocator, context: Context, plan: *const ir.ExecutablePlan, options: LoweringOptions) !ExecutableGraph {
-        const device_count = plan.options.numDevices();
-        if (device_count == 0 or device_count > context.devices.len) return error.InvalidGraph;
+    /// Returns the most recent execute-time executable-cache trimming outcome.
+    pub fn executeCacheTrim(self: *const CompiledExecutable) ExecutableCacheTrim {
+        return self.residency.executeCacheTrim();
+    }
 
-        const device_ids = try allocator.alloc(i32, device_count);
-        errdefer allocator.free(device_ids);
-        const device_local_hardware_ids = try allocator.alloc(i32, device_count);
-        errdefer allocator.free(device_local_hardware_ids);
-        for (device_ids, 0..) |*device_id, i| {
-            device_id.* = if (plan.options.device_assignment.len != 0)
-                plan.options.device_assignment[i]
-            else
-                context.devices[i].id;
-            const device = context.lookupDevice(device_id.*) orelse return error.InvalidGraph;
-            device_local_hardware_ids[i] = device.local_hardware_id;
+    /// Returns the most recent backend completion token observed by execution.
+    pub fn backendCompletion(self: *const CompiledExecutable) backend_api.ExecutionCompletion {
+        return self.residency.backendCompletion();
+    }
+
+    /// Returns the resident backend handle used by the execution dispatcher.
+    pub fn backendExecutableForDispatch(self: *const CompiledExecutable) ?backend_api.ExecutableHandle {
+        return self.residency.backendExecutableForDispatch();
+    }
+
+    /// Records cache trimming done immediately before output allocation.
+    pub fn recordExecuteCacheTrim(self: *CompiledExecutable, trim: ExecutableCacheTrim) void {
+        self.residency.recordExecuteCacheTrim(trim);
+    }
+
+    /// Records the latest backend completion token observed by execution.
+    pub fn recordBackendCompletion(self: *CompiledExecutable, completion: backend_api.ExecutionCompletion) void {
+        self.residency.recordBackendCompletion(completion);
+    }
+
+    /// Adds donation alias counters to this executable's residency statistics.
+    pub fn recordDonationAlias(self: *CompiledExecutable, bytes: usize) void {
+        self.residency.recordDonationAlias(bytes);
+    }
+
+    /// Removes donation alias counters when execution setup fails.
+    pub fn rollbackDonationAlias(self: *CompiledExecutable, output_count: usize, output_bytes: usize) void {
+        self.residency.rollbackDonationAlias(output_count, output_bytes);
+    }
+
+    /// Narrow test access for executable invariants that are not runtime API surface.
+    pub const Testing = struct {
+        /// Overrides donated parameters for focused runtime/PJRT ABI tests.
+        pub fn setDonatedParameters(executable: *CompiledExecutable, donated_parameter_indices: []u32) void {
+            executable.plan.donated_parameter_indices = donated_parameter_indices;
         }
 
-        const node_count = std.math.mul(usize, plan.instructions.len, device_count) catch return error.InvalidGraph;
-        const nodes = try allocator.alloc(GraphNode, node_count);
-        errdefer allocator.free(nodes);
-
-        var out: usize = 0;
-        for (0..device_count) |device_index| {
-            for (plan.instructions, 0..) |instruction, instruction_index| {
-                nodes[out] = .{
-                    .instruction_index = instruction_index,
-                    .device_index = device_index,
-                    .device_id = device_ids[device_index],
-                    .kind = graphNodeKind(instruction.kind),
-                };
-                out += 1;
-            }
+        /// Builds a compiled executable around a caller-owned plan for focused runtime tests.
+        pub fn initBorrowedResident(allocator: std.mem.Allocator, context: Context, plan: *ir.ExecutablePlan, options: BackendCompileOptions) !CompiledExecutable {
+            var resident = try ResidentExecutable.init(allocator, context, plan, options);
+            errdefer resident.deinit();
+            return .{
+                .plan = plan,
+                .schedule = resident.schedule,
+                .residency = resident.residency,
+                .optimized_program = &.{},
+                .fingerprint = options.cache_fingerprint orelse &.{},
+                .cache_hit = false,
+                .backend_stats = resident.residency.backendExecutableStats() orelse .{},
+            };
         }
 
-        var backend_executable_cache_entry: ?*ExecutableCacheEntry = null;
-        var backend_executable_cache_reused = false;
-        var last_compile_cache_trim = ExecutableCacheTrim{};
-        const backend_executable = if (options.cache_fingerprint) |fingerprint| blk: {
-            const cached = try context.acquireCachedExecutable(allocator, fingerprint, plan, device_local_hardware_ids);
-            if (cached) |entry| {
-                backend_executable_cache_entry = entry.entry;
-                backend_executable_cache_reused = entry.reused;
-                last_compile_cache_trim = entry.compile_trim;
-                break :blk entry.handle;
-            }
-            break :blk null;
-        } else context.backend.compileExecutable(allocator, plan, device_local_hardware_ids) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => null,
-        };
-        errdefer if (backend_executable) |handle| {
-            if (backend_executable_cache_entry) |entry| context.releaseCachedExecutable(entry) else context.backend.destroyExecutable(handle);
-        };
-        if (backend_executable == null) {
-            if (options.diagnostic_writer) |writer| {
-                context.backend.writeExecutableLoweringDiagnostic(plan, device_local_hardware_ids, writer) catch {};
-            }
-            return error.UnsupportedRuntimeFeature;
+        /// Releases residency for a compiled executable that borrowed its plan and metadata.
+        pub fn deinitBorrowedResident(executable: *CompiledExecutable) void {
+            executable.releaseResidentStorage();
+            executable.* = undefined;
         }
+
+        /// Returns the number of scheduled instruction/device nodes.
+        pub fn scheduledNodeCount(executable: *const CompiledExecutable) usize {
+            return executable.schedule.nodeCount();
+        }
+
+        /// Returns one scheduled instruction/device node.
+        pub fn scheduledNodeAt(executable: *const CompiledExecutable, index: usize) ?ScheduleNode {
+            return executable.schedule.nodeAt(index);
+        }
+    };
+};
+
+const ResidentExecutable = struct {
+    schedule: ExecutableSchedule,
+    residency: ExecutableResidency,
+
+    fn init(allocator: std.mem.Allocator, context: Context, plan: *const ir.ExecutablePlan, options: BackendCompileOptions) !ResidentExecutable {
+        var schedule = try ExecutableSchedule.init(allocator, context, plan);
+        errdefer schedule.deinit();
+
+        var residency = try ExecutableResidency.init(context, plan, &schedule, options);
+        errdefer residency.deinit();
 
         return .{
-            .allocator = allocator,
-            .backend = context.backend,
-            .device_ids = device_ids,
-            .device_local_hardware_ids = device_local_hardware_ids,
-            .nodes = nodes,
-            .backend_executable = backend_executable,
-            .backend_executable_cache_entry = backend_executable_cache_entry,
-            .context = context,
-            .lowering = .{
-                .backend_executable_ready = true,
-                .backend_executable_cache_reused = backend_executable_cache_reused,
-                .lowered_instruction_count = plan.instructions.len,
-            },
-            .last_compile_cache_trim = last_compile_cache_trim,
+            .schedule = schedule,
+            .residency = residency,
         };
     }
 
-    /// Releases backend residency, cache references, and graph-owned storage.
-    pub fn deinit(self: *ExecutableGraph) void {
-        if (self.backend_executable) |handle| {
-            if (self.backend_executable_cache_entry) |entry| {
-                self.context.releaseCachedExecutable(entry);
-            } else {
-                self.backend.destroyExecutable(handle);
-            }
-        }
-        self.allocator.free(self.device_local_hardware_ids);
-        self.allocator.free(self.nodes);
-        self.allocator.free(self.device_ids);
+    fn deinit(self: *ResidentExecutable) void {
+        self.residency.deinit();
+        self.schedule.deinit();
         self.* = undefined;
     }
-
-    /// Returns backend residency statistics with runtime donation aliases included.
-    pub fn backendExecutableStats(self: *const ExecutableGraph) ?backend_api.ExecutableStats {
-        const handle = self.backend_executable orelse return null;
-        var stats = self.backend.executableStats(handle);
-        stats.donation_alias_output_count += self.donation_alias_stats.output_count;
-        stats.donation_alias_output_bytes += self.donation_alias_stats.output_bytes;
-        return stats;
-    }
 };
-
-fn graphNodeKind(kind: ir.PlanInstructionKind) GraphNodeKind {
-    return switch (kind) {
-        .constant => .constant,
-        .custom_call => .custom_call,
-        .while_ => .control_flow,
-        .tuple, .get_tuple_element, .optimization_barrier => .structural,
-        else => .compute,
-    };
-}
 
 const ExecutableTestContext = struct {
     allocator: std.mem.Allocator,
     backend: backend_api.Backend,
     descriptors: []ir.DeviceDescriptor,
-    devices: []Device,
-    memories: []Memory,
-    addressable_device_ids: []i32,
-    addressable_devices: []*Device,
-    addressable_memories: []*Memory,
+    topology: DeviceMemoryTopology,
 
     fn init(allocator: std.mem.Allocator) !ExecutableTestContext {
         const backend = backend_api.create();
@@ -271,66 +322,19 @@ const ExecutableTestContext = struct {
         errdefer backend.releaseDeviceDescriptors(allocator, descriptors);
         if (descriptors.len == 0) return error.InvalidDeviceCount;
 
-        const devices = try allocator.alloc(Device, 1);
-        errdefer allocator.free(devices);
-
-        const memories = try allocator.alloc(Memory, 1);
-        errdefer allocator.free(memories);
-
-        const addressable_device_ids = try allocator.alloc(i32, 1);
-        errdefer allocator.free(addressable_device_ids);
-
-        const addressable_devices = try allocator.alloc(*Device, 1);
-        errdefer allocator.free(addressable_devices);
-
-        const addressable_memories = try allocator.alloc(*Memory, 1);
-        errdefer allocator.free(addressable_memories);
-
-        const descriptor = descriptors[0];
-        addressable_device_ids[0] = descriptor.id;
-        memories[0] = .{
-            .id = descriptor.default_memory_id,
-            .kind = .device,
-            .debug_string = "device",
-            .addressable_device_ids = addressable_device_ids,
-            .addressable_devices = addressable_devices,
-            .stats = .{ .capacity_bytes = descriptor.memory_bytes },
-        };
-        devices[0] = .{
-            .id = descriptor.id,
-            .local_hardware_id = descriptor.local_hardware_id,
-            .registry_id = descriptor.registry_id,
-            .process_index = descriptor.process_index,
-            .addressable = descriptor.addressable,
-            .name = descriptor.name,
-            .debug_string = descriptor.debug_string,
-            .memory_bytes = descriptor.memory_bytes,
-            .has_unified_memory = descriptor.has_unified_memory,
-            .default_memory_id = descriptor.default_memory_id,
-            .default_memory = &memories[0],
-            .addressable_memories = addressable_memories,
-        };
-        addressable_devices[0] = &devices[0];
-        addressable_memories[0] = &memories[0];
+        const topology = try DeviceMemoryTopology.initFromDescriptors(allocator, descriptors);
+        errdefer topology.deinit(allocator);
 
         return .{
             .allocator = allocator,
             .backend = backend,
             .descriptors = descriptors,
-            .devices = devices,
-            .memories = memories,
-            .addressable_device_ids = addressable_device_ids,
-            .addressable_devices = addressable_devices,
-            .addressable_memories = addressable_memories,
+            .topology = topology,
         };
     }
 
     fn deinit(self: *ExecutableTestContext) void {
-        self.allocator.free(self.addressable_memories);
-        self.allocator.free(self.addressable_devices);
-        self.allocator.free(self.addressable_device_ids);
-        self.allocator.free(self.memories);
-        self.allocator.free(self.devices);
+        self.topology.deinit(self.allocator);
         self.backend.releaseDeviceDescriptors(self.allocator, self.descriptors);
         self.* = undefined;
     }
@@ -338,20 +342,22 @@ const ExecutableTestContext = struct {
     fn executableContext(self: *ExecutableTestContext) Context {
         return .{
             .backend = self.backend,
-            .devices = self.devices,
+            .devices = self.topology.deviceSlice(),
         };
     }
 };
 
-fn testShardingPlan(allocator: std.mem.Allocator, assignment: []const i32) !ir.ShardingPlan {
-    return .{
-        .kind = .replicated,
-        .mesh_name = try allocator.dupe(u8, ""),
-        .device_assignment = try allocator.dupe(i32, assignment),
-    };
-}
+const ExecutableTestSupport = struct {
+    fn shardingPlan(allocator: std.mem.Allocator, assignment: []const i32) !ir.ShardingPlan {
+        return .{
+            .kind = .replicated,
+            .mesh_name = try allocator.dupe(u8, ""),
+            .device_assignment = try allocator.dupe(i32, assignment),
+        };
+    }
+};
 
-test "executable graph materializes per-device scheduled nodes" {
+test "compiled executable materializes per-device scheduled nodes" {
     var ctx = try ExecutableTestContext.init(std.testing.allocator);
     defer ctx.deinit();
     const allocator = std.testing.allocator;
@@ -375,10 +381,10 @@ test "executable graph materializes per-device scheduled nodes" {
     }
 
     var parameter_shardings = try allocator.alloc(ir.ShardingPlan, 2);
-    parameter_shardings[0] = try testShardingPlan(allocator, &assignment);
-    parameter_shardings[1] = try testShardingPlan(allocator, &assignment);
+    parameter_shardings[0] = try ExecutableTestSupport.shardingPlan(allocator, &assignment);
+    parameter_shardings[1] = try ExecutableTestSupport.shardingPlan(allocator, &assignment);
     var output_shardings = try allocator.alloc(ir.ShardingPlan, 1);
-    output_shardings[0] = try testShardingPlan(allocator, &assignment);
+    output_shardings[0] = try ExecutableTestSupport.shardingPlan(allocator, &assignment);
 
     var plan = ir.ExecutablePlan{
         .allocator = allocator,
@@ -399,23 +405,20 @@ test "executable graph materializes per-device scheduled nodes" {
     };
     defer plan.deinit();
 
-    var graph = try ExecutableGraph.init(allocator, ctx.executableContext(), &plan);
-    defer graph.deinit();
+    var executable = try CompiledExecutable.Testing.initBorrowedResident(allocator, ctx.executableContext(), &plan, .{});
+    defer CompiledExecutable.Testing.deinitBorrowedResident(&executable);
 
-    try std.testing.expectEqualSlices(i32, &.{0}, graph.device_ids);
-    try std.testing.expectEqual(@as(usize, 1), graph.nodes.len);
-    try std.testing.expectEqual(GraphNodeKind.compute, graph.nodes[0].kind);
-    try std.testing.expectEqual(@as(usize, 0), graph.nodes[0].device_index);
-    try std.testing.expectEqual(@as(i32, 0), graph.nodes[0].device_id);
-    try std.testing.expectEqual(true, graph.lowering.backend_executable_ready);
-    try std.testing.expectEqual(@as(usize, 1), graph.lowering.lowered_instruction_count);
-    try std.testing.expectEqual(GraphNodeKind.constant, graphNodeKind(.constant));
-    try std.testing.expectEqual(GraphNodeKind.custom_call, graphNodeKind(.custom_call));
-    try std.testing.expectEqual(GraphNodeKind.structural, graphNodeKind(.optimization_barrier));
-    try std.testing.expectEqual(GraphNodeKind.control_flow, graphNodeKind(.while_));
+    try std.testing.expectEqual(@as(i32, 0), executable.deviceIdAt(0).?);
+    try std.testing.expectEqual(@as(usize, 1), CompiledExecutable.Testing.scheduledNodeCount(&executable));
+    const node = CompiledExecutable.Testing.scheduledNodeAt(&executable, 0).?;
+    try std.testing.expectEqual(ScheduleNodeKind.compute, node.kind);
+    try std.testing.expectEqual(@as(usize, 0), node.device_index);
+    try std.testing.expectEqual(@as(i32, 0), node.device_id);
+    try std.testing.expect(executable.hasResidentBackendExecutable());
+    try std.testing.expectEqual(@as(usize, 1), executable.residentProgramInstructionCount());
 }
 
-test "executable graph device-only lowering rejects unsupported backend executable" {
+test "compiled executable rejects unsupported backend executable acquisition" {
     var ctx = try ExecutableTestContext.init(std.testing.allocator);
     defer ctx.deinit();
     const allocator = std.testing.allocator;
@@ -439,6 +442,6 @@ test "executable graph device-only lowering rejects unsupported backend executab
 
     try std.testing.expectError(
         error.UnsupportedRuntimeFeature,
-        ExecutableGraph.initWithOptions(allocator, ctx.executableContext(), &plan, .{}),
+        CompiledExecutable.Testing.initBorrowedResident(allocator, ctx.executableContext(), &plan, .{}),
     );
 }

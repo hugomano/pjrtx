@@ -205,7 +205,7 @@ const DeviceAttributesCache = struct {
     }
 
     fn releaseClient(client: *const runtime.Client) void {
-        for (client.devices) |*device| forget(device);
+        for (client.topologyDevices()) |*device| forget(device);
     }
 };
 

@@ -66,14 +66,14 @@ pub const TopologyDescription = struct {
     }
 
     fn devices(self: TopologyDescription) []const *runtime.Device {
-        return self.client.device_handles;
+        return self.client.deviceHandles();
     }
 
     fn fingerprint(self: TopologyDescription) u64 {
         var hasher = std.hash.Wyhash.init(0);
         hasher.update(plugin.Platform.name);
         hasher.update(plugin.Platform.version);
-        for (self.client.devices) |device| {
+        for (self.client.topologyDevices()) |device| {
             hasher.update(std.mem.asBytes(&device.id));
             hasher.update(std.mem.asBytes(&device.local_hardware_id));
             hasher.update(std.mem.asBytes(&device.process_index));
@@ -85,8 +85,8 @@ pub const TopologyDescription = struct {
     fn serialize(self: TopologyDescription) ?*SerializedTopology {
         var writer = std.Io.Writer.Allocating.init(plugin.allocator());
         defer writer.deinit();
-        writer.writer.print("platform={s};version={s};devices={d}", .{ plugin.Platform.name, plugin.Platform.version, self.client.devices.len }) catch return null;
-        for (self.client.devices) |device| {
+        writer.writer.print("platform={s};version={s};devices={d}", .{ plugin.Platform.name, plugin.Platform.version, self.client.deviceCount() }) catch return null;
+        for (self.client.topologyDevices()) |device| {
             writer.writer.print(";device={d}:{d}:{d}:{s}", .{ device.id, device.local_hardware_id, device.process_index, device.name }) catch return null;
         }
         const topology = plugin.allocator().create(SerializedTopology) catch return null;

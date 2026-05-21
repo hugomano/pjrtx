@@ -34,15 +34,15 @@ pub const Buffer = struct {
     }
 
     fn elementType(self: Buffer) c.PJRT_Buffer_Type {
-        return buffer_element.ElementType.toPjrt(self.ptr.element_type);
+        return buffer_element.ElementType.toPjrt(self.ptr.elementType());
     }
 
     fn onDeviceSize(self: Buffer) usize {
-        return self.ptr.byte_size;
+        return self.ptr.onDeviceSizeInBytes();
     }
 
     fn isDeleted(self: Buffer) bool {
-        return self.ptr.deleted;
+        return self.ptr.isDeleted();
     }
 
     fn isOnCpu(_: Buffer) bool {
@@ -50,15 +50,15 @@ pub const Buffer = struct {
     }
 
     fn device(self: Buffer) *c.PJRT_Device {
-        return handles.Device.handle(self.ptr.device);
+        return handles.Device.handle(@constCast(self.ptr.devicePlacement()));
     }
 
     fn memory(self: Buffer) *c.PJRT_Memory {
-        return handles.Memory.handle(self.ptr.memory);
+        return handles.Memory.handle(self.ptr.memoryPlacement());
     }
 
     fn readyEvent(self: Buffer) ?*c.PJRT_Event {
-        return PjrtEvent.fromRuntime(self.ptr.ready_event);
+        return PjrtEvent.fromRuntime(self.ptr.readinessEvent());
     }
 
     fn destroy(raw: ?*c.PJRT_Buffer) void {
@@ -210,8 +210,9 @@ const BufferDims = struct {
     }
 
     fn writeTo(self: BufferDims, args: anytype) void {
-        args.dims = self.buffer.ptr.dims.ptr;
-        args.num_dims = self.buffer.ptr.dims.len;
+        const dims = self.buffer.ptr.dimensions();
+        args.dims = dims.ptr;
+        args.num_dims = dims.len;
     }
 };
 

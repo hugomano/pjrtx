@@ -5,10 +5,7 @@ const handles = @import("pjrt_handles.zig");
 
 /// Maps a runtime device pointer back to its index in a PJRT client topology.
 fn deviceIndex(client: *const runtime.Client, device: *const runtime.Device) ?usize {
-    for (client.devices, 0..) |*candidate, i| {
-        if (candidate == device or candidate.id == device.id) return i;
-    }
-    return null;
+    return client.deviceIndex(device);
 }
 
 /// Describes where a PJRT buffer is placed in a client topology.
@@ -23,7 +20,7 @@ pub const Placement = struct {
 
     /// Resolves optional PJRT device/memory handles for host-imported buffers.
     pub fn forHostBuffer(client: *runtime.Client, device_arg: ?*c.PJRT_Device, memory_arg: ?*c.PJRT_Memory) Error!Placement {
-        const device = if (device_arg) |dev| handles.Device.ref(dev) else &client.devices[0];
+        const device = if (device_arg) |dev| handles.Device.ref(dev) else client.defaultDevice();
         const memory = if (memory_arg) |mem| handles.Memory.ref(mem) else device.default_memory;
         return forResolved(client, device, memory);
     }
@@ -31,7 +28,7 @@ pub const Placement = struct {
     /// Resolves optional PJRT device/memory handles for device-allocated buffers.
     pub fn forDeviceBuffer(client: *runtime.Client, device_arg: ?*c.PJRT_Device, memory_arg: ?*c.PJRT_Memory) Error!Placement {
         const memory = if (memory_arg) |mem| handles.Memory.ref(mem) else blk: {
-            const device = if (device_arg) |dev| handles.Device.ref(dev) else &client.devices[0];
+            const device = if (device_arg) |dev| handles.Device.ref(dev) else client.defaultDevice();
             break :blk device.default_memory;
         };
         const device = if (device_arg) |dev| handles.Device.ref(dev) else blk: {

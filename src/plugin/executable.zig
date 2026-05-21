@@ -14,85 +14,72 @@ const PjrtError = errors.Error;
 
 const ExecutableOwned = struct {
     client: *runtime.Client,
-    plan: *runtime.ExecutablePlan,
-    graph: runtime.ExecutableGraph,
+    compiled: runtime.CompiledExecutable,
     logical_ids: []c.PJRT_LogicalDeviceIds,
-    optimized_program: []u8,
     parameter_memory_kinds: [][*c]const u8,
     parameter_memory_kind_sizes: []usize,
     output_memory_kinds: [][*c]const u8,
     output_memory_kind_sizes: []usize,
-    fingerprint: []u8,
     name: []const u8 = "pjrtx_executable",
     deleted: bool = false,
-    graph_released: bool = false,
 };
 
-/// Opaque loaded-executable handle owning a runtime plan and resident graph.
+/// Opaque loaded-executable handle owning a runtime plan and resident executable.
 pub const Executable = opaque {
     /// Takes ownership of a compiled runtime executable and prepares PJRT metadata.
     pub fn create(client: *runtime.Client, compiled: *runtime.CompiledExecutable) !*Executable {
-        const plan = compiled.plan;
+        const device_count = compiled.executableDeviceCount();
+        const partition_count: usize = @intCast(compiled.numPartitions());
 
-        const logical_ids = try plugin.allocator().alloc(c.PJRT_LogicalDeviceIds, plan.options.numDevices());
+        const logical_ids = try plugin.allocator().alloc(c.PJRT_LogicalDeviceIds, device_count);
         errdefer plugin.allocator().free(logical_ids);
         for (logical_ids, 0..) |*id, index| {
             id.* = .{
-                .replica = @intCast(index / @as(usize, @intCast(plan.options.num_partitions))),
-                .partition = @intCast(index % @as(usize, @intCast(plan.options.num_partitions))),
+                .replica = @intCast(index / partition_count),
+                .partition = @intCast(index % partition_count),
             };
         }
 
-        const parameter_memory_kinds = try plugin.allocator().alloc([*c]const u8, plan.parameter_shardings.len);
+        const parameter_memory_kinds = try plugin.allocator().alloc([*c]const u8, compiled.parameterCount());
         errdefer plugin.allocator().free(parameter_memory_kinds);
-        const parameter_memory_kind_sizes = try plugin.allocator().alloc(usize, plan.parameter_shardings.len);
+        const parameter_memory_kind_sizes = try plugin.allocator().alloc(usize, compiled.parameterCount());
         errdefer plugin.allocator().free(parameter_memory_kind_sizes);
         MemoryKinds.fillDefault(parameter_memory_kinds, parameter_memory_kind_sizes);
 
-        const output_memory_kinds = try plugin.allocator().alloc([*c]const u8, plan.output_shardings.len);
+        const output_memory_kinds = try plugin.allocator().alloc([*c]const u8, compiled.outputCount());
         errdefer plugin.allocator().free(output_memory_kinds);
-        const output_memory_kind_sizes = try plugin.allocator().alloc(usize, plan.output_shardings.len);
+        const output_memory_kind_sizes = try plugin.allocator().alloc(usize, compiled.outputCount());
         errdefer plugin.allocator().free(output_memory_kind_sizes);
         MemoryKinds.fillDefault(output_memory_kinds, output_memory_kind_sizes);
 
         const executable = try plugin.allocator().create(ExecutableOwned);
         executable.* = .{
             .client = client,
-            .plan = compiled.plan,
-            .graph = compiled.graph,
+            .compiled = compiled.*,
             .logical_ids = logical_ids,
-            .optimized_program = compiled.optimized_program,
             .parameter_memory_kinds = parameter_memory_kinds,
             .parameter_memory_kind_sizes = parameter_memory_kind_sizes,
             .output_memory_kinds = output_memory_kinds,
             .output_memory_kind_sizes = output_memory_kind_sizes,
-            .fingerprint = compiled.fingerprint,
         };
         return @ptrCast(executable);
     }
 
-    /// Releases the runtime plan, backend graph, and PJRT-owned metadata.
+    /// Releases the runtime plan, backend residency, and PJRT-owned metadata.
     pub fn deinit(self: *Executable) void {
         const executable = self.owned();
-        self.releaseGraph();
-        plugin.allocator().free(executable.fingerprint);
         plugin.allocator().free(executable.output_memory_kind_sizes);
         plugin.allocator().free(executable.output_memory_kinds);
         plugin.allocator().free(executable.parameter_memory_kind_sizes);
         plugin.allocator().free(executable.parameter_memory_kinds);
-        plugin.allocator().free(executable.optimized_program);
         plugin.allocator().free(executable.logical_ids);
-        executable.plan.deinit();
-        plugin.allocator().destroy(executable.plan);
+        executable.compiled.deinit(plugin.allocator());
         plugin.allocator().destroy(executable);
     }
 
-    /// Releases backend graph residency while keeping PJRT metadata queryable.
-    pub fn releaseGraph(self: *Executable) void {
-        const executable = self.owned();
-        if (executable.graph_released) return;
-        executable.graph.deinit();
-        executable.graph_released = true;
+    /// Releases backend residency while keeping PJRT metadata queryable.
+    pub fn releaseResidentStorage(self: *Executable) void {
+        self.owned().compiled.releaseResidentStorage();
     }
 
     /// Returns whether PJRT callers may still execute this loaded executable.
@@ -102,48 +89,73 @@ pub const Executable = opaque {
 
     /// Returns the number of PJRT parameters expected on each execution device.
     pub fn parameterCount(self: *const Executable) usize {
-        return self.ownedConst().plan.parameter_shardings.len;
+        return self.ownedConst().compiled.parameterCount();
     }
 
     /// Returns the number of PJRT outputs produced on each execution device.
     pub fn outputCount(self: *const Executable) usize {
-        return self.ownedConst().plan.output_ids.len;
+        return self.ownedConst().compiled.outputCount();
     }
 
-    /// Returns the number of per-device graph plans embedded in this executable.
-    pub fn graphDeviceCount(self: *const Executable) usize {
-        return self.ownedConst().graph.device_ids.len;
+    /// Returns the number of per-device execution slots embedded in this executable.
+    pub fn deviceCount(self: *const Executable) usize {
+        return self.ownedConst().compiled.deviceCount();
+    }
+
+    /// Returns the number of addressable devices this executable may run on.
+    pub fn addressableDeviceCount(self: *const Executable) usize {
+        const executable = self.ownedConst();
+        return @min(executable.compiled.executableDeviceCount(), executable.client.deviceCount());
+    }
+
+    /// Returns addressable device handles for PJRT loaded-executable metadata.
+    pub fn addressableDevices(self: *const Executable) []const *runtime.Device {
+        const executable = self.ownedConst();
+        return executable.client.addressableDeviceHandlesForCount(self.addressableDeviceCount());
+    }
+
+    /// Returns logical device ids in addressable-device order.
+    pub fn logicalDeviceIds(self: *Executable) []c.PJRT_LogicalDeviceIds {
+        return self.owned().logical_ids;
+    }
+
+    /// Returns the stable executable fingerprint string owned by this handle.
+    pub fn fingerprint(self: *const Executable) []const u8 {
+        return self.ownedConst().compiled.fingerprintText();
+    }
+
+    /// Marks the loaded executable deleted and releases resident backend storage.
+    pub fn markDeleted(self: *Executable) void {
+        self.owned().deleted = true;
+        self.releaseResidentStorage();
     }
 
     /// Returns whether executing may consume ownership of a parameter buffer.
     pub fn donatesParameter(self: *const Executable, parameter_index: usize) bool {
-        for (self.ownedConst().plan.donated_parameter_indices) |candidate| {
-            if (candidate == parameter_index) return true;
-        }
-        return false;
+        return self.ownedConst().compiled.donatesParameter(parameter_index);
     }
 
-    /// Executes the resident backend graph for one logical device.
-    pub fn executeDevice(self: *Executable, device_index: usize, arguments: []const *runtime.Buffer) runtime.GraphExecuteError!runtime.GraphExecuteResult {
+    /// Executes the resident backend program for one logical device.
+    pub fn executeDevice(self: *Executable, device_index: usize, arguments: []const *runtime.Buffer) runtime.ExecutionError!runtime.ExecutionResult {
         const executable = self.owned();
-        return runtime.executeDevice(&executable.graph, plugin.allocator(), executable.client.executableContext(), executable.plan, device_index, arguments);
+        return runtime.executeCompiledExecutable(&executable.compiled, plugin.allocator(), executable.client.executableContext(), device_index, arguments);
     }
 
     /// Narrow test access for executable invariants that are not PJRT API surface.
     pub const Testing = struct {
         /// Overrides donated parameters for focused PJRT ABI tests.
         pub fn setDonatedParameters(executable: *Executable, donated_parameter_indices: []u32) void {
-            executable.owned().plan.donated_parameter_indices = donated_parameter_indices;
+            runtime.CompiledExecutable.Testing.setDonatedParameters(&executable.owned().compiled, donated_parameter_indices);
         }
 
         /// Returns backend executable statistics for focused PJRT ABI tests.
         pub fn backendExecutableStats(executable: *const Executable) ?runtime.ExecutableStats {
-            return executable.ownedConst().graph.backendExecutableStats();
+            return executable.ownedConst().compiled.backendExecutableStats();
         }
 
-        /// Returns the last compile-cache trim recorded by graph lowering for tests.
+        /// Returns the last compile-cache trim recorded by backend residency for tests.
         pub fn lastCompileCacheTrim(executable: *const Executable) runtime.ExecutableCacheTrim {
-            return executable.ownedConst().graph.last_compile_cache_trim;
+            return executable.ownedConst().compiled.compileCacheTrim();
         }
     };
 
@@ -189,9 +201,9 @@ pub const ExecutableMetadata = struct {
 
         const name = try plugin.allocator().dupe(u8, executable.name);
         errdefer plugin.allocator().free(name);
-        const fingerprint = try plugin.allocator().dupe(u8, executable.fingerprint);
+        const fingerprint = try plugin.allocator().dupe(u8, executable.compiled.fingerprintText());
         errdefer plugin.allocator().free(fingerprint);
-        const optimized_program = try plugin.allocator().dupe(u8, executable.optimized_program);
+        const optimized_program = try plugin.allocator().dupe(u8, executable.compiled.optimizedProgramText());
         errdefer plugin.allocator().free(optimized_program);
 
         const parameter_memory_kinds = try plugin.allocator().dupe([*c]const u8, executable.parameter_memory_kinds);
@@ -207,9 +219,9 @@ pub const ExecutableMetadata = struct {
             .name = name,
             .fingerprint = fingerprint,
             .optimized_program = optimized_program,
-            .num_replicas = @intCast(executable.plan.options.num_replicas),
-            .num_partitions = @intCast(executable.plan.options.num_partitions),
-            .num_outputs = executable.plan.output_shardings.len,
+            .num_replicas = @intCast(executable.compiled.numReplicas()),
+            .num_partitions = @intCast(executable.compiled.numPartitions()),
+            .num_outputs = executable.compiled.outputCount(),
             .parameter_memory_kinds = parameter_memory_kinds,
             .parameter_memory_kind_sizes = parameter_memory_kind_sizes,
             .output_memory_kinds = output_memory_kinds,
@@ -292,19 +304,15 @@ pub const LoadedExecutable = struct {
     }
 
     fn addressableDeviceCount(self: LoadedExecutable) usize {
-        const executable = self.ptr.ownedConst();
-        return @min(executable.plan.options.numDevices(), executable.client.device_handles.len);
+        return self.ptr.addressableDeviceCount();
     }
 
     fn addressableDevices(self: LoadedExecutable) []const *runtime.Device {
-        const executable = self.ptr.ownedConst();
-        const count = self.addressableDeviceCount();
-        return executable.client.device_handles[0..count];
+        return self.ptr.addressableDevices();
     }
 
     fn delete(self: LoadedExecutable) void {
-        self.ptr.owned().deleted = true;
-        self.ptr.releaseGraph();
+        self.ptr.markDeleted();
     }
 
     fn isDeleted(self: LoadedExecutable) bool {
@@ -318,9 +326,9 @@ pub const LoadedExecutable = struct {
     }
 
     fn writeLogicalIds(self: LoadedExecutable, args: anytype) void {
-        const executable = self.ptr.ownedConst();
-        args.addressable_device_logical_ids = executable.logical_ids.ptr;
-        args.num_addressable_device_logical_ids = executable.logical_ids.len;
+        const logical_ids = self.ptr.logicalDeviceIds();
+        args.addressable_device_logical_ids = logical_ids.ptr;
+        args.num_addressable_device_logical_ids = logical_ids.len;
     }
 
     fn writeEmptyDeviceAssignment(_: LoadedExecutable, args: anytype) void {
@@ -381,9 +389,8 @@ fn LoadedExecutableTextCallback(
     return struct {
         fn call(raw: [*c]Args) callconv(.c) ?*c.PJRT_Error {
             const loaded = LoadedExecutable.at(raw[0].executable);
-            const executable = loaded.ptr.ownedConst();
             abi.Out.writeBytes(ptr_field, size_field, &raw[0], switch (text) {
-                .fingerprint => executable.fingerprint,
+                .fingerprint => loaded.ptr.fingerprint(),
             });
             return null;
         }

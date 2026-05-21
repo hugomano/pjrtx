@@ -70,11 +70,11 @@ pub const Client = struct {
     }
 
     fn devices(self: Client) []const *runtime_mod.Device {
-        return self.ptr.device_handles;
+        return self.ptr.deviceHandles();
     }
 
     fn memories(self: Client) []const *runtime_mod.Memory {
-        return self.ptr.memory_handles;
+        return self.ptr.memoryHandles();
     }
 
     fn lookupDevice(self: Client, id: i32) ?*const runtime_mod.Device {
@@ -382,7 +382,7 @@ const ClientDefaultDeviceAssignment = struct {
     fn call(args: [*c]c.PJRT_Client_DefaultDeviceAssignment_Args) callconv(.c) ?*c.PJRT_Error {
         const client = handles.Client.ref(args[0].client);
         const needed: usize = @intCast(args[0].num_replicas * args[0].num_partitions);
-        if (needed > client.devices.len or needed > args[0].default_assignment_size) {
+        if (needed > client.deviceCount() or needed > args[0].default_assignment_size) {
             return PjrtError.invalidArgument("invalid default device assignment request");
         }
         for (0..needed) |i| args[0].default_assignment[i] = @intCast(i);
@@ -420,7 +420,7 @@ const ClientCreateUninitializedBuffer = struct {
 const ClientCreateBuffersForAsyncHostToDevice = struct {
     fn call(args: [*c]c.PJRT_Client_CreateBuffersForAsyncHostToDevice_Args) callconv(.c) ?*c.PJRT_Error {
         const client = handles.Client.ref(args[0].client);
-        const memory = if (args[0].memory) |mem| handles.Memory.ref(mem) else client.devices[0].default_memory;
+        const memory = if (args[0].memory) |mem| handles.Memory.ref(mem) else client.defaultMemory();
         if (args[0].shape_specs == null and args[0].num_shape_specs != 0) {
             return PjrtError.invalidArgument("shape specs are null");
         }

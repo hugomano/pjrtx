@@ -63,6 +63,22 @@ if grep -Eq 'pub fn init(Elementwise|Compare|Select|Convert|Iota|Reshape|Transpo
   fail "runtime buffers must not expose StableHLO op constructors; lowering belongs to compiler/backend programs"
 fi
 
+if grep -Eq '^const (BufferDescriptor|BufferPlacement|DeviceStorage) = struct\b' src/runtime/buffer.zig; then
+  fail "runtime buffer descriptor, placement, and storage owners must stay in buffer_* owner modules"
+fi
+
+if find src/runtime src/plugin src/backend -name '*.zig' -print0 | xargs -0 grep -Eq 'host_debug|hostDebugByteCount'; then
+  fail "runtime buffers must not retain host-debug storage or expose hostDebugByteCount"
+fi
+
+if find src/runtime -name '*.zig' ! -path 'src/runtime/buffer.zig' ! -path 'src/runtime/buffer_storage.zig' -print0 | xargs -0 grep -Eq '@import\("buffer_storage\.zig"\)|\bstorage\.(handle|backend|accounted_bytes)\b'; then
+  fail "runtime backend buffer storage ownership must stay behind Buffer and buffer_storage.zig"
+fi
+
+if find src/plugin src/compiler src/backend -name '*.zig' -print0 | xargs -0 grep -Eq '@import\("src/runtime/buffer_(descriptor|placement|storage)"'; then
+  fail "runtime buffer owner modules are runtime-internal and must not be imported by plugin, compiler, or backend"
+fi
+
 if grep -Eq 'src/compiler/ir|Elementwise(Binary|Unary)Op|parse.*CustomCallOp' src/runtime/custom_call.zig; then
   fail "runtime custom-call registration must not parse backend operation names"
 fi
@@ -111,6 +127,22 @@ if grep -Eq '@import\("src/compiler"\)|@import\("compile_options\.zig"\)' src/ru
   fail "runtime client must call compile_pipeline instead of importing compiler and compile-options owners"
 fi
 
+if grep -Eq 'compile_pipeline\.|executable_fingerprint\.alloc' src/runtime/client.zig; then
+  fail "runtime client compile orchestration must stay in client_compile.zig"
+fi
+
+if grep -Eq 'clientFromExecutableContext|acquireCachedBackendExecutableForContext|releaseCachedBackendExecutableForContext|trimExecutableCacheForContext' src/runtime/client.zig; then
+  fail "runtime client executable-context callback plumbing must stay in client_executable_context.zig"
+fi
+
+if grep -Eq 'acquireBackendExecutable|release\(self\.io|trimForAllocation\(self\.io|recordCompile\(self\.io|setMaxResidentBytes\(self\.io' src/runtime/client.zig; then
+  fail "runtime client executable residency policy must stay in client_residency.zig"
+fi
+
+if find src/plugin src/compiler src/backend -name '*.zig' -print0 | xargs -0 grep -Eq '@import\("src/runtime/client_(compile|executable_context|residency)"'; then
+  fail "runtime client owner modules are runtime-internal and must not be imported by plugin, compiler, or backend"
+fi
+
 if grep -Eq 'fn (parseCompileOptions|analyzeProgram|makeExecutablePlan|verifyPlan|allocExecutableFingerprint|updateInstructionFingerprint|updateTargetDeviceFingerprint|updateShardingFingerprint)\(' src/runtime/client.zig; then
   fail "runtime client must not own compile-pipeline or executable-fingerprint helpers"
 fi
@@ -147,8 +179,60 @@ if grep -Eq 'pub fn executeDevice\(' src/runtime/execution.zig; then
   fail "runtime execution must expose compiled-executable dispatch, not graph-level executeDevice"
 fi
 
+if grep -Eq '^test "' src/runtime/execution.zig; then
+  fail "runtime execution.zig must stay a facade; execution tests belong in execution_* owner modules"
+fi
+
+if grep -Eq '^fn |^const (DonationAliasDelta|ExecutionTestSupport)\b|tryExecuteBackendExecutable|runtimeEventFromBackendCompletion|argumentMatchesDevice|mapBufferError' src/runtime/execution.zig; then
+  fail "runtime execution.zig must not own implementation helpers; execution work belongs in execution_* owner modules"
+fi
+
+if grep -Eq 'donatedParameterAliasForOutput|takeBackendStorageForDonationAlias|rollbackDonationAlias|recordDonationAlias' src/runtime/execution.zig src/runtime/execution_call.zig src/runtime/execution_outputs.zig; then
+  fail "runtime donation alias logic must stay in execution_donation.zig"
+fi
+
+if grep -Eq 'backendOutputMatches|owned_backend_outputs|backend_outputs' src/runtime/execution.zig src/runtime/execution_call.zig src/runtime/execution_donation.zig src/runtime/execution_completion.zig; then
+  fail "runtime output descriptor validation and wrapping must stay in execution_outputs.zig"
+fi
+
+if grep -Eq 'Buffer\.initBackendHandle' src/runtime/execution.zig src/runtime/execution_call.zig src/runtime/execution_completion.zig; then
+  fail "runtime output descriptor validation and wrapping must stay in execution_outputs.zig"
+fi
+
+if grep -Eq 'executionEventStatus|destroyExecutionEvent|backend returned asynchronous completion|backend execution event' src/runtime/execution.zig src/runtime/execution_call.zig src/runtime/execution_outputs.zig src/runtime/execution_donation.zig; then
+  fail "runtime backend completion adaptation must stay in execution_completion.zig"
+fi
+
+if find src/plugin src/compiler src/backend -name '*.zig' -print0 | xargs -0 grep -Eq '@import\("src/runtime/execution_(call|outputs|donation|completion)"'; then
+  fail "runtime execution owner modules are runtime-internal and must not be imported by plugin, compiler, or backend"
+fi
+
 if grep -Eq 'allocator\.alloc\([^)]*value_(handles|owned)|var value_(handles|owned) =' src/backend/mlx_metal/execution.zig; then
   fail "MLX Metal execution value-handle table allocation must stay behind ValueBindings"
+fi
+
+if grep -Eq '^test "' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution.zig must stay a facade; execution tests belong in execution_* owner modules"
+fi
+
+if grep -Eq '@import\("src/compiler/ir"\)|@import\("(buffer|custom_call|device|program)\.zig"\)' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution.zig must not import backend internals only needed by colocated tests"
+fi
+
+if grep -Eq '^const (ExecuteCall|ValueBindings|ScheduleDispatch|OutputBindings|ProgramNodeDispatch|ControlFlowDispatch|LivenessRelease|MaterializationBoundaryEval|CustomCallDispatch)\b|^fn (executeExecutable|executeCompiledProgram|donatedProgramInputIndices|maybeCreateInitialArgumentCapturedProgram|executeArgumentCapturedProgram|updateArgumentCaptureState|traceScheduleFailure|writeExecuteProfile|writeScheduleProfile)\(' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution.zig must stay a facade; execution implementation belongs in execution_* owner modules"
+fi
+
+if grep -Eq 'programCreateWithCaptures|programExecuteWithDonation|donatedProgramInputIndices|ArgumentCaptureState|InitialCaptureSmallControlBytes|MinCapturedProgramStableInputs' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal compiled-program execution and argument capture must stay in execution_compiled_program.zig"
+fi
+
+if grep -Eq 'handles: \[\]\?BufferHandle|owned: \[\]bool|storeOwnedValueHandle|storeBorrowedValueHandle|destroyOwnedValueHandles' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal execution value binding ownership must stay in execution_values.zig"
+fi
+
+if grep -Eq '^const (ProgramNodeDispatch|ControlFlowDispatch|LivenessRelease|MaterializationBoundaryEval|CustomCallDispatch)\b' src/backend/mlx_metal/execution.zig; then
+  fail "MLX Metal node/control/liveness/materialization/custom-call dispatch owners must not return to execution.zig"
 fi
 
 if grep -Eq '^fn (executeProgramNode|executeControlFlowNode|whilePatternOperandHandle|whileStepOperandHandle|executeLoopInvariantRegionInstruction|loopInvariantRegionOperandHandle)\(' src/backend/mlx_metal/execution.zig; then
@@ -161,6 +245,98 @@ fi
 
 if grep -Eq '^fn executeRegisteredCustomCall\(' src/backend/mlx_metal/execution.zig; then
   fail "MLX Metal custom-call execution must stay behind a backend-local dispatch owner"
+fi
+
+if grep -Eq '^test "' src/backend/mlx_metal/execution_node.zig; then
+  fail "MLX Metal execution_node.zig must stay a dispatch router; node tests belong in operation-family modules"
+fi
+
+if grep -Eq '@import\("(buffer|device|lowering)\.zig"\)|buffer_mod\.Opaque\.' src/backend/mlx_metal/execution_node.zig; then
+  fail "MLX Metal execution_node.zig must route to operation-family owners instead of calling buffer/lowering/device internals directly"
+fi
+
+if grep -Eq '\b(sortKeyValue|topK|reduceWindowMaxWithIndices|reduceMaxWithIndices|rngBitGenerator|optimizationBarrier|getTupleElement)\b' src/backend/mlx_metal/execution_node.zig; then
+  fail "MLX Metal node operation bodies must stay in execution_node_* family modules"
+fi
+
+if find src/runtime src/plugin src/compiler -name '*.zig' -print0 | xargs -0 grep -Eq 'execution_node_(elementwise|generation|indexing|linalg|reduction|structural)\.zig'; then
+  fail "MLX Metal execution-node family modules are backend-internal and must not be imported by runtime, plugin, or compiler"
+fi
+
+if find src/runtime src/plugin src/compiler -name '*.zig' -print0 | xargs -0 grep -Eq 'buffer_(encoding|lifecycle|elementwise|indexing|linalg|reduction|generation|control_flow|custom_call)\.zig'; then
+  fail "MLX Metal buffer owner modules are backend-internal and must not be imported by runtime, plugin, or compiler"
+fi
+
+if grep -Eq 'const (Dtype|BinaryOp|UnaryOp|ReduceOp|ScatterUpdate|CompareOp|FftKind|RngDistribution|TriangularTranspose)\b|fn (wrap|handles)\(' src/backend/mlx_metal/buffer.zig; then
+  fail "MLX Metal buffer facade must keep encoding and shim handle helpers in buffer owner modules"
+fi
+
+if grep -Eq 'mlx_call\.(buffer|customCall)' src/backend/mlx_metal/buffer.zig; then
+  fail "MLX Metal buffer facade must delegate MLX operations to buffer owner modules"
+fi
+
+if find src/runtime src/plugin src/compiler -name '*.zig' -print0 | xargs -0 grep -Eq 'executable_(stats|constants|compiled_program|argument_capture|compile)\.zig'; then
+  fail "MLX Metal executable owner modules are backend-internal and must not be imported by runtime, plugin, or compiler"
+fi
+
+if grep -Eq 'program_build_mod|lowering_mod|loadInstructionConstants|loadWhilePatternConstants|materializeConstant|programCompileEnabled|planSupportsCompiledProgram|destroy(ConstantHandles|CompiledPrograms|ArgumentCaptureStates)' src/backend/mlx_metal/executable.zig; then
+  fail "MLX Metal executable facade must delegate compile, constants, compiled-programs, and teardown to executable owner modules"
+fi
+
+if grep -Eq '\b(previous_arguments|dynamic_indices|program_handle)\b' src/backend/mlx_metal/executable.zig; then
+  fail "MLX Metal argument-capture storage must stay in executable_argument_capture.zig"
+fi
+
+if grep -Eq 'mlx_call\.program(Create|Destroy)' src/backend/mlx_metal/executable.zig; then
+  fail "MLX Metal compiled-program handle ownership must stay in executable_compiled_program.zig"
+fi
+
+if find src/runtime src/plugin src/compiler -name '*.zig' -print0 | xargs -0 grep -Eq 'profiling_(env|clock|stats|writer)\.zig'; then
+  fail "MLX Metal profiling owner modules are backend-internal and must not be imported by runtime, plugin, or compiler"
+fi
+
+if grep -Eq 'std\.c\.getenv|PJRTX_(TRACE|PROFILE|MLX_PROGRAM_COMPILE)|std\.debug\.print|Timestamp\.now|durationTo|recordScheduleItem|recordCompiledProgram|recordOutputClone|execute_wall_us_total' src/backend/mlx_metal/profiling.zig; then
+  fail "MLX Metal profiling facade must delegate env, clock, stats, and rendering to profiling owner modules"
+fi
+
+if grep -Eq 'std\.c\.getenv|PJRTX_(TRACE|PROFILE|MLX_PROGRAM_COMPILE)' src/backend/mlx_metal/profiling.zig src/backend/mlx_metal/profiling_clock.zig src/backend/mlx_metal/profiling_stats.zig src/backend/mlx_metal/profiling_writer.zig; then
+  fail "MLX Metal profiling environment reads must stay in profiling_env.zig"
+fi
+
+if grep -Eq 'std\.debug\.print' src/backend/mlx_metal/profiling.zig src/backend/mlx_metal/profiling_env.zig src/backend/mlx_metal/profiling_clock.zig src/backend/mlx_metal/profiling_stats.zig; then
+  fail "MLX Metal profile and trace rendering must stay in profiling_writer.zig"
+fi
+
+if grep -Eq 'global_single_threaded\.io|Timestamp\.now' src/backend/mlx_metal/profiling.zig src/backend/mlx_metal/profiling_env.zig src/backend/mlx_metal/profiling_stats.zig src/backend/mlx_metal/profiling_writer.zig; then
+  fail "MLX Metal backend IO and timestamps must stay in profiling_clock.zig"
+fi
+
+if grep -Eq 'pub const (ReduceMaxWithIndicesResult|ReduceWindowMaxWithIndicesResult|RngBitGeneratorResult)\b|pub fn (iota|partitionId|complex|realPart|imagPart|convert|bitcast|binary|unary|reshape|transpose|broadcastInDim|slice|dynamicSlice|dynamicUpdateSlice|pad|reverse|concatenate|gather|gatherAxis|scatter|scatterAxis|sort|argsort|takeAlongAxis|dotGeneral|convolution|cholesky|triangularSolve|fft|rng|rngBitGenerator|reduce|reduceMaxWithIndices|reduceWindow|reduceWindowMaxWithIndices|compare|select|clamp)\(' src/backend/mlx_metal/backend.zig; then
+  fail "MLX Metal backend facade must expose runtime lifecycle contracts, not direct operation forwarding wrappers"
+fi
+
+if grep -Eq '^fn (validateValues|validateNodes|validateControlFlows|validateSubprograms|validateEdges|validateFusionGroups|validateMaterializationBoundaries|validateSchedule|validateMarkedValueSet|invalidProgram|markNodeOutputsLive|releaseDeadNodeInputs|releaseDeadFusionNodeInputs|releasePlannedValue)\b' src/backend/mlx_metal/program.zig src/backend/mlx_metal/program_build.zig; then
+  fail "MLX Metal backend program validation and liveness bodies must stay in program_validation/program_liveness owners"
+fi
+
+if grep -Eq '^fn (countPlanSubprograms|countPlanControlFlows|buildNodeSubprograms|buildNodeControlFlow|cloneProgramSubprogram|cloneDescriptorList|cloneRegionValueList|cloneRegionInstructionList|deinitProgramSubprograms|deinitProgramControlFlows)\b' src/backend/mlx_metal/program_build.zig; then
+  fail "MLX Metal backend region cloning and control-flow metadata must stay in program_region.zig"
+fi
+
+if grep -Eq '^fn (buildFusionGroups|deinitFusionGroups|fusionGroupNodeIndices|markedValueIds)\b|groupMarkIndex' src/backend/mlx_metal/program_build.zig; then
+  fail "MLX Metal backend fusion group construction must stay in program_fusion.zig"
+fi
+
+if grep -Eq 'max_schedule|program_mod\.ScheduleItem' src/backend/mlx_metal/program_build.zig; then
+  fail "MLX Metal backend schedule construction must stay in program_schedule_build.zig"
+fi
+
+if grep -Eq '^test "' src/backend/mlx_metal/program_build.zig; then
+  fail "MLX Metal program_build.zig must stay a build router; tests belong with the owner module"
+fi
+
+if find src/runtime src/plugin src/compiler -name '*.zig' -print0 | xargs -0 grep -Eq '@import\("src/backend/mlx_metal/|@import\("[^"]*backend/mlx_metal/'; then
+  fail "runtime, plugin, and compiler must import the MLX Metal backend package facade, not backend internals"
 fi
 
 if grep -Eq 'fn (mlxMetalBackendForTest|initMlxMetalClientForTest|testShardingPlan|addU8ExecutablePlanForTest|constantU8ExecutablePlanForTest)\(' src/runtime/execution.zig; then
@@ -353,7 +529,7 @@ if grep -Eq '^fn ' src/backend/mlx_metal/backend.zig; then
 fi
 
 backend_env_leaks="$(
-  find src/backend/mlx_metal -name '*.zig' ! -name 'profiling.zig' -print0 \
+  find src/backend/mlx_metal -name '*.zig' ! -name 'profiling.zig' ! -name 'profiling_env.zig' -print0 \
     | xargs -0 grep -En 'std\.c\.getenv|PJRTX_(TRACE|PROFILE|MLX_PROGRAM_COMPILE)' || true
 )"
 if [[ -n "${backend_env_leaks}" ]]; then
@@ -418,7 +594,7 @@ if grep -Eq 'fn (executableSupportsInstruction|validElementwiseBroadcast|dotGene
 fi
 
 backend_buffer_decode_leaks="$(
-  find src/backend/mlx_metal -name '*.zig' ! -name 'buffer.zig' -print0 \
+  find src/backend/mlx_metal -name '*.zig' ! -name 'buffer.zig' ! -name 'buffer_lifecycle.zig' -print0 \
     | xargs -0 grep -En 'Buffer\.fromHandle' || true
 )"
 if [[ -n "${backend_buffer_decode_leaks}" ]]; then

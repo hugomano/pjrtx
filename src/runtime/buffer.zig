@@ -2,9 +2,15 @@ const std = @import("std");
 const backend_api = @import("src/backend/mlx_metal");
 const ir = @import("src/compiler/ir");
 
+const buffer_descriptor = @import("buffer_descriptor.zig");
+const buffer_placement = @import("buffer_placement.zig");
+const buffer_storage = @import("buffer_storage.zig");
 const device_memory = @import("device_memory.zig");
 const event_mod = @import("event.zig");
 
+const Descriptor = buffer_descriptor.Descriptor;
+const Placement = buffer_placement.Placement;
+const Storage = buffer_storage.Storage;
 const BufferType = ir.BufferType;
 const Device = device_memory.Device;
 const DeviceMemoryTopology = device_memory.DeviceMemoryTopology;
@@ -40,127 +46,12 @@ const InitialReadiness = enum {
     pending,
 };
 
-/// Owns immutable logical tensor metadata for a runtime buffer.
-const BufferDescriptor = struct {
-    element_type: BufferType,
-    dims: []i64,
-    byte_size: usize,
-    shard_index: usize,
-
-    /// Duplicates shape metadata and records the device-resident byte size.
-    pub fn init(allocator: std.mem.Allocator, element_type: BufferType, dims_: []const i64, shard_index: usize, byte_size: usize) !BufferDescriptor {
-        return .{
-            .element_type = element_type,
-            .dims = try allocator.dupe(i64, dims_),
-            .byte_size = byte_size,
-            .shard_index = shard_index,
-        };
-    }
-
-    /// Releases owned shape metadata.
-    pub fn deinit(self: BufferDescriptor, allocator: std.mem.Allocator) void {
-        allocator.free(self.dims);
-    }
-};
-
-/// Owns device and memory placement metadata for a runtime buffer.
-const BufferPlacement = struct {
-    device_id: i32,
-    memory_id: i32,
-    device: *const Device,
-    memory: *Memory,
-
-    /// Validates that the requested memory can be addressed by the device.
-    pub fn init(device: *const Device, memory: *Memory) error{InvalidArgument}!BufferPlacement {
-        if (!memory.isAddressableBy(device)) return error.InvalidArgument;
-        return .{
-            .device_id = device.id,
-            .memory_id = memory.id,
-            .device = device,
-            .memory = memory,
-        };
-    }
-
-    /// Returns true when this placement belongs to an execution device slot.
-    pub fn matchesExecutionSlot(self: BufferPlacement, device_id: i32) bool {
-        return self.device_id == device_id;
-    }
-
-    /// Accounts bytes transferred from host into this memory placement.
-    pub fn recordHostToDeviceTransfer(self: BufferPlacement, byte_size: usize) void {
-        self.memory.stats.host_to_device_bytes += @intCast(byte_size);
-    }
-
-    /// Accounts bytes transferred from this memory placement back to host.
-    pub fn recordDeviceToHostTransfer(self: BufferPlacement, byte_size: usize) void {
-        self.memory.stats.device_to_host_bytes += @intCast(byte_size);
-    }
-};
-
-/// Owns backend buffer storage and memory accounting for a runtime buffer.
-const DeviceStorage = struct {
-    backend: backend_api.Backend,
-    handle: ?backend_api.BufferHandle = null,
-    accounted_bytes: usize = 0,
-
-    /// Creates storage from an optional backend handle without taking accounting yet.
-    pub fn init(backend: backend_api.Backend, handle: ?backend_api.BufferHandle) DeviceStorage {
-        return .{ .backend = backend, .handle = handle };
-    }
-
-    /// Returns whether a backend device allocation is currently attached.
-    pub fn hasBackendStorage(self: DeviceStorage) bool {
-        return self.handle != null;
-    }
-
-    /// Returns the backend handle for runtime dispatch without transferring ownership.
-    pub fn handleForDispatch(self: DeviceStorage) ?backend_api.BufferHandle {
-        return self.handle;
-    }
-
-    /// Accounts this storage against its memory placement.
-    pub fn account(self: *DeviceStorage, memory: *Memory, byte_size: usize) void {
-        self.accounted_bytes = byte_size;
-        memory.stats.retain(self.accounted_bytes);
-    }
-
-    /// Releases backend storage and memory accounting.
-    pub fn release(self: *DeviceStorage, memory: *Memory) void {
-        if (self.accounted_bytes != 0) {
-            memory.stats.release(self.accounted_bytes);
-            self.accounted_bytes = 0;
-        }
-        if (self.handle) |backend_buffer| {
-            self.backend.destroyBuffer(backend_buffer);
-            self.handle = null;
-        }
-    }
-
-    /// Transfers backend storage ownership for a donation alias.
-    pub fn takeForDonationAlias(self: *DeviceStorage, memory: *Memory) !backend_api.BufferHandle {
-        const backend_buffer = self.handle orelse return error.UnsupportedRuntimeFeature;
-        self.handle = null;
-        if (self.accounted_bytes != 0) {
-            memory.stats.release(self.accounted_bytes);
-            self.accounted_bytes = 0;
-        }
-        return backend_buffer;
-    }
-
-    /// Replaces backend storage and refreshes memory accounting.
-    pub fn replace(self: *DeviceStorage, memory: *Memory, byte_size: usize, backend_buffer: backend_api.BufferHandle) void {
-        self.release(memory);
-        self.handle = backend_buffer;
-        self.account(memory, byte_size);
-    }
-};
-
+/// Owns runtime buffer lifecycle, readiness, placement, and backend storage.
 pub const Buffer = struct {
     allocator: std.mem.Allocator,
-    descriptor: BufferDescriptor,
-    placement: BufferPlacement,
-    storage: DeviceStorage,
-    host_debug_bytes: []u8,
+    descriptor: Descriptor,
+    placement: Placement,
+    storage: Storage,
     state: BufferState = .live,
     ready_event: Event = Event.ready(),
 
@@ -197,7 +88,7 @@ pub const Buffer = struct {
         shard_index: usize,
         src: []const u8,
     ) BufferCreateError!*Buffer {
-        const placement = try BufferPlacement.init(device, memory);
+        const placement = try Placement.init(device, memory);
         const backend_buffer = try backend.bufferFromHost(device.local_hardware_id, element_type, dims_, src) orelse
             return error.UnsupportedRuntimeFeature;
         errdefer backend.destroyBuffer(backend_buffer);
@@ -216,7 +107,7 @@ pub const Buffer = struct {
         memory: *Memory,
         shard_index: usize,
     ) BufferCreateError!*Buffer {
-        const placement = try BufferPlacement.init(device, memory);
+        const placement = try Placement.init(device, memory);
 
         const byte_size = ir.denseByteSize(element_type, dims_);
         const backend_buffer = try backend.allocateBuffer(device.local_hardware_id, element_type, dims_) orelse
@@ -235,7 +126,7 @@ pub const Buffer = struct {
         memory: *Memory,
         shard_index: usize,
     ) PendingBackendTransferBufferError!*Buffer {
-        const placement = try BufferPlacement.init(device, memory);
+        const placement = try Placement.init(device, memory);
         return initOwnedWithPlacement(allocator, backend, element_type, dims_, placement, shard_index, ir.denseByteSize(element_type, dims_), null, .pending);
     }
 
@@ -265,7 +156,6 @@ pub const Buffer = struct {
 
     pub fn deinit(self: *Buffer) void {
         self.releaseStorage();
-        self.allocator.free(self.host_debug_bytes);
         self.descriptor.deinit(self.allocator);
         self.allocator.destroy(self);
     }
@@ -306,11 +196,6 @@ pub const Buffer = struct {
     /// Returns true when this buffer belongs to the given device/shard execution slot.
     pub fn matchesExecutionSlot(self: *const Buffer, device_id: i32, shard_index: usize) bool {
         return self.placement.matchesExecutionSlot(device_id) and self.descriptor.shard_index == shard_index;
-    }
-
-    /// Returns retained host/debug bytes; device-only fast paths should keep this zero.
-    pub fn hostDebugByteCount(self: *const Buffer) usize {
-        return self.host_debug_bytes.len;
     }
 
     /// Returns whether this buffer has been deleted or donated from PJRT's view.
@@ -410,7 +295,7 @@ pub const Buffer = struct {
 
         /// Replaces stable device id for focused placement validation tests.
         pub fn setDeviceId(buffer: *Buffer, device_id: i32) void {
-            buffer.placement.device_id = device_id;
+            buffer.placement.setDeviceIdForTest(device_id);
         }
     };
 
@@ -435,7 +320,7 @@ pub const Buffer = struct {
         backend_buffer: ?backend_api.BufferHandle,
         readiness: InitialReadiness,
     ) !*Buffer {
-        const placement = try BufferPlacement.init(device, memory);
+        const placement = try Placement.init(device, memory);
         return initOwnedWithPlacement(allocator, backend, element_type, dims_, placement, shard_index, byte_size, backend_buffer, readiness);
     }
 
@@ -444,7 +329,7 @@ pub const Buffer = struct {
         backend: backend_api.Backend,
         element_type: BufferType,
         dims_: []const i64,
-        placement: BufferPlacement,
+        placement: Placement,
         shard_index: usize,
         byte_size: usize,
         backend_buffer: ?backend_api.BufferHandle,
@@ -453,18 +338,14 @@ pub const Buffer = struct {
         const buffer = try allocator.create(Buffer);
         errdefer allocator.destroy(buffer);
 
-        const descriptor = try BufferDescriptor.init(allocator, element_type, dims_, shard_index, byte_size);
+        const descriptor = try Descriptor.init(allocator, element_type, dims_, shard_index, byte_size);
         errdefer descriptor.deinit(allocator);
-
-        const host_debug_bytes = try allocator.alloc(u8, 0);
-        errdefer allocator.free(host_debug_bytes);
 
         buffer.* = .{
             .allocator = allocator,
             .descriptor = descriptor,
             .placement = placement,
-            .storage = DeviceStorage.init(backend, backend_buffer),
-            .host_debug_bytes = host_debug_bytes,
+            .storage = Storage.init(backend, backend_buffer),
             .ready_event = switch (readiness) {
                 .ready => Event.ready(),
                 .pending => Event.pending(),

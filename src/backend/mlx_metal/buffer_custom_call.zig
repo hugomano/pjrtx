@@ -1,19 +1,14 @@
-const buffer_mod = @import("buffer.zig");
+const buffer_handle = @import("buffer_handle.zig");
 const mlx_call = @import("mlx_call.zig");
 
-const Buffer = buffer_mod.Buffer;
-const Error = buffer_mod.Error;
+pub const Error = buffer_handle.Error;
 
 /// Runs the built-in MLX/Metal binary-add custom call.
-pub fn customBinaryAddF32(lhs: Buffer, rhs: Buffer) Error!?Buffer {
-    return wrap(mlx_call.customCallBinaryAddF32(lhs.handle, rhs.handle), error.CommandSubmissionFailed);
+pub fn customBinaryAddF32(lhs: anytype, rhs: @TypeOf(lhs)) Error!?@TypeOf(lhs) {
+    return buffer_handle.wrap(@TypeOf(lhs), mlx_call.customCallBinaryAddF32(lhs.handle, rhs.handle), error.CommandSubmissionFailed);
 }
 
 /// Runs the built-in MLX/Metal scaled dot-product attention custom call.
-pub fn customScaledDotProductAttention(q: Buffer, k: Buffer, v: Buffer, token_index: Buffer) Error!?Buffer {
-    return wrap(mlx_call.customCallScaledDotProductAttention(q.handle, k.handle, v.handle, token_index.handle), error.CommandSubmissionFailed);
-}
-
-fn wrap(handle: ?mlx_call.BufferHandle, err: Error) Error!?Buffer {
-    return if (handle) |ptr| Buffer{ .handle = ptr } else err;
+pub fn customScaledDotProductAttention(q: anytype, k: @TypeOf(q), v: @TypeOf(q), token_index: @TypeOf(q)) Error!?@TypeOf(q) {
+    return buffer_handle.wrap(@TypeOf(q), mlx_call.customCallScaledDotProductAttention(q.handle, k.handle, v.handle, token_index.handle), error.CommandSubmissionFailed);
 }

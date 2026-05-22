@@ -1,4 +1,4 @@
-const backend_api = @import("src/backend/mlx_metal");
+const backend_api = @import("backend_selection.zig");
 const ir = @import("src/compiler/ir");
 
 const buffer_mod = @import("buffer.zig");

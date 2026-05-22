@@ -89,10 +89,7 @@ pub const Capabilities = device_mod.Capabilities;
 
 /// Concrete Metal/MLX backend facade used by runtime lifecycle and execution code.
 pub const Backend = struct {
-    pub fn capabilities(self: Backend) Capabilities {
-        _ = self;
-        return device_mod.capabilities();
-    }
+    pub fn capabilities(self: Backend) Capabilities { _ = self; return device_mod.capabilities(); }
 
     pub fn enumerateDevices(self: Backend, allocator: std.mem.Allocator, device_count_hint: usize) Error![]ir.DeviceDescriptor {
         _ = self;
@@ -101,134 +98,85 @@ pub const Backend = struct {
     }
 
     pub fn releaseDeviceDescriptors(self: Backend, allocator: std.mem.Allocator, descriptors: []ir.DeviceDescriptor) void {
-        _ = self;
-        device_mod.DeviceList.release(allocator, descriptors);
+        _ = self; device_mod.DeviceList.release(allocator, descriptors);
     }
 
     pub fn bufferFromHost(self: Backend, device_local_hardware_id: i32, element_type: ir.BufferType, dims: []const i64, src: []const u8) Error!?BufferHandle {
-        _ = self;
-        return buffer_mod.Opaque.fromHost(device_local_hardware_id, element_type, dims, src);
+        _ = self; return buffer_mod.Opaque.fromHost(device_local_hardware_id, element_type, dims, src);
     }
 
     pub fn beginAsyncHostToDeviceTransfer(self: Backend, device_local_hardware_id: i32, element_type: ir.BufferType, dims: []const i64, byte_size: usize) Error!?AsyncHostToDeviceTransferHandle {
-        _ = self;
-        return async_transfer_mod.Opaque.begin(device_local_hardware_id, element_type, dims, byte_size);
+        _ = self; return async_transfer_mod.Opaque.begin(device_local_hardware_id, element_type, dims, byte_size);
     }
 
     pub fn writeAsyncHostToDeviceTransfer(self: Backend, transfer: AsyncHostToDeviceTransferHandle, offset: usize, src: []const u8) Error!void {
-        _ = self;
-        return async_transfer_mod.Opaque.write(transfer, offset, src);
+        _ = self; return async_transfer_mod.Opaque.write(transfer, offset, src);
     }
 
     pub fn finishAsyncHostToDeviceTransfer(self: Backend, transfer: AsyncHostToDeviceTransferHandle) Error!?BufferHandle {
-        _ = self;
-        return async_transfer_mod.Opaque.finish(transfer);
+        _ = self; return async_transfer_mod.Opaque.finish(transfer);
     }
 
     pub fn destroyAsyncHostToDeviceTransfer(self: Backend, transfer: AsyncHostToDeviceTransferHandle) void {
-        _ = self;
-        async_transfer_mod.Opaque.destroy(transfer);
+        _ = self; async_transfer_mod.Opaque.destroy(transfer);
     }
 
     pub fn allocateBuffer(self: Backend, device_local_hardware_id: i32, element_type: ir.BufferType, dims: []const i64) Error!?BufferHandle {
-        _ = self;
-        return buffer_mod.Opaque.zeros(device_local_hardware_id, element_type, dims);
+        _ = self; return buffer_mod.Opaque.zeros(device_local_hardware_id, element_type, dims);
     }
 
-    pub fn cloneBuffer(self: Backend, src: BufferHandle) Error!?BufferHandle {
-        _ = self;
-        return buffer_mod.Opaque.clone(src);
-    }
+    pub fn cloneBuffer(self: Backend, src: BufferHandle) Error!?BufferHandle { _ = self; return buffer_mod.Opaque.clone(src); }
 
     pub fn compileExecutable(self: Backend, allocator: std.mem.Allocator, plan: *const ir.ExecutablePlan, device_local_hardware_ids: []const i32) Error!?ExecutableHandle {
-        _ = self;
-        return executable_mod.compile(allocator, plan, device_local_hardware_ids, execution_mod.compiledProgramBuildCallback);
+        _ = self; return executable_mod.compile(allocator, plan, device_local_hardware_ids, execution_mod.compiledProgramBuildCallback);
     }
 
     pub fn writeExecutableLoweringDiagnostic(self: Backend, plan: *const ir.ExecutablePlan, device_local_hardware_ids: []const i32, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        _ = self;
-        return lowering_mod.writeExecutableDiagnostic(plan, device_local_hardware_ids, writer);
+        _ = self; return lowering_mod.writeExecutableDiagnostic(plan, device_local_hardware_ids, writer);
     }
 
     pub fn executeExecutable(self: Backend, allocator: std.mem.Allocator, executable: ExecutableHandle, device_index: usize, arguments: []const BufferHandle) Error!?ExecutionResult {
-        _ = self;
-        return execution_mod.execute(allocator, executable, device_index, arguments);
+        _ = self; return execution_mod.execute(allocator, executable, device_index, arguments);
     }
 
-    pub fn executionEventStatus(self: Backend, event: ExecutionEventHandle) Error!ExecutionEventStatus {
-        _ = self;
-        return execution_mod.eventStatus(event);
-    }
+    pub fn executionEventStatus(self: Backend, event: ExecutionEventHandle) Error!ExecutionEventStatus { _ = self; return execution_mod.eventStatus(event); }
 
-    pub fn destroyExecutionEvent(self: Backend, event: ExecutionEventHandle) void {
-        _ = self;
-        execution_mod.destroyEvent(event);
-    }
+    pub fn destroyExecutionEvent(self: Backend, event: ExecutionEventHandle) void { _ = self; execution_mod.destroyEvent(event); }
 
-    pub fn executableStats(self: Backend, executable: ExecutableHandle) ExecutableStats {
-        _ = self;
-        return execution_mod.stats(executable);
-    }
+    pub fn executableStats(self: Backend, executable: ExecutableHandle) ExecutableStats { _ = self; return execution_mod.stats(executable); }
 
-    pub fn destroyExecutable(self: Backend, executable: ExecutableHandle) void {
-        _ = self;
-        execution_mod.destroy(executable);
-    }
+    pub fn destroyExecutable(self: Backend, executable: ExecutableHandle) void { _ = self; execution_mod.destroy(executable); }
 
-    pub fn registerCustomCall(self: Backend, registration: CustomCallRegistration) Error!void {
-        _ = self;
-        return custom_call_mod.register(registration);
-    }
+    pub fn registerCustomCall(self: Backend, registration: CustomCallRegistration) Error!void { _ = self; return custom_call_mod.register(registration); }
 
     /// Registers a named binary custom-call target in the MLX/Metal backend registry.
     pub fn registerBinaryCustomCall(self: Backend, target: []const u8, op_name: []const u8) Error!void {
-        _ = self;
-        return custom_call_mod.registerBinary(target, op_name);
+        _ = self; return custom_call_mod.registerBinary(target, op_name);
     }
 
     /// Registers an identity custom-call target in the MLX/Metal backend registry.
-    pub fn registerIdentityCustomCall(self: Backend, target: []const u8) Error!void {
-        _ = self;
-        return custom_call_mod.registerIdentity(target);
-    }
+    pub fn registerIdentityCustomCall(self: Backend, target: []const u8) Error!void { _ = self; return custom_call_mod.registerIdentity(target); }
 
     /// Registers a named unary custom-call target in the MLX/Metal backend registry.
     pub fn registerUnaryCustomCall(self: Backend, target: []const u8, op_name: []const u8) Error!void {
-        _ = self;
-        return custom_call_mod.registerUnary(target, op_name);
+        _ = self; return custom_call_mod.registerUnary(target, op_name);
     }
 
     /// Registers the built-in unary square-root custom-call marker.
-    pub fn registerUnarySqrtCustomCall(self: Backend, target: []const u8) Error!void {
-        _ = self;
-        return custom_call_mod.registerUnarySqrt(target);
-    }
+    pub fn registerUnarySqrtCustomCall(self: Backend, target: []const u8) Error!void { _ = self; return custom_call_mod.registerUnarySqrt(target); }
 
     /// Registers the built-in binary add custom-call marker.
-    pub fn registerBinaryAddCustomCall(self: Backend, target: []const u8) Error!void {
-        _ = self;
-        return custom_call_mod.registerBinaryAdd(target);
-    }
+    pub fn registerBinaryAddCustomCall(self: Backend, target: []const u8) Error!void { _ = self; return custom_call_mod.registerBinaryAdd(target); }
 
     pub fn unregisterCustomCall(self: Backend, target: []const u8) void {
-        _ = self;
-        custom_call_mod.unregister(target);
+        _ = self; custom_call_mod.unregister(target);
     }
 
-    pub fn customCallRegistryVersion(self: Backend) u64 {
-        _ = self;
-        return custom_call_mod.version();
-    }
+    pub fn customCallRegistryVersion(self: Backend) u64 { _ = self; return custom_call_mod.version(); }
 
-    pub fn copyToHost(self: Backend, src: BufferHandle, dst: []u8) Error!void {
-        _ = self;
-        return buffer_mod.Opaque.copyToHost(src, dst);
-    }
+    pub fn copyToHost(self: Backend, src: BufferHandle, dst: []u8) Error!void { _ = self; return buffer_mod.Opaque.copyToHost(src, dst); }
 
-    pub fn destroyBuffer(self: Backend, buffer: BufferHandle) void {
-        _ = self;
-        buffer_mod.Opaque.destroy(buffer);
-    }
+    pub fn destroyBuffer(self: Backend, buffer: BufferHandle) void { _ = self; buffer_mod.Opaque.destroy(buffer); }
 };
 
 /// Returns the stateless concrete MLX/Metal backend facade.
@@ -237,6 +185,8 @@ pub fn create() Backend {
 }
 
 test "mlx metal backend exposes opaque backend interface" {
+    _ = @import("execution_integration.zig");
+
     const b = create();
     try std.testing.expectEqualStrings("metal_mlx", b.capabilities().name);
     const devices = try b.enumerateDevices(std.testing.allocator, 1);

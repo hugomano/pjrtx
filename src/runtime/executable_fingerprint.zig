@@ -1,5 +1,5 @@
 const std = @import("std");
-const backend_api = @import("src/backend/mlx_metal");
+const backend_api = @import("backend_selection.zig");
 const ir = @import("src/compiler/ir");
 
 const device_memory = @import("device_memory.zig");

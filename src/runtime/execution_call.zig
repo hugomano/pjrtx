@@ -1,5 +1,5 @@
 const std = @import("std");
-const backend_api = @import("src/backend/mlx_metal");
+const backend_api = @import("backend_selection.zig");
 const ir = @import("src/compiler/ir");
 
 const buffer_mod = @import("buffer.zig");
@@ -126,14 +126,44 @@ const ExecutionCallTestSupport = struct {
     }
 
     fn shardingPlan(allocator: std.mem.Allocator, assignment: []const i32) !ir.ShardingPlan {
+        return ExecutionShardingFixture.plan(allocator, assignment);
+    }
+
+    fn addU8ExecutablePlan(allocator: std.mem.Allocator, assignment: []const i32, dims: []const i64) !ir.ExecutablePlan {
+        return ExecutionPlanFixture.addU8(allocator, assignment, dims);
+    }
+
+    fn constantU8ExecutablePlan(allocator: std.mem.Allocator, assignment: []const i32, literal: []const u8) !ir.ExecutablePlan {
+        return ExecutionPlanFixture.constantU8(allocator, assignment, literal);
+    }
+
+    fn expectBufferBytes(buffer: *Buffer, expected: []const u8) !void {
+        return ExecutionBufferExpect.bytes(buffer, expected);
+    }
+};
+
+const ExecutionShardingFixture = struct {
+    fn plan(allocator: std.mem.Allocator, assignment: []const i32) !ir.ShardingPlan {
         return .{
             .kind = .replicated,
             .mesh_name = try allocator.dupe(u8, ""),
             .device_assignment = try allocator.dupe(i32, assignment),
         };
     }
+};
 
-    fn addU8ExecutablePlan(allocator: std.mem.Allocator, assignment: []const i32, dims: []const i64) !ir.ExecutablePlan {
+const ExecutionPlanFixture = struct {
+    fn addU8(allocator: std.mem.Allocator, assignment: []const i32, dims: []const i64) !ir.ExecutablePlan {
+        return AddU8ExecutionPlanFixture.create(allocator, assignment, dims);
+    }
+
+    fn constantU8(allocator: std.mem.Allocator, assignment: []const i32, literal: []const u8) !ir.ExecutablePlan {
+        return ConstantU8ExecutionPlanFixture.create(allocator, assignment, literal);
+    }
+};
+
+const AddU8ExecutionPlanFixture = struct {
+    fn create(allocator: std.mem.Allocator, assignment: []const i32, dims: []const i64) !ir.ExecutablePlan {
         const values = try allocator.alloc(ir.Value, 3);
         errdefer allocator.free(values);
 
@@ -153,12 +183,12 @@ const ExecutionCallTestSupport = struct {
 
         var parameter_shardings = try allocator.alloc(ir.ShardingPlan, 2);
         errdefer allocator.free(parameter_shardings);
-        parameter_shardings[0] = try shardingPlan(allocator, assignment);
+        parameter_shardings[0] = try ExecutionShardingFixture.plan(allocator, assignment);
         errdefer {
             allocator.free(parameter_shardings[0].mesh_name);
             allocator.free(parameter_shardings[0].device_assignment);
         }
-        parameter_shardings[1] = try shardingPlan(allocator, assignment);
+        parameter_shardings[1] = try ExecutionShardingFixture.plan(allocator, assignment);
         errdefer {
             allocator.free(parameter_shardings[1].mesh_name);
             allocator.free(parameter_shardings[1].device_assignment);
@@ -166,7 +196,7 @@ const ExecutionCallTestSupport = struct {
 
         var output_shardings = try allocator.alloc(ir.ShardingPlan, 1);
         errdefer allocator.free(output_shardings);
-        output_shardings[0] = try shardingPlan(allocator, assignment);
+        output_shardings[0] = try ExecutionShardingFixture.plan(allocator, assignment);
         errdefer {
             allocator.free(output_shardings[0].mesh_name);
             allocator.free(output_shardings[0].device_assignment);
@@ -202,8 +232,10 @@ const ExecutionCallTestSupport = struct {
             .instructions = instructions,
         };
     }
+};
 
-    fn constantU8ExecutablePlan(allocator: std.mem.Allocator, assignment: []const i32, literal: []const u8) !ir.ExecutablePlan {
+const ConstantU8ExecutionPlanFixture = struct {
+    fn create(allocator: std.mem.Allocator, assignment: []const i32, literal: []const u8) !ir.ExecutablePlan {
         var values = try allocator.alloc(ir.Value, 1);
         errdefer allocator.free(values);
 
@@ -224,7 +256,7 @@ const ExecutionCallTestSupport = struct {
 
         var output_shardings = try allocator.alloc(ir.ShardingPlan, 1);
         errdefer allocator.free(output_shardings);
-        output_shardings[0] = try shardingPlan(allocator, assignment);
+        output_shardings[0] = try ExecutionShardingFixture.plan(allocator, assignment);
         errdefer {
             allocator.free(output_shardings[0].mesh_name);
             allocator.free(output_shardings[0].device_assignment);
@@ -260,8 +292,10 @@ const ExecutionCallTestSupport = struct {
             .instructions = instructions,
         };
     }
+};
 
-    fn expectBufferBytes(buffer: *Buffer, expected: []const u8) !void {
+const ExecutionBufferExpect = struct {
+    fn bytes(buffer: *Buffer, expected: []const u8) !void {
         const actual = try std.testing.allocator.alloc(u8, expected.len);
         defer std.testing.allocator.free(actual);
         try buffer.copyToHost(actual);

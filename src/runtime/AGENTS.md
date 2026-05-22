@@ -1,20 +1,28 @@
 # Agent Guide For `src/runtime`
 
 Read the root `AGENTS.md` and `CODING_POLICY.md` first. Runtime code owns PJRTx
-lifecycle and scheduling for the single Metal/MLX backend; it is not a compiler,
-backend abstraction layer, or CPU reference interpreter.
+lifecycle and scheduling for concrete Metal backends; it is not a compiler,
+backend registry, generic abstraction layer, or CPU reference interpreter.
 
 ## Runtime Boundary
 
-The runtime may import the concrete `src/backend/mlx_metal` Zig package. It must
-not import MLX C symbols, Metal shims, PJRT C structs, StableHLO/MLIR C APIs, or
-any replacement generic backend facade.
+Runtime concrete backend imports must stay centralized in
+`backend_selection.zig`. That module may import concrete backend package facades
+such as `src/backend/mlx_metal` and `src/backend/metalcpp`, and select between
+them with `PJRTX_RUNTIME_BACKEND` / `PJRTX_BACKEND`. Other runtime modules must
+consume the closed `Backend` union from `backend_selection.zig`; do not recreate
+a vtable, registry, root backend facade, or scatter environment reads.
+
+Runtime must not import MLX C symbols, Metal shims, PJRT C structs,
+StableHLO/MLIR C APIs, or backend internals.
 
 Keep responsibilities strict:
 
 - `runtime.zig`: package root only. It may import domain modules and re-export
   public runtime contracts, but it should not own lifecycle, cache, residency,
   or execution implementation bodies.
+- `backend_selection.zig`: closed concrete-backend selection and method
+  dispatch. It owns the runtime env knob and no backend implementation details.
 - `client.zig`: client lifecycle, topology ownership, compile orchestration.
 - `device_memory.zig`: devices, memories, topology, memory stats.
 - `event.zig`: readiness state, callbacks, dependency chaining.

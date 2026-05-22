@@ -12,7 +12,7 @@ const errors = @import("errors.zig");
 const events = @import("events.zig");
 const executable_mod = @import("executable.zig");
 const handles = @import("pjrt_handles.zig");
-const plugin = @import("plugin.zig");
+const plugin_process = @import("plugin_process.zig");
 const trace_mod = @import("trace.zig");
 
 const Executable = executable_mod.Executable;
@@ -52,12 +52,12 @@ pub const Client = struct {
 
     fn platformName(self: Client) []const u8 {
         _ = self;
-        return plugin.Platform.name;
+        return plugin_process.Platform.name;
     }
 
     fn platformVersion(self: Client) []const u8 {
         _ = self;
-        return plugin.Platform.version;
+        return plugin_process.Platform.version;
     }
 
     fn processIndex(self: Client) c_int {
@@ -91,9 +91,11 @@ const ClientCreateRequest = struct {
         if (args.create_options != null) {
             for (0..args.num_options) |i| {
                 const option = abi.NamedValue.borrow(args.create_options[i]);
-                if (std.mem.eql(u8, option.name(), plugin.Options.backend)) {
+                if (std.mem.eql(u8, option.name(), plugin_process.Options.backend)) {
                     const value = option.stringValue() orelse return error.InvalidBackend;
-                    if (!std.mem.eql(u8, value, "metal_mlx")) return error.InvalidBackend;
+                    if (!std.mem.eql(u8, value, "metal_mlx") and
+                        !std.mem.eql(u8, value, "metalcpp") and
+                        !std.mem.eql(u8, value, "metal_cpp")) return error.InvalidBackend;
                 } else {
                     return error.InvalidBackend;
                 }
@@ -290,7 +292,7 @@ const ClientCreate = struct {
         _ = ClientCreateRequest.decode(args[0]) catch {
             return PjrtError.invalidArgument("invalid PjRTx client create option");
         };
-        const client = runtime_mod.createClient(plugin.allocator(), .{
+        const client = runtime_mod.createClient(plugin_process.allocator(), .{
             .executable_cache_max_resident_bytes = trace_mod.Env.executableCacheMaxBytes(),
         }) catch {
             return PjrtError.internal("failed to create PjRTx client");
@@ -355,18 +357,18 @@ const ClientCompile = struct {
         const call_info = CompileCall.init(&args[0]);
         const client = call_info.client();
 
-        var diagnostics = std.Io.Writer.Allocating.init(plugin.allocator());
+        var diagnostics = std.Io.Writer.Allocating.init(plugin_process.allocator());
         defer diagnostics.deinit();
         const program = call_info.program() catch |err| return switch (err) {
             error.InvalidOptions => PjrtError.invalidArgument("compile options pointer is null"),
             error.InvalidProgram => PjrtError.invalidArgument("compile program is null or malformed"),
         };
-        var compiled = client.compileProgram(plugin.allocator(), program, &diagnostics.writer) catch |err| {
+        var compiled = client.compileProgram(plugin_process.allocator(), program, &diagnostics.writer) catch |err| {
             const message = diagnostics.writer.buffered();
             return CompileCall.fail(err, message);
         };
         var compiled_owned = true;
-        defer if (compiled_owned) compiled.deinit(plugin.allocator());
+        defer if (compiled_owned) compiled.deinit(plugin_process.allocator());
 
         const executable = Executable.create(client, &compiled) catch |err| {
             return switch (err) {
@@ -395,7 +397,7 @@ const ClientBufferFromHostBuffer = struct {
         const request = HostBufferRequest.decode(&args[0]) catch |err| return HostBufferRequest.fail(err);
         const placement = request.placement;
         _ = placement.client.trimExecutableCacheForAllocation(placement.memory, request.byte_size);
-        const buffer = placement.client.createHostBufferFromBytes(plugin.allocator(), request.element_type, request.dims, placement.device, placement.memory, placement.shard_index, request.data) catch |err| {
+        const buffer = placement.client.createHostBufferFromBytes(plugin_process.allocator(), request.element_type, request.dims, placement.device, placement.memory, placement.shard_index, request.data) catch |err| {
             return BufferCreateFailure.host(err);
         };
         args[0].buffer = handles.Buffer.handle(buffer);
@@ -409,7 +411,7 @@ const ClientCreateUninitializedBuffer = struct {
         const request = DeviceBufferRequest.decode(&args[0]) catch |err| return DeviceBufferRequest.fail(err);
         const placement = request.placement;
         _ = placement.client.trimExecutableCacheForAllocation(placement.memory, request.byte_size);
-        const buffer = placement.client.createDeviceBuffer(plugin.allocator(), request.element_type, request.dims, placement.device, placement.memory, placement.shard_index) catch |err| {
+        const buffer = placement.client.createDeviceBuffer(plugin_process.allocator(), request.element_type, request.dims, placement.device, placement.memory, placement.shard_index) catch |err| {
             return BufferCreateFailure.device(err);
         };
         args[0].buffer = handles.Buffer.handle(buffer);

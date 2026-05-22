@@ -4,6 +4,7 @@ const ir = @import("src/compiler/ir");
 const executable_mod = @import("executable.zig");
 const liveness_mod = @import("execution_liveness.zig");
 const materialization_mod = @import("execution_materialization.zig");
+const metalcpp_fusion_runner = @import("metalcpp_fusion_runner.zig");
 const node_mod = @import("execution_node.zig");
 const profiling_mod = @import("profiling.zig");
 const program_mod = @import("program.zig");
@@ -159,6 +160,21 @@ const FusionGroupDispatch = struct {
             .view_elementwise => {},
         }
         self.executable.recordFusionGroupExecute();
+        if ((try (metalcpp_fusion_runner.FusionRunner{
+            .allocator = self.allocator,
+            .plan = self.executable.plan,
+            .program = &self.executable.program,
+            .device_local_hardware_id = self.executable.device_local_hardware_ids[self.device_index],
+            .resident_kernel = self.executable.metalCppFusionKernel(self.device_index, group.id),
+            .values = self.values,
+        }).run(group)) != null) {
+            const released = (liveness_mod.LivenessRelease{
+                .program = &self.executable.program,
+                .values = self.values,
+            }).fusionGroup(group);
+            if (released != 0) self.executable.recordReleasedIntermediateValues(released);
+            return {};
+        }
         for (group.node_indices) |group_node_index| {
             if (group_node_index >= self.executable.program.nodes.len) return error.CommandSubmissionFailed;
             const node = self.executable.program.nodes[group_node_index];

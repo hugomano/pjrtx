@@ -1,5 +1,5 @@
 const std = @import("std");
-const mlx_metal = @import("src/backend/mlx_metal");
+const mlx_metal = @import("backend_selection.zig");
 const ir = @import("src/compiler/ir");
 
 const device_memory = @import("device_memory.zig");
@@ -87,34 +87,10 @@ pub const Cache = struct {
     }
 
     /// Releases every cached backend executable and owned fingerprint.
-    pub fn deinit(self: *Cache, backend: mlx_metal.Backend) void {
-        var it = self.entries.valueIterator();
-        while (it.next()) |entry_ptr| {
-            const entry = entry_ptr.*;
-            if (entry.backend_executable) |handle| backend.destroyExecutable(handle);
-            self.allocator.free(entry.fingerprint);
-            self.allocator.destroy(entry);
-        }
-        self.entries.deinit(self.allocator);
-        self.* = undefined;
-    }
+    pub const deinit = CacheStorage.deinit;
 
     /// Records a frontend compile request and returns true when it is a hit.
-    pub fn recordCompile(self: *Cache, fingerprint: []const u8) !bool {
-        if (self.entries.contains(fingerprint)) {
-            self.stats.hits += 1;
-            return true;
-        }
-        const entry = try self.allocator.create(Entry);
-        errdefer self.allocator.destroy(entry);
-        entry.* = .{
-            .fingerprint = try self.allocator.dupe(u8, fingerprint),
-        };
-        errdefer self.allocator.free(entry.fingerprint);
-        try self.entries.put(self.allocator, entry.fingerprint, entry);
-        self.stats.misses += 1;
-        return false;
-    }
+    pub const recordCompile = CacheStorage.recordCompile;
 
     /// Updates compile-latency metadata used to choose eviction victims.
     pub fn recordCompileLatency(self: *Cache, fingerprint: []const u8, latency_us: u64) void {
@@ -127,14 +103,10 @@ pub const Cache = struct {
     }
 
     /// Returns a copy of cache counters for memory accounting and diagnostics.
-    pub fn statsSnapshot(self: *const Cache) Stats {
-        return self.stats;
-    }
+    pub fn statsSnapshot(self: *const Cache) Stats { return self.stats; }
 
     /// Returns currently resident backend executable bytes.
-    pub fn residentBytes(self: *const Cache) u64 {
-        return self.stats.resident_bytes;
-    }
+    pub fn residentBytes(self: *const Cache) u64 { return self.stats.resident_bytes; }
 
     /// Records pressure-trim accounting after an owner-triggered trim.
     pub fn recordPressureTrim(self: *Cache, trim: Trim) void {
@@ -144,27 +116,10 @@ pub const Cache = struct {
     }
 
     /// Changes the residency budget and evicts idle entries if needed.
-    pub fn setMaxResidentBytes(self: *Cache, backend: mlx_metal.Backend, max_resident_bytes: u64) void {
-        self.max_resident_bytes = max_resident_bytes;
-        self.evictIdleUntilUnderLimit(backend);
-    }
+    pub const setMaxResidentBytes = CacheEviction.setMaxResidentBytes;
 
     /// Evicts idle entries until residency is at or below the requested budget.
-    pub fn trimIdleToResidentBytes(self: *Cache, backend: mlx_metal.Backend, target_resident_bytes: u64) Trim {
-        const before_bytes = self.stats.resident_bytes;
-        const before_evictions = self.stats.evictions;
-        while (self.stats.resident_bytes > target_resident_bytes) {
-            const victim = self.pressureEvictionVictim() orelse break;
-            self.evictIdleEntry(backend, victim);
-        }
-        return .{
-            .target_resident_bytes = target_resident_bytes,
-            .freed_bytes = before_bytes - self.stats.resident_bytes,
-            .evicted_entries = self.stats.evictions - before_evictions,
-            .remaining_resident_bytes = self.stats.resident_bytes,
-            .still_over_capacity = self.stats.resident_bytes > target_resident_bytes,
-        };
-    }
+    pub const trimIdleToResidentBytes = CacheEviction.trimIdleToResidentBytes;
 
     /// Retains an already resident executable for the given fingerprint.
     pub fn retainResidentByFingerprint(self: *Cache, fingerprint: []const u8) ?Retained {
@@ -175,7 +130,7 @@ pub const Cache = struct {
     /// Retains an already resident entry during a compile race recheck.
     pub fn retainResidentEntry(self: *Cache, entry: *Entry, reused: bool, compile_trim: Trim) ?Retained {
         const handle = entry.backend_executable orelse return null;
-        self.retain(entry);
+        CacheEntryRefs.retain(self, entry);
         return .{
             .lease = Lease.fromEntry(entry),
             .handle = handle,
@@ -185,54 +140,19 @@ pub const Cache = struct {
     }
 
     /// Marks a freshly compiled backend executable as resident for reuse.
-    pub fn acquireResident(
-        self: *Cache,
-        backend: mlx_metal.Backend,
-        entry: *Entry,
-        handle: mlx_metal.ExecutableHandle,
-        resident_bytes: u64,
-        compile_trim: Trim,
-    ) Retained {
-        entry.backend_executable = handle;
-        entry.resident_bytes = resident_bytes;
-        entry.ref_count = 1;
-        self.touch(entry);
-        self.stats.resident_entries += 1;
-        self.stats.resident_bytes +|= resident_bytes;
-        self.stats.peak_resident_bytes = @max(self.stats.peak_resident_bytes, self.stats.resident_bytes);
-        self.stats.largest_resident_bytes = @max(self.stats.largest_resident_bytes, resident_bytes);
-        self.evictIdleUntilUnderLimit(backend);
-        return .{
-            .lease = Lease.fromEntry(entry),
-            .handle = handle,
-            .reused = false,
-            .compile_trim = compile_trim,
-        };
-    }
+    pub const acquireResident = CacheStorage.acquireResident;
 
     /// Increments an entry reference before runtime execution.
-    pub fn retain(self: *Cache, entry: *Entry) void {
-        entry.ref_count += 1;
-        self.touch(entry);
-    }
+    pub const retain = CacheEntryRefs.retain;
 
     /// Releases an entry reference and applies residency limits.
-    pub fn release(self: *Cache, backend: mlx_metal.Backend, lease: Lease) void {
-        const entry = lease.entry();
-        if (entry.ref_count != 0) entry.ref_count -= 1;
-        self.touch(entry);
-        self.evictIdleUntilUnderLimit(backend);
-    }
+    pub const release = CacheEntryRefs.release;
 
     /// Finds an entry by fingerprint without changing ownership.
-    pub fn get(self: *Cache, fingerprint: []const u8) ?*Entry {
-        return self.entries.get(fingerprint);
-    }
+    pub fn get(self: *Cache, fingerprint: []const u8) ?*Entry { return self.entries.get(fingerprint); }
 
     /// Finds a non-retained entry for the client compile path.
-    pub fn entryForCompile(self: *Cache, fingerprint: []const u8) ?*Entry {
-        return self.entries.get(fingerprint);
-    }
+    pub fn entryForCompile(self: *Cache, fingerprint: []const u8) ?*Entry { return self.entries.get(fingerprint); }
 
     /// Returns read-only state for a cache entry.
     pub fn entrySnapshot(self: *const Cache, fingerprint: []const u8) ?EntrySnapshot {
@@ -251,15 +171,90 @@ pub const Cache = struct {
         entry.compile_latency_us = latency_us;
     }
 
-    fn touch(self: *Cache, entry: *Entry) void {
-        self.next_use +|= 1;
-        entry.last_use = self.next_use;
+    fn touch(self: *Cache, entry: *Entry) void { self.next_use +|= 1; entry.last_use = self.next_use; }
+};
+
+const CacheStorage = struct {
+    fn deinit(cache: *Cache, backend: mlx_metal.Backend) void {
+        var it = cache.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (entry.backend_executable) |handle| backend.destroyExecutable(handle);
+            cache.allocator.free(entry.fingerprint);
+            cache.allocator.destroy(entry);
+        }
+        cache.entries.deinit(cache.allocator);
+        cache.* = undefined;
+    }
+
+    fn recordCompile(cache: *Cache, fingerprint: []const u8) !bool {
+        if (cache.entries.contains(fingerprint)) {
+            cache.stats.hits += 1;
+            return true;
+        }
+        const entry = try cache.allocator.create(Entry);
+        errdefer cache.allocator.destroy(entry);
+        entry.* = .{ .fingerprint = try cache.allocator.dupe(u8, fingerprint) };
+        errdefer cache.allocator.free(entry.fingerprint);
+        try cache.entries.put(cache.allocator, entry.fingerprint, entry);
+        cache.stats.misses += 1;
+        return false;
+    }
+
+    fn acquireResident(cache: *Cache, backend: mlx_metal.Backend, entry: *Entry, handle: mlx_metal.ExecutableHandle, resident_bytes: u64, compile_trim: Trim) Retained {
+        entry.backend_executable = handle;
+        entry.resident_bytes = resident_bytes;
+        entry.ref_count = 1;
+        cache.touch(entry);
+        cache.stats.resident_entries += 1;
+        cache.stats.resident_bytes +|= resident_bytes;
+        cache.stats.peak_resident_bytes = @max(cache.stats.peak_resident_bytes, cache.stats.resident_bytes);
+        cache.stats.largest_resident_bytes = @max(cache.stats.largest_resident_bytes, resident_bytes);
+        CacheEviction.evictIdleUntilUnderLimit(cache, backend);
+        return .{ .lease = Lease.fromEntry(entry), .handle = handle, .reused = false, .compile_trim = compile_trim };
+    }
+};
+
+const CacheEntryRefs = struct {
+    fn retain(cache: *Cache, entry: *Entry) void {
+        entry.ref_count += 1;
+        cache.touch(entry);
+    }
+
+    fn release(cache: *Cache, backend: mlx_metal.Backend, lease: Lease) void {
+        const entry = lease.entry();
+        if (entry.ref_count != 0) entry.ref_count -= 1;
+        cache.touch(entry);
+        CacheEviction.evictIdleUntilUnderLimit(cache, backend);
+    }
+};
+
+const CacheEviction = struct {
+    fn setMaxResidentBytes(cache: *Cache, backend: mlx_metal.Backend, max_resident_bytes: u64) void {
+        cache.max_resident_bytes = max_resident_bytes;
+        evictIdleUntilUnderLimit(cache, backend);
+    }
+
+    fn trimIdleToResidentBytes(cache: *Cache, backend: mlx_metal.Backend, target_resident_bytes: u64) Trim {
+        const before_bytes = cache.stats.resident_bytes;
+        const before_evictions = cache.stats.evictions;
+        while (cache.stats.resident_bytes > target_resident_bytes) {
+            const victim = pressureEvictionVictim(cache) orelse break;
+            evictIdleEntry(cache, backend, victim);
+        }
+        return .{
+            .target_resident_bytes = target_resident_bytes,
+            .freed_bytes = before_bytes - cache.stats.resident_bytes,
+            .evicted_entries = cache.stats.evictions - before_evictions,
+            .remaining_resident_bytes = cache.stats.resident_bytes,
+            .still_over_capacity = cache.stats.resident_bytes > target_resident_bytes,
+        };
     }
 
     fn evictIdleUntilUnderLimit(self: *Cache, backend: mlx_metal.Backend) void {
         while (self.stats.resident_bytes > self.max_resident_bytes) {
-            const victim = self.pressureEvictionVictim() orelse return;
-            self.evictIdleEntry(backend, victim);
+            const victim = pressureEvictionVictim(self) orelse return;
+            evictIdleEntry(self, backend, victim);
         }
     }
 
@@ -355,30 +350,7 @@ pub const Residency = struct {
 
     /// Trims idle resident executables to make room for a device allocation.
     pub fn trimForAllocation(self: *Residency, io: std.Io, backend: mlx_metal.Backend, memories: []Memory, memory: *Memory, allocation_bytes: usize) Trim {
-        self.lock(io);
-        defer self.unlock(io);
-        if (memory.stats.capacity_bytes == 0) return .{};
-
-        const allocation: u64 = @intCast(allocation_bytes);
-        const bytes_without_cache = memory.stats.bytes_in_use +| allocation;
-        const resident_bytes = self.cache.residentBytes();
-        if (bytes_without_cache +| resident_bytes <= memory.stats.capacity_bytes) return .{
-            .requested_bytes = allocation,
-            .target_resident_bytes = resident_bytes,
-            .remaining_resident_bytes = resident_bytes,
-        };
-
-        const target_resident_bytes = if (bytes_without_cache >= memory.stats.capacity_bytes)
-            0
-        else
-            memory.stats.capacity_bytes - bytes_without_cache;
-        var trim = self.cache.trimIdleToResidentBytes(backend, target_resident_bytes);
-        trim.requested_bytes = allocation;
-        trim.still_over_capacity = bytes_without_cache +| trim.remaining_resident_bytes > memory.stats.capacity_bytes;
-
-        self.cache.recordPressureTrim(trim);
-        self.syncMemoryStats(memories);
-        return trim;
+        return ResidencyPressure.trimForAllocation(self, io, backend, memories, memory, allocation_bytes);
     }
 
     /// Acquires a retained resident backend executable, compiling one if no resident entry exists.
@@ -393,56 +365,7 @@ pub const Residency = struct {
         plan: *const ir.ExecutablePlan,
         device_local_hardware_ids: []const i32,
     ) (std.mem.Allocator.Error || mlx_metal.Error || error{UnsupportedRuntimeFeature})!?Retained {
-        const entry = blk: {
-            self.lock(io);
-            defer self.unlock(io);
-            const entry = self.cache.entryForCompile(fingerprint) orelse return null;
-            if (self.cache.retainResidentEntry(entry, true, .{})) |retained| {
-                self.syncMemoryStats(memories);
-                return retained;
-            }
-            break :blk entry;
-        };
-
-        // Backend compilation can be expensive and may perform allocations that
-        // trim the executable cache, so it intentionally happens outside the
-        // cache mutex. The entry pointer remains stable until client teardown.
-        {
-            self.lock(io);
-            defer self.unlock(io);
-            if (self.cache.retainResidentEntry(entry, true, .{})) |retained| {
-                self.syncMemoryStats(memories);
-                return retained;
-            }
-        }
-
-        const compile_start = nowTimestamp(io);
-        const handle = backend.compileExecutable(allocator, plan, device_local_hardware_ids) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => null,
-        };
-        const compile_latency_us = elapsedMicrosSince(io, compile_start);
-        const owned_handle = handle orelse return null;
-        const stats = backend.executableStats(owned_handle);
-        const resident_constant_bytes: usize = @intCast(stats.resident_constant_bytes);
-        var compile_trim = Trim{};
-        if (resident_constant_bytes != 0) {
-            if (residency_memory) |memory| {
-                compile_trim = self.trimForAllocation(io, backend, memories, memory, resident_constant_bytes);
-            }
-        }
-
-        self.lock(io);
-        defer self.unlock(io);
-        if (self.cache.retainResidentEntry(entry, true, compile_trim)) |retained| {
-            backend.destroyExecutable(owned_handle);
-            self.syncMemoryStats(memories);
-            return retained;
-        }
-        const retained = self.cache.acquireResident(backend, entry, owned_handle, resident_constant_bytes, compile_trim);
-        self.cache.recordCompileLatency(fingerprint, compile_latency_us);
-        self.syncMemoryStats(memories);
-        return retained;
+        return ResidencyAcquire.acquireBackendExecutable(self, io, backend, allocator, memories, residency_memory, fingerprint, plan, device_local_hardware_ids);
     }
 
     /// Releases a retained executable-cache entry after residency teardown.
@@ -478,10 +401,99 @@ pub const Residency = struct {
     }
 };
 
-fn nowTimestamp(io: std.Io) std.Io.Timestamp {
-    return std.Io.Timestamp.now(io, .awake);
-}
+const ResidencyPressure = struct {
+    fn trimForAllocation(self: *Residency, io: std.Io, backend: mlx_metal.Backend, memories: []Memory, memory: *Memory, allocation_bytes: usize) Trim {
+        self.lock(io);
+        defer self.unlock(io);
+        if (memory.stats.capacity_bytes == 0) return .{};
+        const allocation: u64 = @intCast(allocation_bytes);
+        const bytes_without_cache = memory.stats.bytes_in_use +| allocation;
+        const resident_bytes = self.cache.residentBytes();
+        if (bytes_without_cache +| resident_bytes <= memory.stats.capacity_bytes) return .{
+            .requested_bytes = allocation,
+            .target_resident_bytes = resident_bytes,
+            .remaining_resident_bytes = resident_bytes,
+        };
+        const target_resident_bytes = if (bytes_without_cache >= memory.stats.capacity_bytes) 0 else memory.stats.capacity_bytes - bytes_without_cache;
+        var trim = self.cache.trimIdleToResidentBytes(backend, target_resident_bytes);
+        trim.requested_bytes = allocation;
+        trim.still_over_capacity = bytes_without_cache +| trim.remaining_resident_bytes > memory.stats.capacity_bytes;
+        self.cache.recordPressureTrim(trim);
+        self.syncMemoryStats(memories);
+        return trim;
+    }
+};
 
-fn elapsedMicrosSince(io: std.Io, start: std.Io.Timestamp) u64 {
-    return @intCast(@max(start.durationTo(nowTimestamp(io)).toMicroseconds(), 0));
-}
+const ResidencyAcquire = struct {
+    const CompileEntry = union(enum) { missing, entry: *Entry, retained: Retained };
+
+    fn acquireBackendExecutable(
+        self: *Residency,
+        io: std.Io,
+        backend: mlx_metal.Backend,
+        allocator: std.mem.Allocator,
+        memories: []Memory,
+        residency_memory: ?*Memory,
+        fingerprint: []const u8,
+        plan: *const ir.ExecutablePlan,
+        device_local_hardware_ids: []const i32,
+    ) (std.mem.Allocator.Error || mlx_metal.Error || error{UnsupportedRuntimeFeature})!?Retained {
+        const entry = switch (entryForCompile(self, io, memories, fingerprint)) {
+            .missing => return null,
+            .retained => |retained| return retained,
+            .entry => |entry| entry,
+        };
+        if (retainRaceWinner(self, io, memories, entry)) |retained| return retained;
+
+        const compile_start = nowTimestamp(io);
+        const handle = backend.compileExecutable(allocator, plan, device_local_hardware_ids) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        const compile_latency_us = elapsedMicrosSince(io, compile_start);
+        const owned_handle = handle orelse return null;
+        const stats = backend.executableStats(owned_handle);
+        const resident_constant_bytes: usize = @intCast(stats.resident_constant_bytes);
+        const compile_trim = if (resident_constant_bytes != 0 and residency_memory != null)
+            self.trimForAllocation(io, backend, memories, residency_memory.?, resident_constant_bytes)
+        else
+            Trim{};
+
+        self.lock(io);
+        defer self.unlock(io);
+        if (self.cache.retainResidentEntry(entry, true, compile_trim)) |retained| {
+            backend.destroyExecutable(owned_handle);
+            self.syncMemoryStats(memories);
+            return retained;
+        }
+        const retained = self.cache.acquireResident(backend, entry, owned_handle, resident_constant_bytes, compile_trim);
+        self.cache.recordCompileLatency(fingerprint, compile_latency_us);
+        self.syncMemoryStats(memories);
+        return retained;
+    }
+
+    fn entryForCompile(self: *Residency, io: std.Io, memories: []Memory, fingerprint: []const u8) CompileEntry {
+        self.lock(io);
+        defer self.unlock(io);
+        const entry = self.cache.entryForCompile(fingerprint) orelse return .missing;
+        if (self.cache.retainResidentEntry(entry, true, .{})) |retained| {
+            self.syncMemoryStats(memories);
+            return .{ .retained = retained };
+        }
+        return .{ .entry = entry };
+    }
+
+    fn retainRaceWinner(self: *Residency, io: std.Io, memories: []Memory, entry: *Entry) ?Retained {
+        self.lock(io);
+        defer self.unlock(io);
+        if (self.cache.retainResidentEntry(entry, true, .{})) |retained| {
+            self.syncMemoryStats(memories);
+            return retained;
+        }
+        return null;
+    }
+};
+
+fn nowTimestamp(io: std.Io) std.Io.Timestamp { return std.Io.Timestamp.now(io, .awake); }
+
+fn elapsedMicrosSince(io: std.Io, start: std.Io.Timestamp) u64 { return @intCast(@max(start.durationTo(nowTimestamp(io)).toMicroseconds(), 0)); }

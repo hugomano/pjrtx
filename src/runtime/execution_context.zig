@@ -1,5 +1,5 @@
 const std = @import("std");
-const backend_api = @import("src/backend/mlx_metal");
+const backend_api = @import("backend_selection.zig");
 const ir = @import("src/compiler/ir");
 
 const device_memory = @import("device_memory.zig");
@@ -33,12 +33,7 @@ pub const Context = struct {
     trim_executable_cache: ?TrimExecutableCacheFn = null,
 
     /// Finds a device by stable PJRT id within the context topology.
-    pub fn lookupDevice(self: Context, id: i32) ?*const Device {
-        for (self.devices) |*device| {
-            if (device.id == id) return device;
-        }
-        return null;
-    }
+    pub const lookupDevice = ContextTopology.lookupDevice;
 
     /// Returns the number of runtime devices available to this executable context.
     pub fn deviceCount(self: Context) usize {
@@ -46,97 +41,115 @@ pub const Context = struct {
     }
 
     /// Returns a runtime device by executable device index.
-    pub fn deviceAt(self: Context, index: usize) ?*const Device {
-        if (index >= self.devices.len) return null;
-        return &self.devices[index];
-    }
+    pub const deviceAt = ContextTopology.deviceAt;
 
     /// Returns the default device id for an executable device index.
-    pub fn defaultDeviceIdAt(self: Context, index: usize) ?i32 {
-        const device = self.deviceAt(index) orelse return null;
-        return device.id;
-    }
+    pub const defaultDeviceIdAt = ContextTopology.defaultDeviceIdAt;
 
     /// Compiles an executable plan for the selected backend devices.
-    pub fn compileBackendExecutable(
-        self: Context,
-        allocator: std.mem.Allocator,
-        plan: *const ir.ExecutablePlan,
-        device_local_hardware_ids: []const i32,
-    ) backend_api.Error!?backend_api.ExecutableHandle {
-        return self.backend.compileExecutable(allocator, plan, device_local_hardware_ids);
-    }
+    pub const compileBackendExecutable = ContextBackend.compileExecutable;
 
     /// Destroys a backend executable that is not retained by the executable cache.
-    pub fn destroyBackendExecutable(self: Context, executable: backend_api.ExecutableHandle) void {
-        self.backend.destroyExecutable(executable);
-    }
+    pub const destroyBackendExecutable = ContextBackend.destroyExecutable;
 
     /// Writes backend lowering diagnostics for a plan that could not be resident.
-    pub fn writeBackendLoweringDiagnostic(
-        self: Context,
-        plan: *const ir.ExecutablePlan,
-        device_local_hardware_ids: []const i32,
-        writer: *std.Io.Writer,
-    ) void {
-        self.backend.writeExecutableLoweringDiagnostic(plan, device_local_hardware_ids, writer) catch {};
-    }
+    pub const writeBackendLoweringDiagnostic = ContextBackend.writeLoweringDiagnostic;
 
     /// Executes a resident backend executable for one device through this context.
-    pub fn executeBackendExecutable(
-        self: Context,
-        allocator: std.mem.Allocator,
-        executable: backend_api.ExecutableHandle,
-        device_index: usize,
-        argument_handles: []const backend_api.BufferHandle,
-    ) backend_api.Error!?backend_api.ExecutionResult {
-        return self.backend.executeExecutable(allocator, executable, device_index, argument_handles);
-    }
+    pub const executeBackendExecutable = ContextBackend.execute;
 
     /// Destroys a backend buffer produced during execution setup.
-    pub fn destroyBackendBuffer(self: Context, buffer: backend_api.BufferHandle) void {
-        self.backend.destroyBuffer(buffer);
-    }
+    pub const destroyBackendBuffer = ContextBackend.destroyBuffer;
 
     /// Returns the concrete backend needed to attach owned storage to runtime buffers.
-    pub fn bufferStorageBackend(self: Context) backend_api.Backend {
-        return self.backend;
-    }
+    pub const bufferStorageBackend = ContextBackend.backend;
 
     /// Converts a backend execution completion into a runtime-observable status.
-    pub fn executionEventStatus(self: Context, event: backend_api.ExecutionEventHandle) backend_api.Error!backend_api.ExecutionEventStatus {
-        return self.backend.executionEventStatus(event);
-    }
+    pub const executionEventStatus = ContextBackend.eventStatus;
 
     /// Releases a backend execution event after status observation.
-    pub fn destroyExecutionEvent(self: Context, event: backend_api.ExecutionEventHandle) void {
-        self.backend.destroyExecutionEvent(event);
-    }
+    pub const destroyExecutionEvent = ContextBackend.destroyEvent;
 
     /// Returns the backend object retained by executable residency.
-    pub fn backendForExecutableResidency(self: Context) backend_api.Backend {
-        return self.backend;
-    }
+    pub const backendForExecutableResidency = ContextBackend.backend;
 
     /// Acquires a cached backend executable through the owning runtime client.
-    pub fn acquireCachedExecutable(self: Context, allocator: std.mem.Allocator, fingerprint: []const u8, plan: *const ir.ExecutablePlan, device_local_hardware_ids: []const i32) CacheAcquireError!?CachedBackendExecutable {
-        const callback = self.acquire_cached_executable orelse return null;
-        _ = self.release_cached_executable orelse return null;
-        const user_context = self.user_context orelse return null;
+    pub const acquireCachedExecutable = ContextCache.acquire;
+
+    /// Releases a retained cache lease through the owning runtime client.
+    pub const releaseCachedExecutable = ContextCache.release;
+
+    /// Requests executable-cache pressure relief before execution allocates outputs.
+    pub const trimExecutableCacheForAllocation = ContextCache.trimForAllocation;
+};
+
+const ContextTopology = struct {
+    fn lookupDevice(context: Context, id: i32) ?*const Device {
+        for (context.devices) |*device| if (device.id == id) return device;
+        return null;
+    }
+
+    fn deviceAt(context: Context, index: usize) ?*const Device {
+        return if (index >= context.devices.len) null else &context.devices[index];
+    }
+
+    fn defaultDeviceIdAt(context: Context, index: usize) ?i32 {
+        const device = deviceAt(context, index) orelse return null;
+        return device.id;
+    }
+};
+
+const ContextBackend = struct {
+    fn backend(context: Context) backend_api.Backend {
+        return context.backend;
+    }
+
+    fn compileExecutable(context: Context, allocator: std.mem.Allocator, plan: *const ir.ExecutablePlan, device_local_hardware_ids: []const i32) backend_api.Error!?backend_api.ExecutableHandle {
+        return context.backend.compileExecutable(allocator, plan, device_local_hardware_ids);
+    }
+
+    fn destroyExecutable(context: Context, executable: backend_api.ExecutableHandle) void {
+        context.backend.destroyExecutable(executable);
+    }
+
+    fn writeLoweringDiagnostic(context: Context, plan: *const ir.ExecutablePlan, device_local_hardware_ids: []const i32, writer: *std.Io.Writer) void {
+        context.backend.writeExecutableLoweringDiagnostic(plan, device_local_hardware_ids, writer) catch {};
+    }
+
+    fn execute(context: Context, allocator: std.mem.Allocator, executable: backend_api.ExecutableHandle, device_index: usize, argument_handles: []const backend_api.BufferHandle) backend_api.Error!?backend_api.ExecutionResult {
+        return context.backend.executeExecutable(allocator, executable, device_index, argument_handles);
+    }
+
+    fn destroyBuffer(context: Context, buffer: backend_api.BufferHandle) void {
+        context.backend.destroyBuffer(buffer);
+    }
+
+    fn eventStatus(context: Context, event: backend_api.ExecutionEventHandle) backend_api.Error!backend_api.ExecutionEventStatus {
+        return context.backend.executionEventStatus(event);
+    }
+
+    fn destroyEvent(context: Context, event: backend_api.ExecutionEventHandle) void {
+        context.backend.destroyExecutionEvent(event);
+    }
+};
+
+const ContextCache = struct {
+    fn acquire(context: Context, allocator: std.mem.Allocator, fingerprint: []const u8, plan: *const ir.ExecutablePlan, device_local_hardware_ids: []const i32) CacheAcquireError!?CachedBackendExecutable {
+        const callback = context.acquire_cached_executable orelse return null;
+        _ = context.release_cached_executable orelse return null;
+        const user_context = context.user_context orelse return null;
         return callback(user_context, allocator, fingerprint, plan, device_local_hardware_ids);
     }
 
-    /// Releases a retained cache lease through the owning runtime client.
-    pub fn releaseCachedExecutable(self: Context, lease: ExecutableCacheLease) void {
-        if (self.release_cached_executable) |callback| {
-            if (self.user_context) |user_context| callback(user_context, lease);
+    fn release(context: Context, lease: ExecutableCacheLease) void {
+        if (context.release_cached_executable) |callback| {
+            if (context.user_context) |user_context| callback(user_context, lease);
         }
     }
 
-    /// Requests executable-cache pressure relief before execution allocates outputs.
-    pub fn trimExecutableCacheForAllocation(self: Context, memory: *Memory, allocation_bytes: usize) ExecutableCacheTrim {
-        const callback = self.trim_executable_cache orelse return .{ .requested_bytes = @intCast(allocation_bytes) };
-        const user_context = self.user_context orelse return .{ .requested_bytes = @intCast(allocation_bytes) };
+    fn trimForAllocation(context: Context, memory: *Memory, allocation_bytes: usize) ExecutableCacheTrim {
+        const callback = context.trim_executable_cache orelse return .{ .requested_bytes = @intCast(allocation_bytes) };
+        const user_context = context.user_context orelse return .{ .requested_bytes = @intCast(allocation_bytes) };
         return callback(user_context, memory, allocation_bytes);
     }
 };

@@ -4,7 +4,10 @@ const ir = @import("src/compiler/ir");
 const argument_capture_mod = @import("executable_argument_capture.zig");
 const compiled_program_mod = @import("executable_compiled_program.zig");
 const constants_mod = @import("executable_constants.zig");
+const fusion_kernels_mod = @import("executable_fusion_kernels.zig");
+const metal_graph_mod = @import("executable_metal_graph.zig");
 const lowering_mod = @import("lowering.zig");
+const metalcpp_msl = @import("metalcpp_msl.zig");
 const mlx_call = @import("mlx_call.zig");
 const program_mod = @import("program.zig");
 const program_build_mod = @import("program_build.zig");
@@ -41,6 +44,9 @@ pub fn run(
         error.InvalidCustomCall => return error.InvalidCustomCall,
     };
     errdefer program.deinit();
+    metalcpp_msl.dumpIfEnabled(allocator, plan, &program) catch |err| {
+        std.debug.print("pjrtx_trace event=metalcpp_msl_dump_failed error={s}\n", .{@errorName(err)});
+    };
     const while_constant_handles = try constants_mod.allocWhileSlots(allocator, program.control_flows.len, device_local_hardware_ids.len);
     errdefer allocator.free(while_constant_handles);
     errdefer constants_mod.destroy(while_constant_handles);
@@ -49,6 +55,12 @@ pub fn run(
     const compiled_program_handles = try compiled_program_mod.allocHandles(allocator, device_local_hardware_ids.len);
     errdefer allocator.free(compiled_program_handles);
     errdefer compiled_program_mod.destroyHandles(compiled_program_handles);
+    const metalcpp_fusion_kernel_handles = try fusion_kernels_mod.allocSlots(allocator, device_local_hardware_ids.len, program.fusion_groups.len);
+    errdefer allocator.free(metalcpp_fusion_kernel_handles);
+    errdefer fusion_kernels_mod.destroy(metalcpp_fusion_kernel_handles);
+    const metalcpp_graph_handles = try metal_graph_mod.allocHandles(allocator, device_local_hardware_ids.len);
+    errdefer allocator.free(metalcpp_graph_handles);
+    errdefer metal_graph_mod.destroy(metalcpp_graph_handles);
     const argument_capture_states = try argument_capture_mod.allocStates(allocator, device_local_hardware_ids.len);
     errdefer allocator.free(argument_capture_states);
     errdefer argument_capture_mod.destroyStates(allocator, argument_capture_states);
@@ -60,6 +72,20 @@ pub fn run(
         constant_handles,
         while_constant_handles,
     );
+    try fusion_kernels_mod.compileIfSupported(
+        allocator,
+        plan,
+        &program,
+        device_local_hardware_ids,
+        metalcpp_fusion_kernel_handles,
+    );
+    try metal_graph_mod.compileIfSupported(
+        allocator,
+        plan,
+        &program,
+        device_local_hardware_ids,
+        metalcpp_graph_handles,
+    );
 
     executable.* = .{
         .allocator = allocator,
@@ -69,10 +95,13 @@ pub fn run(
         .while_constant_handles = while_constant_handles,
         .compiled_program_contexts = compiled_program_contexts,
         .compiled_program_handles = compiled_program_handles,
+        .metalcpp_fusion_kernel_handles = metalcpp_fusion_kernel_handles,
+        .metalcpp_graph_handles = metalcpp_graph_handles,
         .argument_capture_states = argument_capture_states,
         .program = program,
         .stats = stats_mod.init(program, liveness_stats, constant_stats.count, constant_stats.bytes, device_local_hardware_ids.len),
     };
+    executable.recordMetalGraphCompile(countCompiledMetalGraphs(metalcpp_graph_handles));
     compiled_program_mod.initContexts(executable);
     try compiled_program_mod.compileIfSupported(executable, plan, build_callback);
     return @ptrCast(executable);
@@ -80,4 +109,12 @@ pub fn run(
 
 fn buildProgram(allocator: std.mem.Allocator, plan: *const ir.ExecutablePlan, diagnostic_writer: ?*std.Io.Writer) !program_mod.Program {
     return program_build_mod.build(allocator, plan, diagnostic_writer);
+}
+
+fn countCompiledMetalGraphs(handles: []const ?metal_graph_mod.Handle) usize {
+    var count: usize = 0;
+    for (handles) |maybe_handle| {
+        if (maybe_handle != null) count += 1;
+    }
+    return count;
 }

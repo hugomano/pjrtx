@@ -1,12 +1,10 @@
 const std = @import("std");
 
-const client_mod = @import("client.zig");
 const client_residency = @import("client_residency.zig");
 const compile_pipeline = @import("compile_pipeline.zig");
 const executable_fingerprint = @import("executable_fingerprint.zig");
 const executable_mod = @import("executable.zig");
 
-const Client = client_mod.Client;
 const CompiledExecutable = executable_mod.CompiledExecutable;
 const ExecutablePlan = @import("src/compiler/ir").ExecutablePlan;
 
@@ -18,7 +16,7 @@ pub const Error = compile_pipeline.Error;
 
 /// Compiles program bytes into a resident executable plan and backend residency.
 pub fn compile(
-    client: *Client,
+    client: anytype,
     allocator: std.mem.Allocator,
     program: Program,
     diagnostics: *std.Io.Writer,
@@ -41,7 +39,7 @@ pub fn compile(
     const fingerprint = executable_fingerprint.alloc(allocator, client.backend, &client.device_memory, optimized_program, &plan) catch return error.OutOfMemory;
     errdefer allocator.free(fingerprint);
 
-    const cache_hit = client_residency.recordCompile(client, fingerprint) catch return error.Internal;
+    const cache_hit = client_residency.recordCompile(&client.executable_residency_context, fingerprint) catch return error.Internal;
 
     const plan_ptr = allocator.create(ExecutablePlan) catch return error.OutOfMemory;
     plan_ptr.* = plan;

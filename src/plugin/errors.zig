@@ -2,7 +2,7 @@ const std = @import("std");
 
 const c = @import("c");
 const abi = @import("pjrt_abi.zig");
-const plugin = @import("plugin.zig");
+const plugin_process = @import("plugin_process.zig");
 
 const ErrorHandle = abi.Opaque(PjrtxError, c.PJRT_Error);
 
@@ -27,8 +27,8 @@ const ErrorRef = struct {
     fn destroy(raw: ?*c.PJRT_Error) void {
         const base = raw orelse return;
         const err = ErrorRef.at(base).ptr;
-        plugin.allocator().free(err.message);
-        plugin.allocator().destroy(err);
+        plugin_process.allocator().free(err.message);
+        plugin_process.allocator().destroy(err);
     }
 
     fn message(self: ErrorRef) []const u8 {
@@ -95,12 +95,12 @@ pub const Error = struct {
     };
 
     fn make(code_: c.PJRT_Error_Code, message_: []const u8) ?*c.PJRT_Error {
-        const err = plugin.allocator().create(PjrtxError) catch return null;
+        const err = plugin_process.allocator().create(PjrtxError) catch return null;
         err.* = .{
             .base = .{ .vtable = null },
             .code = code_,
-            .message = plugin.allocator().dupe(u8, message_) catch {
-                plugin.allocator().destroy(err);
+            .message = plugin_process.allocator().dupe(u8, message_) catch {
+                plugin_process.allocator().destroy(err);
                 return null;
             },
         };

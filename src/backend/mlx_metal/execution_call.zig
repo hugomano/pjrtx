@@ -3,6 +3,7 @@ const ir = @import("src/compiler/ir");
 
 const buffer_mod = @import("buffer.zig");
 const executable_mod = @import("executable.zig");
+const metal_graph_mod = @import("executable_metal_graph.zig");
 const mlx_call = @import("mlx_call.zig");
 const profiling_mod = @import("profiling.zig");
 const program_mod = @import("program.zig");
@@ -41,6 +42,10 @@ const ExecuteCall = struct {
         return self.executable.compiled_program_handles[self.device_index];
     }
 
+    fn metalGraph(self: ExecuteCall) ?metal_graph_mod.Handle {
+        return self.executable.metalCppGraph(self.device_index);
+    }
+
     fn recordComplete(self: ExecuteCall, profile: ExecuteProfile, profile_enabled: bool, output_count: usize) void {
         self.executable.recordExecute(self.device_index, self.executable.device_local_hardware_ids[self.device_index]);
         if (profile_enabled) {
@@ -64,6 +69,34 @@ pub fn executeExecutable(allocator: std.mem.Allocator, executable_handle: Execut
     const profile_verbose = profile_enabled and profiling_mod.verbose();
     const execute_start_ns = profiling_mod.start(profile_enabled);
     var profile: ExecuteProfile = .{};
+
+    if (call.metalGraph()) |graph| {
+        const graph_start_ns = profiling_mod.start(profile_enabled);
+        const outputs = try metal_graph_mod.execute(allocator, call.executable, call.device_index, graph, call.arguments);
+        call.executable.recordMetalGraphExecute(outputs.len);
+        if (profile_enabled) {
+            const graph_us = profiling_mod.elapsedUs(graph_start_ns);
+            profile.recordMetalGraph(graph_us);
+            profile.wall_us = profiling_mod.elapsedUs(execute_start_ns);
+            profiling_mod.writeMetalGraphExecute(.{
+                .executable_address = @intFromPtr(call.executable),
+                .device_index = call.device_index,
+                .status = "executed",
+                .reason = "compiled",
+                .output_count = outputs.len,
+                .elapsed_us = graph_us,
+            });
+        }
+        call.recordComplete(profile, profile_enabled, outputs.len);
+        return ExecuteCall.result(outputs);
+    } else if (profile_enabled and profiling_mod.metalCppExecutableRunnerEnabled()) {
+        profiling_mod.writeMetalGraphExecute(.{
+            .executable_address = @intFromPtr(call.executable),
+            .device_index = call.device_index,
+            .status = "skipped",
+            .reason = "not_compiled",
+        });
+    }
 
     if (call.compiledProgram()) |compiled_program| {
         try compiled_program_mod.maybeCreateInitialArgumentCapturedProgram(call.executable, call.device_index, call.arguments);
@@ -97,7 +130,7 @@ pub fn executeExecutable(allocator: std.mem.Allocator, executable_handle: Execut
     const output_clone_start_ns = profiling_mod.start(profile_enabled);
     const outputs = (try (values_mod.OutputBindings{
         .allocator = allocator,
-        .executable = call.executable,
+        .plan = call.executable.plan,
         .values = &bindings,
     }).cloneOrNull()) orelse return null;
     if (profile_enabled) {
@@ -112,7 +145,6 @@ pub fn executeExecutable(allocator: std.mem.Allocator, executable_handle: Execut
 }
 
 test "mlx metal backend executable runs resident device buffers" {
-    const execution_mod = @import("execution.zig");
     const allocator = std.testing.allocator;
     const local_hardware_id: i32 = 0;
     const dims = [_]i64{4};
@@ -178,8 +210,8 @@ test "mlx metal backend executable runs resident device buffers" {
     };
     defer plan.deinit();
 
-    const executable = (try executable_mod.compile(allocator, &plan, &.{local_hardware_id}, execution_mod.compiledProgramBuildCallback)) orelse return error.TestUnexpectedResult;
-    defer execution_mod.destroy(executable);
+    const executable = (try executable_mod.compile(allocator, &plan, &.{local_hardware_id}, compiled_program_mod.compiledProgramBuildCallback)) orelse return error.TestUnexpectedResult;
+    defer executable_mod.Executable.fromHandle(executable).deinit();
     const compiled = executable_mod.Executable.fromHandle(executable);
     try std.testing.expectEqual(@as(usize, 3), compiled.program.nodes.len);
     try std.testing.expectEqual(@as(usize, 3), compiled.program.schedule.len);
@@ -240,7 +272,7 @@ test "mlx metal backend executable runs resident device buffers" {
     try std.testing.expect(compiled.program.values[3].is_output);
     try std.testing.expectEqual(@as(?usize, 0), compiled.program.values[3].materialization_boundary);
 
-    var executable_stats = execution_mod.stats(executable);
+    var executable_stats = executable_mod.Executable.fromHandle(executable).snapshotStats();
     try std.testing.expectEqual(@as(usize, 1), executable_stats.resident_constant_count);
     try std.testing.expectEqual(@as(usize, 4), executable_stats.resident_constant_bytes);
     try std.testing.expectEqual(@as(usize, 4), executable_stats.program_value_count);
@@ -268,16 +300,16 @@ test "mlx metal backend executable runs resident device buffers" {
     const lhs = (try buffer_mod.Buffer.fromHost(local_hardware_id, .u8, &dims, &.{ 1, 2, 3, 4 })) orelse return error.TestUnexpectedResult;
     defer lhs.destroy();
 
-    try std.testing.expectError(error.CommandSubmissionFailed, execution_mod.execute(allocator, executable, 1, &.{lhs.toHandle()}));
-    try std.testing.expectError(error.CommandSubmissionFailed, execution_mod.execute(allocator, executable, 0, &.{}));
-    try std.testing.expectError(error.CommandSubmissionFailed, execution_mod.execute(allocator, executable, 0, &.{ lhs.toHandle(), lhs.toHandle() }));
-    executable_stats = execution_mod.stats(executable);
+    try std.testing.expectError(error.CommandSubmissionFailed, executeExecutable(allocator, executable, 1, &.{lhs.toHandle()}));
+    try std.testing.expectError(error.CommandSubmissionFailed, executeExecutable(allocator, executable, 0, &.{}));
+    try std.testing.expectError(error.CommandSubmissionFailed, executeExecutable(allocator, executable, 0, &.{ lhs.toHandle(), lhs.toHandle() }));
+    executable_stats = executable_mod.Executable.fromHandle(executable).snapshotStats();
     try std.testing.expectEqual(@as(usize, 0), executable_stats.execute_count);
     try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), executable_stats.last_execute_device_index);
     try std.testing.expectEqual(@as(i32, -1), executable_stats.last_execute_local_hardware_id);
 
-    const result = (try execution_mod.execute(allocator, executable, 0, &.{lhs.toHandle()})) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(execution_mod.ExecutionCompletionKind.completed, result.completion.kind);
+    const result = (try executeExecutable(allocator, executable, 0, &.{lhs.toHandle()})) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(types.ExecutionCompletionKind.completed, result.completion.kind);
     const outputs = result.outputs;
     defer allocator.free(outputs);
     defer {
@@ -292,7 +324,7 @@ test "mlx metal backend executable runs resident device buffers" {
     try buffer_mod.Opaque.copyToHost(outputs[0].handle, &actual);
     try std.testing.expectEqualSlices(u8, &.{ 6, 15, 28, 45 }, &actual);
 
-    executable_stats = execution_mod.stats(executable);
+    executable_stats = executable_mod.Executable.fromHandle(executable).snapshotStats();
     const compiled_programs_enabled = executable_stats.compiled_program_execute_count != 0;
     try std.testing.expectEqual(@as(usize, 1), executable_stats.resident_constant_count);
     try std.testing.expectEqual(@as(usize, 4), executable_stats.resident_constant_bytes);
@@ -319,8 +351,8 @@ test "mlx metal backend executable runs resident device buffers" {
 
     const second_lhs = (try buffer_mod.Buffer.fromHost(local_hardware_id, .u8, &dims, &.{ 2, 4, 6, 8 })) orelse return error.TestUnexpectedResult;
     defer second_lhs.destroy();
-    const second_result = (try execution_mod.execute(allocator, executable, 0, &.{second_lhs.toHandle()})) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(execution_mod.ExecutionCompletionKind.completed, second_result.completion.kind);
+    const second_result = (try executeExecutable(allocator, executable, 0, &.{second_lhs.toHandle()})) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(types.ExecutionCompletionKind.completed, second_result.completion.kind);
     const second_outputs = second_result.outputs;
     defer allocator.free(second_outputs);
     defer {
@@ -332,7 +364,7 @@ test "mlx metal backend executable runs resident device buffers" {
     try buffer_mod.Opaque.copyToHost(second_outputs[0].handle, &actual);
     try std.testing.expectEqualSlices(u8, &.{ 8, 21, 40, 65 }, &actual);
 
-    executable_stats = execution_mod.stats(executable);
+    executable_stats = executable_mod.Executable.fromHandle(executable).snapshotStats();
     try std.testing.expectEqual(@as(usize, 1), executable_stats.resident_constant_count);
     try std.testing.expectEqual(@as(usize, 4), executable_stats.resident_constant_bytes);
     try std.testing.expectEqual(@as(usize, 2), executable_stats.execute_count);

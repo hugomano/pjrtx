@@ -6,7 +6,7 @@ const runtime = @import("src/runtime");
 const abi = @import("pjrt_abi.zig");
 const errors = @import("errors.zig");
 const handles = @import("pjrt_handles.zig");
-const plugin = @import("plugin.zig");
+const plugin_process = @import("plugin_process.zig");
 
 const PjrtError = errors.Error;
 
@@ -30,8 +30,8 @@ const SerializedTopologyRef = struct {
     fn delete(raw: ?*c.PJRT_SerializedTopology) callconv(.c) void {
         const opaque_topology = raw orelse return;
         const topology = at(opaque_topology).ptr;
-        plugin.allocator().free(topology.bytes);
-        plugin.allocator().destroy(topology);
+        plugin_process.allocator().free(topology.bytes);
+        plugin_process.allocator().destroy(topology);
     }
 };
 
@@ -57,12 +57,12 @@ pub const TopologyDescription = struct {
 
     fn platformName(self: TopologyDescription) []const u8 {
         _ = self;
-        return plugin.Platform.name;
+        return plugin_process.Platform.name;
     }
 
     fn platformVersion(self: TopologyDescription) []const u8 {
         _ = self;
-        return plugin.Platform.version;
+        return plugin_process.Platform.version;
     }
 
     fn devices(self: TopologyDescription) []const *runtime.Device {
@@ -71,8 +71,8 @@ pub const TopologyDescription = struct {
 
     fn fingerprint(self: TopologyDescription) u64 {
         var hasher = std.hash.Wyhash.init(0);
-        hasher.update(plugin.Platform.name);
-        hasher.update(plugin.Platform.version);
+        hasher.update(plugin_process.Platform.name);
+        hasher.update(plugin_process.Platform.version);
         for (self.client.topologyDevices()) |device| {
             hasher.update(std.mem.asBytes(&device.id));
             hasher.update(std.mem.asBytes(&device.local_hardware_id));
@@ -83,15 +83,15 @@ pub const TopologyDescription = struct {
     }
 
     fn serialize(self: TopologyDescription) ?*SerializedTopology {
-        var writer = std.Io.Writer.Allocating.init(plugin.allocator());
+        var writer = std.Io.Writer.Allocating.init(plugin_process.allocator());
         defer writer.deinit();
-        writer.writer.print("platform={s};version={s};devices={d}", .{ plugin.Platform.name, plugin.Platform.version, self.client.deviceCount() }) catch return null;
+        writer.writer.print("platform={s};version={s};devices={d}", .{ plugin_process.Platform.name, plugin_process.Platform.version, self.client.deviceCount() }) catch return null;
         for (self.client.topologyDevices()) |device| {
             writer.writer.print(";device={d}:{d}:{d}:{s}", .{ device.id, device.local_hardware_id, device.process_index, device.name }) catch return null;
         }
-        const topology = plugin.allocator().create(SerializedTopology) catch return null;
+        const topology = plugin_process.allocator().create(SerializedTopology) catch return null;
         topology.* = .{ .bytes = writer.toOwnedSlice() catch {
-            plugin.allocator().destroy(topology);
+            plugin_process.allocator().destroy(topology);
             return null;
         } };
         return topology;

@@ -9,11 +9,12 @@ const buffer_placement = @import("buffer_placement.zig");
 const errors = @import("errors.zig");
 const events = @import("events.zig");
 const handles = @import("pjrt_handles.zig");
-const plugin = @import("plugin.zig");
+const plugin_process = @import("plugin_process.zig");
 
 const TransferHandle = handles.AsyncHostToDeviceTransferManager(TransferManager);
 const PjrtError = errors.Error;
 const PjrtEvent = events.Event;
+const TransferCreateError = std.mem.Allocator.Error || runtime.PendingBackendTransferBufferError || runtime.AsyncTransferBeginError;
 
 const TransferIndex = struct {
     value: usize,
@@ -192,66 +193,8 @@ pub const TransferManager = struct {
         return TransferHandle.handle(manager);
     }
 
-    fn create(client: *runtime.Client, memory: *runtime.Memory, shape_specs: []const ShapeSpec) CreateError!*TransferManager {
-        if (memory.addressable_devices.len == 0) return error.InvalidArgument;
-        const device = memory.addressable_devices[0];
-        const shard_index = buffer_placement.Placement.index(client, device) orelse return error.InvalidArgument;
-
-        const manager = try plugin.allocator().create(TransferManager);
-        errdefer plugin.allocator().destroy(manager);
-
-        const buffers = try plugin.allocator().alloc(*runtime.Buffer, shape_specs.len);
-        errdefer plugin.allocator().free(buffers);
-        const backend_transfers = try plugin.allocator().alloc(runtime.AsyncHostToDeviceTransferHandle, shape_specs.len);
-        errdefer plugin.allocator().free(backend_transfers);
-        const written = try plugin.allocator().alloc(usize, shape_specs.len);
-        errdefer plugin.allocator().free(written);
-        const retrieved = try plugin.allocator().alloc(bool, shape_specs.len);
-        errdefer plugin.allocator().free(retrieved);
-        const completed = try plugin.allocator().alloc(bool, shape_specs.len);
-        errdefer plugin.allocator().free(completed);
-
-        @memset(written, 0);
-        @memset(retrieved, false);
-        @memset(completed, false);
-
-        var initialized: usize = 0;
-        errdefer {
-            for (backend_transfers[0..initialized], completed[0..initialized]) |transfer, done| {
-                if (!done) client.destroyAsyncHostToDeviceTransfer(transfer);
-            }
-            for (buffers[0..initialized]) |buffer| buffer.deinit();
-        }
-
-        for (shape_specs, 0..) |shape_spec, i| {
-            const transfer = try client.beginAsyncHostToDeviceTransfer(device, shape_spec.element_type, shape_spec.dims, shape_spec.byte_size);
-            backend_transfers[i] = transfer;
-            buffers[i] = client.createPendingBackendTransferBuffer(
-                plugin.allocator(),
-                shape_spec.element_type,
-                shape_spec.dims,
-                device,
-                memory,
-                shard_index,
-            ) catch |err| {
-                client.destroyAsyncHostToDeviceTransfer(transfer);
-                return err;
-            };
-            initialized += 1;
-        }
-
-        manager.* = .{
-            .allocator = plugin.allocator(),
-            .client = client,
-            .device = device,
-            .memory = memory,
-            .buffers = buffers,
-            .backend_transfers = backend_transfers,
-            .written = written,
-            .retrieved = retrieved,
-            .completed = completed,
-        };
-        return manager;
+    fn create(client: *runtime.Client, memory: *runtime.Memory, shape_specs: []const ShapeSpec) TransferCreateError!*TransferManager {
+        return TransferAllocation.create(client, memory, shape_specs);
     }
 
     fn deinit(self: *TransferManager) void {
@@ -315,7 +258,71 @@ pub const TransferManager = struct {
         self.completed[i] = true;
     }
 
-    const CreateError = std.mem.Allocator.Error || runtime.PendingBackendTransferBufferError || runtime.AsyncTransferBeginError;
+    const CreateError = TransferCreateError;
+};
+
+const TransferAllocation = struct {
+    fn create(client: *runtime.Client, memory: *runtime.Memory, shape_specs: []const ShapeSpec) TransferCreateError!*TransferManager {
+        if (memory.addressable_devices.len == 0) return error.InvalidArgument;
+        const device = memory.addressable_devices[0];
+        const shard_index = buffer_placement.Placement.index(client, device) orelse return error.InvalidArgument;
+
+        const manager = try plugin_process.allocator().create(TransferManager);
+        errdefer plugin_process.allocator().destroy(manager);
+
+        const buffers = try plugin_process.allocator().alloc(*runtime.Buffer, shape_specs.len);
+        errdefer plugin_process.allocator().free(buffers);
+        const backend_transfers = try plugin_process.allocator().alloc(runtime.AsyncHostToDeviceTransferHandle, shape_specs.len);
+        errdefer plugin_process.allocator().free(backend_transfers);
+        const written = try plugin_process.allocator().alloc(usize, shape_specs.len);
+        errdefer plugin_process.allocator().free(written);
+        const retrieved = try plugin_process.allocator().alloc(bool, shape_specs.len);
+        errdefer plugin_process.allocator().free(retrieved);
+        const completed = try plugin_process.allocator().alloc(bool, shape_specs.len);
+        errdefer plugin_process.allocator().free(completed);
+
+        @memset(written, 0);
+        @memset(retrieved, false);
+        @memset(completed, false);
+
+        var initialized: usize = 0;
+        errdefer {
+            for (backend_transfers[0..initialized], completed[0..initialized]) |transfer, done| {
+                if (!done) client.destroyAsyncHostToDeviceTransfer(transfer);
+            }
+            for (buffers[0..initialized]) |buffer| buffer.deinit();
+        }
+
+        for (shape_specs, 0..) |shape_spec, i| {
+            const transfer = try client.beginAsyncHostToDeviceTransfer(device, shape_spec.element_type, shape_spec.dims, shape_spec.byte_size);
+            backend_transfers[i] = transfer;
+            buffers[i] = client.createPendingBackendTransferBuffer(
+                plugin_process.allocator(),
+                shape_spec.element_type,
+                shape_spec.dims,
+                device,
+                memory,
+                shard_index,
+            ) catch |err| {
+                client.destroyAsyncHostToDeviceTransfer(transfer);
+                return err;
+            };
+            initialized += 1;
+        }
+
+        manager.* = .{
+            .allocator = plugin_process.allocator(),
+            .client = client,
+            .device = device,
+            .memory = memory,
+            .buffers = buffers,
+            .backend_transfers = backend_transfers,
+            .written = written,
+            .retrieved = retrieved,
+            .completed = completed,
+        };
+        return manager;
+    }
 };
 
 const TransferDestroy = struct {
@@ -428,8 +435,8 @@ const AsyncAddMetadata = struct {
 
 /// Creates a PJRT async host-to-device transfer manager handle from PJRT shapes.
 pub fn create(client: *runtime.Client, memory: *runtime.Memory, raw_shape_specs: []const c.PJRT_ShapeSpec) (TransferManager.CreateError || error{InvalidShapeSpec})!*c.PJRT_AsyncHostToDeviceTransferManager {
-    const shape_specs = try plugin.allocator().alloc(ShapeSpec, raw_shape_specs.len);
-    defer plugin.allocator().free(shape_specs);
+    const shape_specs = try plugin_process.allocator().alloc(ShapeSpec, raw_shape_specs.len);
+    defer plugin_process.allocator().free(shape_specs);
     for (raw_shape_specs, shape_specs) |raw, *shape_spec| {
         shape_spec.* = ShapeSpec.fromPjrt(raw) catch return error.InvalidShapeSpec;
     }

@@ -1,0 +1,51 @@
+load("@rules_zig//zig:defs.bzl", "zig_library", "zig_test")
+
+filegroup(
+    name = "sources",
+    srcs = [
+        "BUILD.bazel",
+        "backend.zig",
+        "msl_artifact_refs.zig",
+        "msl_artifacts.zig",
+        "msl_dense_elementwise.zig",
+        "msl_manifest.zig",
+        "msl_source.zig",
+    ],
+    visibility = ["//src/architecture:__pkg__"],
+)
+
+zig_library(
+    name = "metalcpp",
+    import_name = "src/backend/metalcpp",
+    main = "backend.zig",
+    srcs = [
+        "backend.zig",
+        "msl_artifact_refs.zig",
+        "msl_artifacts.zig",
+        "msl_dense_elementwise.zig",
+        "msl_manifest.zig",
+        "msl_source.zig",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/backend/mlx_metal:mlx_metal",
+        "//src/compiler:ir",
+    ],
+)
+
+zig_test(
+    name = "metalcpp_test",
+    main = "backend.zig",
+    srcs = [
+        "backend.zig",
+        "msl_artifact_refs.zig",
+        "msl_artifacts.zig",
+        "msl_dense_elementwise.zig",
+        "msl_manifest.zig",
+        "msl_source.zig",
+    ],
+    deps = [
+        "//src/backend/mlx_metal:mlx_metal",
+        "//src/compiler:ir",
+    ],
+)

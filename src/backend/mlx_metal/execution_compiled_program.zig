@@ -2,6 +2,7 @@ const std = @import("std");
 const ir = @import("src/compiler/ir");
 
 const buffer_mod = @import("buffer.zig");
+const argument_capture_mod = @import("executable_argument_capture.zig");
 const executable_mod = @import("executable.zig");
 const mlx_call = @import("mlx_call.zig");
 const profiling_mod = @import("profiling.zig");
@@ -12,9 +13,6 @@ const values_mod = @import("execution_values.zig");
 const CompiledExecutable = executable_mod.Executable;
 const CompiledProgramContext = executable_mod.CompiledProgramContext;
 const ArgumentCaptureState = executable_mod.ArgumentCaptureState;
-
-const InitialCaptureSmallControlBytes: usize = 4096;
-const MinCapturedProgramStableInputs = 8;
 
 /// Executes an MLX compiled program and wraps its device-resident outputs.
 pub fn executeCompiledProgram(
@@ -31,6 +29,13 @@ pub fn executeCompiledProgram(
     defer program_outputs.deinit();
     if (program_outputs.len() != executable.plan.output_ids.len) {
         return error.CommandSubmissionFailed;
+    }
+    if (profile_enabled) {
+        profile.recordCompiledProgramBoundary(
+            program_outputs.profile.host_enqueue_us,
+            program_outputs.profile.device_sync_wait_us,
+            program_outputs.profile.measured_device_sync,
+        );
     }
 
     const outputs = try allocator.alloc(types.ExecutableOutput, executable.plan.output_ids.len);
@@ -55,10 +60,7 @@ pub fn executeCompiledProgram(
     }
     if (profile_enabled) {
         const elapsed = profiling_mod.elapsedUs(execute_start_ns);
-        profile.schedule_us +|= elapsed;
-        profile.schedule_peak_us = @max(profile.schedule_peak_us, elapsed);
-        profile.compiled_program_us +|= elapsed;
-        profile.compiled_program_peak_us = @max(profile.compiled_program_peak_us, elapsed);
+        profile.recordCompiledProgram(elapsed);
     }
     executable.recordCompiledProgramExecute(outputs.len);
     return outputs;
@@ -120,9 +122,10 @@ pub fn maybeCreateInitialArgumentCapturedProgram(
     const state = &executable.argument_capture_states[device_index];
     if (state.program_handle != null or state.previous_arguments.len != 0) return;
 
-    const dynamic_indices = try initialArgumentCaptureDynamicIndices(executable.allocator, executable.plan);
+    const policy = argument_capture_mod.Policy.current();
+    const dynamic_indices = try initialArgumentCaptureDynamicIndices(executable.allocator, executable.plan, policy);
     errdefer executable.allocator.free(dynamic_indices);
-    if (dynamic_indices.len >= arguments.len or arguments.len - dynamic_indices.len < MinCapturedProgramStableInputs) {
+    if (!policy.allowsCapture(arguments.len, dynamic_indices.len)) {
         executable.allocator.free(dynamic_indices);
         return;
     }
@@ -147,14 +150,14 @@ pub fn maybeCreateInitialArgumentCapturedProgram(
     };
 }
 
-fn initialArgumentCaptureDynamicIndices(allocator: std.mem.Allocator, plan: *const ir.ExecutablePlan) ![]u64 {
+fn initialArgumentCaptureDynamicIndices(allocator: std.mem.Allocator, plan: *const ir.ExecutablePlan, policy: argument_capture_mod.Policy) ![]u64 {
     var dynamic: std.ArrayList(u64) = .empty;
     errdefer dynamic.deinit(allocator);
 
     var parameter_index: u32 = 0;
     for (plan.values) |value| {
         if (value.role != .parameter) continue;
-        if (initiallyDynamicParameter(plan, parameter_index, value.descriptor)) {
+        if (initiallyDynamicParameter(plan, parameter_index, value.descriptor, policy)) {
             try dynamic.append(allocator, parameter_index);
         }
         parameter_index += 1;
@@ -162,17 +165,13 @@ fn initialArgumentCaptureDynamicIndices(allocator: std.mem.Allocator, plan: *con
     return try dynamic.toOwnedSlice(allocator);
 }
 
-fn initiallyDynamicParameter(plan: *const ir.ExecutablePlan, parameter_index: u32, descriptor: ir.BufferDescriptor) bool {
+fn initiallyDynamicParameter(plan: *const ir.ExecutablePlan, parameter_index: u32, descriptor: ir.BufferDescriptor, policy: argument_capture_mod.Policy) bool {
     for (plan.donated_parameter_indices) |donated_index| {
         if (donated_index == parameter_index) return true;
     }
 
     const byte_size = ir.denseByteSize(descriptor.element_type, descriptor.dims);
-    if (byte_size == 0 or byte_size > InitialCaptureSmallControlBytes) return false;
-    return switch (descriptor.element_type) {
-        .pred, .s8, .s16, .s32, .s64, .u8, .u16, .u32, .u64 => true,
-        else => false,
-    };
+    return policy.treatsSmallControlAsDynamic(descriptor.element_type, byte_size);
 }
 
 /// Executes a previously captured MLX program when its stable arguments still match.
@@ -233,8 +232,8 @@ pub fn updateArgumentCaptureState(
     for (arguments, 0..) |argument, index| {
         if (state.previous_arguments[index] != argument) dynamic_count += 1;
     }
-    const captured_count = arguments.len - dynamic_count;
-    if (captured_count < MinCapturedProgramStableInputs or dynamic_count == arguments.len) {
+    const policy = argument_capture_mod.Policy.current();
+    if (!policy.allowsCapture(arguments.len, dynamic_count)) {
         try state.rememberBaseline(executable.allocator, arguments);
         return;
     }
@@ -322,7 +321,7 @@ fn buildExecutableOutputHandlesForCompiledTrace(
 
     return try (values_mod.OutputBindings{
         .allocator = allocator,
-        .executable = executable,
+        .plan = executable.plan,
         .values = &bindings,
     }).cloneOrFail();
 }

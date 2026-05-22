@@ -3,7 +3,7 @@ const std = @import("std");
 const c = @import("c");
 const errors = @import("errors.zig");
 const PjrtError = errors.Error;
-const plugin = @import("plugin.zig");
+const plugin_process = @import("plugin_process.zig");
 const render = @import("trace_render.zig");
 
 const Timestamp = std.Io.Timestamp;
@@ -38,8 +38,8 @@ pub const Env = struct {
 };
 
 fn config() Config {
-    config_mutex.lockUncancelable(plugin.io());
-    defer config_mutex.unlock(plugin.io());
+    config_mutex.lockUncancelable(plugin_process.io());
+    defer config_mutex.unlock(plugin_process.io());
 
     if (config_state == .cold) {
         config_storage = Config.init();
@@ -61,7 +61,7 @@ fn integerFromEnv(comptime name: [:0]const u8) ?u64 {
 }
 
 fn now() Timestamp {
-    return Timestamp.now(plugin.io(), .awake);
+    return Timestamp.now(plugin_process.io(), .awake);
 }
 
 fn resultText(result: ?*c.PJRT_Error, out: *std.Io.Writer.Allocating) []const u8 {
@@ -90,15 +90,15 @@ pub const Api = struct {
                 const start = now();
                 if (Return == void) {
                     callback(args);
-                    var args_text = std.Io.Writer.Allocating.init(plugin.allocator());
+                    var args_text = std.Io.Writer.Allocating.init(plugin_process.allocator());
                     defer args_text.deinit();
                     emit(name, start, c.PJRT_Error_Code_OK, render.Render.args(Args, args, &args_text), "ok");
                     return;
                 }
                 const result = callback(args);
-                var args_text = std.Io.Writer.Allocating.init(plugin.allocator());
+                var args_text = std.Io.Writer.Allocating.init(plugin_process.allocator());
                 defer args_text.deinit();
-                var rendered_result = std.Io.Writer.Allocating.init(plugin.allocator());
+                var rendered_result = std.Io.Writer.Allocating.init(plugin_process.allocator());
                 defer rendered_result.deinit();
                 emit(name, start, PjrtError.code(result), render.Render.args(Args, args, &args_text), resultText(result, &rendered_result));
                 return result;

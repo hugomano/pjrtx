@@ -6,55 +6,57 @@ const runtime_mod = @import("src/runtime");
 const abi = @import("pjrt_abi.zig");
 const errors = @import("errors.zig");
 const handles = @import("pjrt_handles.zig");
-const plugin = @import("plugin.zig");
+const plugin_process = @import("plugin_process.zig");
 
 const BridgeHandle = handles.UserArg(OnReadyBridge);
 const PjrtError = errors.Error;
+
+const EventCompletion = struct {
+    slot: *allowzero ?*c.PJRT_Event,
+
+    /// Creates a pending event in a PJRT output slot.
+    pub fn pending(slot: *allowzero ?*c.PJRT_Event) ?*c.PJRT_Error {
+        const completion = EventCompletion.at(slot);
+        completion.slot.* = Event.create(runtime_mod.Event.pending());
+        if (completion.slot.* == null) return PjrtError.resourceExhausted("failed to allocate PJRT event");
+        return null;
+    }
+
+    /// Creates an event mirroring a runtime event in a PJRT output slot.
+    pub fn fromRuntime(slot: *allowzero ?*c.PJRT_Event, source: runtime_mod.Event) ?EventCompletion {
+        const completion = EventCompletion.at(slot);
+        completion.slot.* = Event.create(source);
+        if (completion.slot.* == null) return null;
+        return completion;
+    }
+
+    /// Binds a helper to an existing PJRT event output slot.
+    pub fn at(slot: *allowzero ?*c.PJRT_Event) EventCompletion {
+        return .{ .slot = slot };
+    }
+
+    /// Marks the event in this slot ready when the caller supplied one.
+    pub fn setReady(self: EventCompletion) void {
+        if (self.slot.*) |event| Event.at(event).ptr.setReady();
+    }
+
+    /// Marks the event in this slot failed when the caller supplied one.
+    pub fn setFailed(self: EventCompletion, message: []const u8) void {
+        if (self.slot.*) |event| Event.at(event).ptr.setFailed(message);
+    }
+
+    /// Borrows the runtime event stored in this output slot.
+    pub fn runtime(self: EventCompletion) *runtime_mod.Event {
+        return Event.at(self.slot.*.?).ptr;
+    }
+};
 
 /// PJRT event reference over a runtime event owned by the plugin.
 pub const Event = struct {
     ptr: *runtime_mod.Event,
 
     /// Mutable PJRT event output slot used by APIs that complete asynchronously.
-    pub const Completion = struct {
-        slot: *allowzero ?*c.PJRT_Event,
-
-        /// Creates a pending event in a PJRT output slot.
-        pub fn pending(slot: *allowzero ?*c.PJRT_Event) ?*c.PJRT_Error {
-            const completion = Completion.at(slot);
-            completion.slot.* = Event.create(runtime_mod.Event.pending());
-            if (completion.slot.* == null) return PjrtError.resourceExhausted("failed to allocate PJRT event");
-            return null;
-        }
-
-        /// Creates an event mirroring a runtime event in a PJRT output slot.
-        pub fn fromRuntime(slot: *allowzero ?*c.PJRT_Event, source: runtime_mod.Event) ?Completion {
-            const completion = Completion.at(slot);
-            completion.slot.* = Event.create(source);
-            if (completion.slot.* == null) return null;
-            return completion;
-        }
-
-        /// Binds a helper to an existing PJRT event output slot.
-        pub fn at(slot: *allowzero ?*c.PJRT_Event) Completion {
-            return .{ .slot = slot };
-        }
-
-        /// Marks the event in this slot ready when the caller supplied one.
-        pub fn setReady(self: Completion) void {
-            if (self.slot.*) |event| Event.at(event).ptr.setReady();
-        }
-
-        /// Marks the event in this slot failed when the caller supplied one.
-        pub fn setFailed(self: Completion, message: []const u8) void {
-            if (self.slot.*) |event| Event.at(event).ptr.setFailed(message);
-        }
-
-        /// Borrows the runtime event stored in this output slot.
-        pub fn runtime(self: Completion) *runtime_mod.Event {
-            return Event.at(self.slot.*.?).ptr;
-        }
-    };
+    pub const Completion = EventCompletion;
 
     pub const Api = struct {
         pub const Destroy = EventCallback(c.PJRT_Event_Destroy_Args, .destroy).call;
@@ -69,7 +71,7 @@ pub const Event = struct {
     }
 
     fn create(source: runtime_mod.Event) ?*c.PJRT_Event {
-        const event = plugin.allocator().create(runtime_mod.Event) catch return null;
+        const event = plugin_process.allocator().create(runtime_mod.Event) catch return null;
         event.* = source;
         return handles.Event.handle(event);
     }
@@ -94,7 +96,7 @@ pub const Event = struct {
         const event = raw orelse return;
         const event_ref = Event.at(event);
         event_ref.ptr.deinit();
-        plugin.allocator().destroy(event_ref.ptr);
+        plugin_process.allocator().destroy(event_ref.ptr);
     }
 
     fn isReady(self: Event) bool {
@@ -131,7 +133,7 @@ const OnReadyBridge = struct {
     user_arg: ?*anyopaque,
 
     fn create(callback_fn: c.PJRT_Event_OnReadyCallback, user_arg: ?*anyopaque) ?*OnReadyBridge {
-        const bridge = plugin.allocator().create(OnReadyBridge) catch return null;
+        const bridge = plugin_process.allocator().create(OnReadyBridge) catch return null;
         bridge.* = .{ .callback_fn = callback_fn, .user_arg = user_arg };
         return bridge;
     }
@@ -141,7 +143,7 @@ const OnReadyBridge = struct {
     }
 
     fn destroy(bridge: *OnReadyBridge) void {
-        plugin.allocator().destroy(bridge);
+        plugin_process.allocator().destroy(bridge);
     }
 
     fn complete(self: *OnReadyBridge, message: ?[]const u8) void {

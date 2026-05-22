@@ -1,9 +1,13 @@
 const std = @import("std");
 
-const program_mod = @import("program.zig");
+/// Errors reported while computing backend-program liveness observations.
+pub const Error = error{
+    InvalidProgram,
+    OutOfMemory,
+};
 
 /// Computes backend-program release and peak-memory observations from schedule metadata.
-pub fn compute(program: *const program_mod.Program) program_mod.Error!program_mod.LivenessStats {
+pub fn compute(comptime Stats: type, program: anytype) Error!Stats {
     const live_values = program.allocator.alloc(bool, program.values.len) catch return error.OutOfMemory;
     defer program.allocator.free(live_values);
     @memset(live_values, false);
@@ -18,7 +22,7 @@ pub fn compute(program: *const program_mod.Program) program_mod.Error!program_mo
         live_bytes += value.byte_size;
     }
 
-    var result = program_mod.LivenessStats{
+    var result = Stats{
         .peak_live_value_count = live_count,
         .peak_live_bytes = live_bytes,
     };
@@ -51,13 +55,13 @@ pub fn compute(program: *const program_mod.Program) program_mod.Error!program_mo
 }
 
 fn markNodeOutputsLive(
-    program: *const program_mod.Program,
-    node: program_mod.Node,
+    program: anytype,
+    node: anytype,
     live_values: []bool,
     live_count: *usize,
     live_bytes: *usize,
-    stats: *program_mod.LivenessStats,
-) program_mod.Error!void {
+    stats: anytype,
+) Error!void {
     for (node.outputs) |output| {
         if (output.index >= live_values.len or output.index >= program.values.len) return error.InvalidProgram;
         if (live_values[output.index]) continue;
@@ -70,14 +74,14 @@ fn markNodeOutputsLive(
 }
 
 fn releaseDeadNodeInputs(
-    program: *const program_mod.Program,
-    node: program_mod.Node,
+    program: anytype,
+    node: anytype,
     node_index: usize,
     live_values: []bool,
     live_count: *usize,
     live_bytes: *usize,
-    stats: *program_mod.LivenessStats,
-) program_mod.Error!void {
+    stats: anytype,
+) Error!void {
     for (node.inputs) |input| {
         if (input.index >= program.values.len or input.index >= live_values.len) return error.InvalidProgram;
         const value = program.values[input.index];
@@ -87,14 +91,14 @@ fn releaseDeadNodeInputs(
 }
 
 fn releaseDeadFusionNodeInputs(
-    program: *const program_mod.Program,
-    node: program_mod.Node,
+    program: anytype,
+    node: anytype,
     group_last_node: usize,
     live_values: []bool,
     live_count: *usize,
     live_bytes: *usize,
-    stats: *program_mod.LivenessStats,
-) program_mod.Error!void {
+    stats: anytype,
+) Error!void {
     for (node.inputs) |input| {
         if (input.index >= program.values.len or input.index >= live_values.len) return error.InvalidProgram;
         const value = program.values[input.index];
@@ -105,13 +109,13 @@ fn releaseDeadFusionNodeInputs(
 }
 
 fn releasePlannedValue(
-    program: *const program_mod.Program,
+    program: anytype,
     value_index: usize,
     live_values: []bool,
     live_count: *usize,
     live_bytes: *usize,
-    stats: *program_mod.LivenessStats,
-) program_mod.Error!void {
+    stats: anytype,
+) Error!void {
     const value = program.values[value_index];
     if (value.is_output) return;
     const producer_node = value.producer_node orelse return;

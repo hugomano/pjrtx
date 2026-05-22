@@ -229,7 +229,6 @@ fn cloneRegionInstructionList(allocator: std.mem.Allocator, source: []const ir.R
 }
 
 test "mlx metal backend program owns while cond body subprogram descriptors" {
-    const program_build_mod = @import("program_build.zig");
     const allocator = std.testing.allocator;
     const assignment = [_]i32{0};
 
@@ -359,25 +358,52 @@ test "mlx metal backend program owns while cond body subprogram descriptors" {
     };
     defer plan.deinit();
 
-    var program = try program_build_mod.build(allocator, &plan, null);
-    defer program.deinit();
+    try std.testing.expectEqual(@as(usize, 2), try countSubprograms(&plan));
+    try std.testing.expectEqual(@as(usize, 1), try countControlFlows(&plan));
 
-    try std.testing.expectEqual(@as(usize, 1), program.nodes.len);
-    try std.testing.expectEqual(program_mod.NodeKind.control_flow, program.nodes[0].kind);
-    try std.testing.expectEqual(@as(usize, 2), program.nodes[0].subprograms.len);
-    try std.testing.expectEqual(@as(usize, 2), program.subprograms.len);
-    try std.testing.expectEqual(@as(usize, 1), program.control_flows.len);
-    try std.testing.expectEqual(@as(?usize, 0), program.nodes[0].control_flow);
-    const control_flow = program.control_flows[0];
+    const subprograms = try allocator.alloc(program_mod.Subprogram, 2);
+    var initialized_subprograms: usize = 0;
+    defer deinitSubprograms(allocator, subprograms[0..initialized_subprograms]);
+
+    const instruction = plan.instructions[0];
+    const node_subprograms = try buildNodeSubprograms(
+        allocator,
+        &plan,
+        instruction,
+        0,
+        subprograms,
+        &initialized_subprograms,
+    );
+    defer allocator.free(node_subprograms);
+
+    const control_flows = try allocator.alloc(program_mod.ControlFlow, 1);
+    var initialized_control_flows: usize = 0;
+    defer deinitControlFlows(allocator, control_flows[0..initialized_control_flows]);
+
+    const node_control_flow = try buildNodeControlFlow(
+        allocator,
+        instruction,
+        0,
+        node_subprograms,
+        subprograms,
+        control_flows,
+        &initialized_control_flows,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), node_subprograms.len);
+    try std.testing.expectEqual(@as(usize, 2), initialized_subprograms);
+    try std.testing.expectEqual(@as(usize, 1), initialized_control_flows);
+    try std.testing.expectEqual(@as(?usize, 0), node_control_flow);
+    const control_flow = control_flows[0];
     try std.testing.expectEqual(program_mod.ControlFlowKind.while_loop, control_flow.kind);
     try std.testing.expectEqual(@as(usize, 0), control_flow.parent_node);
-    try std.testing.expectEqual(program.nodes[0].subprograms[0], control_flow.condition_subprogram);
-    try std.testing.expectEqual(program.nodes[0].subprograms[1], control_flow.body_subprogram);
+    try std.testing.expectEqual(node_subprograms[0], control_flow.condition_subprogram);
+    try std.testing.expectEqual(node_subprograms[1], control_flow.body_subprogram);
     try std.testing.expectEqual(@as(usize, 1), control_flow.state_inputs.len);
     try std.testing.expectEqual(@as(usize, 1), control_flow.state_outputs.len);
     try std.testing.expectEqual(@as(u32, 1), control_flow.predicate_output.index);
-    const cond = program.subprograms[program.nodes[0].subprograms[0]];
-    const body = program.subprograms[program.nodes[0].subprograms[1]];
+    const cond = subprograms[node_subprograms[0]];
+    const body = subprograms[node_subprograms[1]];
     try std.testing.expectEqual(ir.RegionKind.while_cond, cond.kind);
     try std.testing.expectEqual(ir.RegionKind.while_body, body.kind);
     try std.testing.expectEqual(@as(usize, 2), cond.values.len);

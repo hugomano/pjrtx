@@ -8,7 +8,7 @@ const errors = @import("errors.zig");
 const events_mod = @import("events.zig");
 const executable_mod = @import("executable.zig");
 const handles = @import("pjrt_handles.zig");
-const plugin = @import("plugin.zig");
+const plugin_process = @import("plugin_process.zig");
 
 const Executable = executable_mod.Executable;
 const LoadedExecutableHandle = handles.LoadedExecutable(Executable);
@@ -107,75 +107,57 @@ const ExecuteCall = struct {
     }
 
     fn clearResults(self: ExecuteCall, output_count: usize) void {
-        for (0..self.numDevices()) |device_index| {
-            if (self.raw.output_lists != null) {
-                const outputs = self.raw.output_lists[device_index];
-                if (outputs != null) {
-                    for (0..output_count) |output_index| outputs[output_index] = null;
-                }
-            }
-            if (self.raw.device_complete_events) |events| events[device_index] = null;
-        }
+        ExecuteResults.init(self).clear(output_count);
     }
 
     fn cleanupResults(self: ExecuteCall, output_count: usize) void {
-        for (0..self.numDevices()) |device_index| {
-            if (self.raw.output_lists != null) {
-                const outputs = self.raw.output_lists[device_index];
-                if (outputs != null) {
-                    for (0..output_count) |output_index| {
-                        if (outputs[output_index]) |output| {
-                            handles.Buffer.ref(output).deinit();
-                            outputs[output_index] = null;
-                        }
-                    }
-                }
-            }
-            if (self.raw.device_complete_events) |events| {
-                if (events[device_index]) |event| {
-                    PjrtEvent.destroy(event);
-                    events[device_index] = null;
-                }
-            }
-        }
+        ExecuteResults.init(self).cleanup(output_count);
     }
 
     fn completionEventSlot(self: ExecuteCall, device_index: usize, source: runtime.Event) ?*runtime.Event {
-        if (self.raw.device_complete_events) |events| {
-            const completion = PjrtEvent.Completion.fromRuntime(&events[device_index], source) orelse return null;
-            return completion.runtime();
-        }
-        return null;
+        return ExecuteResults.init(self).completionEventSlot(device_index, source);
     }
 
     fn assignOutput(self: ExecuteCall, device_index: usize, output_index: usize, output: *runtime.Buffer) void {
-        self.raw.output_lists[device_index][output_index] = handles.Buffer.handle(output);
+        ExecuteResults.init(self).assignOutput(device_index, output_index, output);
     }
 
     fn validate(self: ExecuteCall) ?*c.PJRT_Error {
-        if (self.executable.isDeleted()) return PjrtError.failedPrecondition("loaded executable has been deleted");
-        if (self.validateLists()) |err| return err;
-        if (self.options.validate(self.raw.options, self.numArgs())) |err| return err;
-        return self.validateDonationAliasHazards();
+        return ExecuteValidation.init(self).validate();
+    }
+};
+
+const ExecuteValidation = struct {
+    request: ExecuteCall,
+
+    fn init(request: ExecuteCall) ExecuteValidation {
+        return .{ .request = request };
     }
 
-    fn validateLists(self: ExecuteCall) ?*c.PJRT_Error {
-        const expected_args = self.expectedArgs();
-        const expected_outputs = self.expectedOutputs();
-        if (self.numDevices() == 0) return PjrtError.invalidArgument("PjRTx execute requires at least one device");
-        if (self.numDevices() > self.executable.deviceCount()) return PjrtError.invalidArgument("PjRTx execute requested more devices than the executable contains");
-        if (self.numArgs() != expected_args) return PjrtError.invalidArgument("PjRTx execute argument count does not match executable parameters");
-        if (expected_args != 0 and self.raw.argument_lists == null) return PjrtError.invalidArgument("PjRTx execute requires non-null argument_lists for executable parameters");
-        if (expected_outputs != 0 and self.raw.output_lists == null) return PjrtError.invalidArgument("PjRTx execute requires non-null output_lists for executable outputs");
-        for (0..self.numDevices()) |device_index| {
-            if (expected_args != 0 and self.raw.argument_lists[device_index] == null) {
+    fn validate(self: ExecuteValidation) ?*c.PJRT_Error {
+        if (self.request.executable.isDeleted()) return PjrtError.failedPrecondition("loaded executable has been deleted");
+        if (self.lists()) |err| return err;
+        if (self.request.options.validate(self.request.raw.options, self.request.numArgs())) |err| return err;
+        return self.donationAliases();
+    }
+
+    fn lists(self: ExecuteValidation) ?*c.PJRT_Error {
+        const expected_args = self.request.expectedArgs();
+        const expected_outputs = self.request.expectedOutputs();
+        if (self.request.numDevices() == 0) return PjrtError.invalidArgument("PjRTx execute requires at least one device");
+        if (self.request.numDevices() > self.request.executable.deviceCount()) return PjrtError.invalidArgument("PjRTx execute requested more devices than the executable contains");
+        if (self.request.numArgs() != expected_args) return PjrtError.invalidArgument("PjRTx execute argument count does not match executable parameters");
+        if (expected_args != 0 and self.request.raw.argument_lists == null) return PjrtError.invalidArgument("PjRTx execute requires non-null argument_lists for executable parameters");
+        if (expected_outputs != 0 and self.request.raw.output_lists == null) return PjrtError.invalidArgument("PjRTx execute requires non-null output_lists for executable outputs");
+        for (0..self.request.numDevices()) |device_index| {
+            if (expected_args != 0 and self.request.raw.argument_lists[device_index] == null) {
                 return PjrtError.invalidArgument("PjRTx execute requires a non-null argument list for every device");
             }
-            if (expected_outputs != 0 and self.raw.output_lists[device_index] == null) {
+            if (expected_outputs != 0 and self.request.raw.output_lists[device_index] == null) {
                 return PjrtError.invalidArgument("PjRTx execute requires a non-null output list for every device");
             }
             for (0..expected_args) |argument_index| {
-                if (self.raw.argument_lists[device_index][argument_index] == null) {
+                if (self.request.raw.argument_lists[device_index][argument_index] == null) {
                     return PjrtError.invalidArgument("PjRTx execute argument list contains a null buffer");
                 }
             }
@@ -183,16 +165,16 @@ const ExecuteCall = struct {
         return null;
     }
 
-    fn validateDonationAliasHazards(self: ExecuteCall) ?*c.PJRT_Error {
-        for (0..self.numDevices()) |donor_device_index| {
-            for (0..self.numArgs()) |donor_argument_index| {
-                if (!self.executable.donatesParameter(donor_argument_index)) continue;
-                if (self.options.keepsParameter(donor_argument_index)) continue;
-                const donor_buffer = self.rawArgument(donor_device_index, donor_argument_index).?;
-                for (0..self.numDevices()) |other_device_index| {
-                    for (0..self.numArgs()) |other_argument_index| {
+    fn donationAliases(self: ExecuteValidation) ?*c.PJRT_Error {
+        for (0..self.request.numDevices()) |donor_device_index| {
+            for (0..self.request.numArgs()) |donor_argument_index| {
+                if (!self.request.executable.donatesParameter(donor_argument_index)) continue;
+                if (self.request.options.keepsParameter(donor_argument_index)) continue;
+                const donor_buffer = self.request.rawArgument(donor_device_index, donor_argument_index).?;
+                for (0..self.request.numDevices()) |other_device_index| {
+                    for (0..self.request.numArgs()) |other_argument_index| {
                         if (donor_device_index == other_device_index and donor_argument_index == other_argument_index) continue;
-                        if (self.rawArgument(other_device_index, other_argument_index) == donor_buffer) {
+                        if (self.request.rawArgument(other_device_index, other_argument_index) == donor_buffer) {
                             return PjrtError.invalidArgument("donated execute argument aliases another argument");
                         }
                     }
@@ -203,18 +185,77 @@ const ExecuteCall = struct {
     }
 };
 
+const ExecuteResults = struct {
+    request: ExecuteCall,
+
+    fn init(request: ExecuteCall) ExecuteResults {
+        return .{ .request = request };
+    }
+
+    fn clear(self: ExecuteResults, output_count: usize) void {
+        for (0..self.request.numDevices()) |device_index| {
+            if (self.request.raw.output_lists != null) {
+                const outputs = self.request.raw.output_lists[device_index];
+                if (outputs != null) {
+                    for (0..output_count) |output_index| outputs[output_index] = null;
+                }
+            }
+            if (self.request.raw.device_complete_events) |events| events[device_index] = null;
+        }
+    }
+
+    fn cleanup(self: ExecuteResults, output_count: usize) void {
+        for (0..self.request.numDevices()) |device_index| {
+            self.cleanupDeviceOutputs(device_index, output_count);
+            self.cleanupDeviceEvent(device_index);
+        }
+    }
+
+    fn completionEventSlot(self: ExecuteResults, device_index: usize, source: runtime.Event) ?*runtime.Event {
+        if (self.request.raw.device_complete_events) |events| {
+            const completion = PjrtEvent.Completion.fromRuntime(&events[device_index], source) orelse return null;
+            return completion.runtime();
+        }
+        return null;
+    }
+
+    fn assignOutput(self: ExecuteResults, device_index: usize, output_index: usize, output: *runtime.Buffer) void {
+        self.request.raw.output_lists[device_index][output_index] = handles.Buffer.handle(output);
+    }
+
+    fn cleanupDeviceOutputs(self: ExecuteResults, device_index: usize, output_count: usize) void {
+        if (self.request.raw.output_lists == null) return;
+        const outputs = self.request.raw.output_lists[device_index] orelse return;
+        for (0..output_count) |output_index| {
+            if (outputs[output_index]) |output| {
+                handles.Buffer.ref(output).deinit();
+                outputs[output_index] = null;
+            }
+        }
+    }
+
+    fn cleanupDeviceEvent(self: ExecuteResults, device_index: usize) void {
+        if (self.request.raw.device_complete_events) |events| {
+            if (events[device_index]) |event| {
+                PjrtEvent.destroy(event);
+                events[device_index] = null;
+            }
+        }
+    }
+};
+
 const DonationSet = struct {
     list: std.ArrayList(*runtime.Buffer) = .empty,
 
     fn deinit(self: *DonationSet) void {
-        self.list.deinit(plugin.allocator());
+        self.list.deinit(plugin_process.allocator());
     }
 
     fn record(self: *DonationSet, buffer: *runtime.Buffer) !void {
         for (self.list.items) |existing| {
             if (existing == buffer) return;
         }
-        try self.list.append(plugin.allocator(), buffer);
+        try self.list.append(plugin_process.allocator(), buffer);
     }
 
     fn commit(self: DonationSet) void {
@@ -248,11 +289,11 @@ const ExecuteApiCallback = struct {
     }
 
     fn runDevice(request: ExecuteCall, executable: *Executable, donated_arguments: *DonationSet, device_index: usize, output_count: usize) ?*c.PJRT_Error {
-        const arguments = plugin.allocator().alloc(*runtime.Buffer, request.numArgs()) catch {
+        const arguments = plugin_process.allocator().alloc(*runtime.Buffer, request.numArgs()) catch {
             request.cleanupResults(output_count);
             return PjrtError.internal("failed to allocate executable argument list");
         };
-        defer plugin.allocator().free(arguments);
+        defer plugin_process.allocator().free(arguments);
         for (arguments, 0..) |*argument, argument_index| {
             argument.* = request.argument(device_index, argument_index);
             if (executable.donatesParameter(argument_index) and !request.options.keepsParameter(argument_index)) {
@@ -272,7 +313,7 @@ const ExecuteApiCallback = struct {
 
     fn assignDeviceOutputs(request: ExecuteCall, device_index: usize, output_count: usize, execute_result: runtime.ExecutionResult) ?*c.PJRT_Error {
         const outputs = execute_result.outputs;
-        defer plugin.allocator().free(outputs);
+        defer plugin_process.allocator().free(outputs);
         var assigned_outputs: usize = 0;
         var outputs_transferred = false;
         defer if (!outputs_transferred) cleanupUnassignedExecuteOutputs(outputs, assigned_outputs);

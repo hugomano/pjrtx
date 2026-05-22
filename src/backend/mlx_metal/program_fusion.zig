@@ -2,6 +2,7 @@ const std = @import("std");
 const ir = @import("src/compiler/ir");
 
 const program_mod = @import("program.zig");
+const program_schedule_build = @import("program_schedule_build.zig");
 
 /// Builds owned fusion-group metadata from provisional contiguous fusible ranges.
 pub fn build(
@@ -110,4 +111,171 @@ fn markedValueIds(allocator: std.mem.Allocator, values: []const program_mod.Valu
         index += 1;
     }
     return ids;
+}
+
+test "mlx metal backend program fuses nonmaterializing tuple structural nodes with elementwise chain" {
+    const allocator = std.testing.allocator;
+
+    const values = [_]program_mod.Value{
+        parameterValue(0),
+        parameterValue(1),
+        producedValue(2, 0),
+        producedValue(3, 1),
+        producedValue(4, 2),
+        materializedOutputValue(5, 3),
+    };
+    const nodes = [_]program_mod.Node{
+        fusionNode(0, .elementwise, &.{ id(0), id(1) }, &.{id(2)}),
+        fusionNode(1, .structural, &.{id(2)}, &.{id(3)}),
+        fusionNode(2, .structural, &.{ id(3), id(2) }, &.{id(4)}),
+        fusionNode(3, .elementwise, &.{ id(4), id(1) }, &.{id(5)}),
+    };
+    const edges = [_]program_mod.Edge{
+        valueEdge(2, 0, 1),
+        valueEdge(3, 1, 2),
+        valueEdge(2, 0, 2),
+        valueEdge(4, 2, 3),
+    };
+    const provisional_groups = [_]program_mod.FusionGroup{provisionalGroup(0, 3, 4)};
+
+    const fusion_groups = try build(allocator, &provisional_groups, &nodes, &values, &edges);
+    defer deinit(allocator, fusion_groups);
+
+    const boundaries = [_]program_mod.MaterializationBoundary{.{ .value_id = id(5), .reason = .pjrt_output }};
+    const schedule = try program_schedule_build.build(allocator, &nodes, fusion_groups, &boundaries);
+    defer allocator.free(schedule);
+
+    try std.testing.expectEqual(@as(usize, 1), fusion_groups.len);
+    try std.testing.expectEqual(@as(usize, 2), schedule.len);
+    try std.testing.expectEqual(program_mod.ScheduleKind.fusion_group, schedule[0].kind);
+    try std.testing.expectEqual(@as(usize, 4), schedule[0].count);
+    try std.testing.expectEqual(program_mod.ScheduleKind.materialization_boundary, schedule[1].kind);
+
+    const group = fusion_groups[0];
+    try std.testing.expectEqual(@as(usize, 0), group.first_node);
+    try std.testing.expectEqual(@as(usize, 3), group.last_node);
+    try std.testing.expectEqual(@as(usize, 4), group.node_count);
+    try std.testing.expectEqual(@as(usize, 4), group.node_indices.len);
+    try std.testing.expectEqual(program_mod.NodeKind.elementwise, nodes[0].kind);
+    try std.testing.expectEqual(program_mod.NodeKind.structural, nodes[1].kind);
+    try std.testing.expectEqual(program_mod.NodeKind.structural, nodes[2].kind);
+    try std.testing.expectEqual(program_mod.NodeKind.elementwise, nodes[3].kind);
+    for (nodes) |node| {
+        try std.testing.expectEqual(@as(?usize, 0), node.fusion_group);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), group.input_values.len);
+    try std.testing.expectEqual(@as(usize, 0), group.input_values[0].index);
+    try std.testing.expectEqual(@as(usize, 1), group.input_values[1].index);
+    try std.testing.expectEqual(@as(usize, 1), group.output_values.len);
+    try std.testing.expectEqual(@as(usize, 5), group.output_values[0].index);
+}
+
+test "mlx metal backend program fuses dtype and precision passthroughs with elementwise chain" {
+    const allocator = std.testing.allocator;
+
+    const values = [_]program_mod.Value{
+        parameterValue(0),
+        producedValue(1, 0),
+        producedValue(2, 1),
+        parameterValue(3),
+        producedValue(4, 2),
+        producedValue(5, 3),
+        materializedOutputValue(6, 4),
+    };
+    const nodes = [_]program_mod.Node{
+        fusionNode(0, .materialize, &.{id(0)}, &.{id(1)}),
+        fusionNode(1, .materialize, &.{id(1)}, &.{id(2)}),
+        fusionNode(2, .elementwise, &.{ id(2), id(3) }, &.{id(4)}),
+        fusionNode(3, .materialize, &.{id(4)}, &.{id(5)}),
+        fusionNode(4, .elementwise, &.{ id(5), id(3) }, &.{id(6)}),
+    };
+    const edges = [_]program_mod.Edge{
+        valueEdge(1, 0, 1),
+        valueEdge(2, 1, 2),
+        valueEdge(4, 2, 3),
+        valueEdge(5, 3, 4),
+    };
+    const provisional_groups = [_]program_mod.FusionGroup{provisionalGroup(0, 4, 5)};
+
+    const fusion_groups = try build(allocator, &provisional_groups, &nodes, &values, &edges);
+    defer deinit(allocator, fusion_groups);
+
+    const boundaries = [_]program_mod.MaterializationBoundary{.{ .value_id = id(6), .reason = .pjrt_output }};
+    const schedule = try program_schedule_build.build(allocator, &nodes, fusion_groups, &boundaries);
+    defer allocator.free(schedule);
+
+    try std.testing.expectEqual(@as(usize, 1), fusion_groups.len);
+    try std.testing.expectEqual(@as(usize, 2), schedule.len);
+    try std.testing.expectEqual(program_mod.ScheduleKind.fusion_group, schedule[0].kind);
+    try std.testing.expectEqual(@as(usize, 5), schedule[0].count);
+    try std.testing.expectEqual(program_mod.ScheduleKind.materialization_boundary, schedule[1].kind);
+
+    const group = fusion_groups[0];
+    try std.testing.expectEqual(@as(usize, 0), group.first_node);
+    try std.testing.expectEqual(@as(usize, 4), group.last_node);
+    try std.testing.expectEqual(@as(usize, 5), group.node_count);
+    for (nodes) |node| {
+        try std.testing.expectEqual(@as(?usize, 0), node.fusion_group);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), group.input_values.len);
+    try std.testing.expectEqual(@as(usize, 0), group.input_values[0].index);
+    try std.testing.expectEqual(@as(usize, 3), group.input_values[1].index);
+    try std.testing.expectEqual(@as(usize, 1), group.output_values.len);
+    try std.testing.expectEqual(@as(usize, 6), group.output_values[0].index);
+}
+
+fn valueEdge(value_index: u32, from_node: usize, to_node: usize) program_mod.Edge {
+    return .{ .value_id = id(value_index), .from_node = from_node, .to_node = to_node };
+}
+
+fn fusionNode(
+    instruction_index: usize,
+    kind: program_mod.NodeKind,
+    inputs: []const ir.ValueId,
+    outputs: []const ir.ValueId,
+) program_mod.Node {
+    return .{
+        .instruction_index = instruction_index,
+        .kind = kind,
+        .inputs = inputs,
+        .outputs = outputs,
+        .fusion_group = 0,
+    };
+}
+
+fn id(index: u32) ir.ValueId {
+    return .{ .index = index };
+}
+
+fn materializedOutputValue(index: u32, producer_node: usize) program_mod.Value {
+    var value = producedValue(index, producer_node);
+    value.is_output = true;
+    value.materialization_boundary = 0;
+    return value;
+}
+
+fn parameterValue(index: u32) program_mod.Value {
+    return .{
+        .value_id = id(index),
+        .producer_node = null,
+    };
+}
+
+fn producedValue(index: u32, producer_node: usize) program_mod.Value {
+    return .{
+        .value_id = id(index),
+        .producer_node = producer_node,
+    };
+}
+
+fn provisionalGroup(first_node: usize, last_node: usize, node_count: usize) program_mod.FusionGroup {
+    return .{
+        .id = 0,
+        .kind = .view_elementwise,
+        .first_node = first_node,
+        .last_node = last_node,
+        .node_count = node_count,
+    };
 }

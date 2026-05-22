@@ -48,10 +48,7 @@ pub const Event = struct {
 
     /// Registers a callback or invokes it immediately when already complete.
     pub fn onReady(self: *Event, callback: EventCallback, user_arg: ?*anyopaque) !void {
-        if (self.state != .pending) {
-            callback(self.errorMessage(), user_arg);
-            return;
-        }
+        if (self.state != .pending) return callback(EventCallbacks.errorMessage(self.*), user_arg);
         if (self.callback_count >= MAX_EVENT_CALLBACKS) return error.TooManyEventCallbacks;
         self.callbacks[self.callback_count] = .{
             .callback = callback,
@@ -62,7 +59,7 @@ pub const Event = struct {
 
     /// Propagates this event's eventual completion into a dependent event.
     pub fn chainTo(self: *Event, dependent: *Event) !void {
-        try self.onReady(resolveChainedEvent, dependent);
+        try self.onReady(EventCallbacks.resolveChainedEvent, dependent);
     }
 
     /// Completes a pending event successfully and releases callbacks.
@@ -70,7 +67,7 @@ pub const Event = struct {
         if (self.state != .pending) return;
         self.state = .ready;
         self.message = "";
-        self.invokeCallbacks();
+        EventCallbacks.invoke(self);
     }
 
     /// Completes or overwrites an event as failed with a borrowed message.
@@ -82,7 +79,7 @@ pub const Event = struct {
         }
         self.state = .failed;
         self.message = message;
-        self.invokeCallbacks();
+        EventCallbacks.invoke(self);
     }
 
     /// Fails when the event has not completed successfully.
@@ -99,23 +96,25 @@ pub const Event = struct {
         if (self.state == .pending) {
             self.state = .failed;
             self.message = "event destroyed before completion";
-            self.invokeCallbacks();
+            EventCallbacks.invoke(self);
         }
         self.* = undefined;
     }
+};
 
-    fn errorMessage(self: Event) ?[]const u8 {
-        return switch (self.state) {
-            .failed => self.message,
+const EventCallbacks = struct {
+    fn errorMessage(event: Event) ?[]const u8 {
+        return switch (event.state) {
+            .failed => event.message,
             .pending, .ready => null,
         };
     }
 
-    fn invokeCallbacks(self: *Event) void {
-        const callback_count = self.callback_count;
-        self.callback_count = 0;
-        const message = self.errorMessage();
-        for (self.callbacks[0..callback_count]) |registration| {
+    fn invoke(event: *Event) void {
+        const callback_count = event.callback_count;
+        event.callback_count = 0;
+        const message = errorMessage(event.*);
+        for (event.callbacks[0..callback_count]) |registration| {
             registration.callback(message, registration.user_arg);
         }
     }

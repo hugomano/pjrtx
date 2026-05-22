@@ -2,13 +2,11 @@ const std = @import("std");
 const ir = @import("src/compiler/ir");
 
 const buffer_mod = @import("buffer.zig");
-const executable_mod = @import("executable.zig");
 const types = @import("execution_types.zig");
 
 const BufferHandle = types.BufferHandle;
 const Error = types.Error;
 const ExecutableOutput = types.ExecutableOutput;
-const CompiledExecutable = executable_mod.Executable;
 
 /// Owns the per-execute value table and destroys intermediate handles it owns.
 pub const ValueBindings = struct {
@@ -53,7 +51,7 @@ pub const ValueBindings = struct {
 /// Clones or transfers executable output handles from a completed value table.
 pub const OutputBindings = struct {
     allocator: std.mem.Allocator,
-    executable: *CompiledExecutable,
+    plan: *const ir.ExecutablePlan,
     values: *ValueBindings,
 
     /// Returns cloned outputs, or null when an output handle cannot be materialized.
@@ -72,7 +70,7 @@ pub const OutputBindings = struct {
     };
 
     fn clone(self: OutputBindings, missing_output: MissingOutput) Error!?[]ExecutableOutput {
-        const plan = self.executable.plan;
+        const plan = self.plan;
         const outputs = try self.allocator.alloc(ExecutableOutput, plan.output_ids.len);
         errdefer self.allocator.free(outputs);
         var initialized: usize = 0;

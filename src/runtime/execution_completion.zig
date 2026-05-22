@@ -1,5 +1,5 @@
 const std = @import("std");
-const backend_api = @import("src/backend/mlx_metal");
+const backend_api = @import("backend_selection.zig");
 
 const client_mod = @import("client.zig");
 const event_mod = @import("event.zig");

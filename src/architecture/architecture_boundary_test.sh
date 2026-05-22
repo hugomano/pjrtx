@@ -11,6 +11,91 @@ fail() {
   exit 1
 }
 
+python3 - <<'PY'
+from pathlib import Path
+import re
+import sys
+
+max_file_lines = 500
+max_struct_lines = 100
+line_violations = []
+struct_violations = []
+for path in Path("src").rglob("*.zig"):
+    lines = path.read_text(errors="ignore").splitlines()
+    line_count = len(lines)
+    if line_count > max_file_lines:
+        line_violations.append((line_count, path.as_posix()))
+    for index, line in enumerate(lines):
+        if not re.search(r'\b(?:extern\s+|packed\s+)?struct\s*\{', line):
+            continue
+        balance = line.count("{") - line.count("}")
+        end = index
+        while balance > 0 and end + 1 < len(lines):
+            end += 1
+            balance += lines[end].count("{") - lines[end].count("}")
+        struct_lines = end - index + 1
+        if struct_lines > max_struct_lines:
+            struct_violations.append((struct_lines, path.as_posix(), index + 1))
+if line_violations:
+    for line_count, name in sorted(line_violations):
+        print(f"architecture boundary violation: Zig file exceeds {max_file_lines} lines: {line_count} {name}", file=sys.stderr)
+    sys.exit(1)
+if struct_violations:
+    for line_count, name, line in sorted(struct_violations):
+        print(f"architecture boundary violation: Zig struct exceeds {max_struct_lines} lines: {line_count} {name}:{line}", file=sys.stderr)
+    sys.exit(1)
+
+roots = [Path("src")]
+files = {
+    path.as_posix(): path
+    for root in roots
+    for path in root.rglob("*.zig")
+}
+edges = {}
+for name, path in files.items():
+    imports = []
+    text = path.read_text(errors="ignore")
+    for match in re.finditer(r'@import\("([^"]+)"\)', text):
+        target = match.group(1)
+        resolved = None
+        if target.startswith("src/"):
+            resolved = target
+            if not resolved.endswith(".zig") and Path(f"{resolved}.zig").exists():
+                resolved = f"{resolved}.zig"
+        elif target.endswith(".zig"):
+            resolved = (path.parent / target).as_posix()
+        if resolved in files:
+            imports.append(resolved)
+    edges[name] = imports
+
+visited = set()
+stack = []
+in_stack = set()
+
+def dfs(node):
+    visited.add(node)
+    stack.append(node)
+    in_stack.add(node)
+    for target in edges.get(node, []):
+        if target not in visited:
+            cycle = dfs(target)
+            if cycle:
+                return cycle
+        elif target in in_stack:
+            return stack[stack.index(target):] + [target]
+    in_stack.remove(node)
+    stack.pop()
+    return None
+
+for node in files:
+    if node in visited:
+        continue
+    cycle = dfs(node)
+    if cycle:
+        print("architecture boundary violation: src Zig import graph must be acyclic: " + " -> ".join(cycle), file=sys.stderr)
+        sys.exit(1)
+PY
+
 if find src/compiler -name '*.zig' -print0 | xargs -0 grep -Eq 'src/runtime|src/backend'; then
   fail "compiler must not import runtime or backend"
 fi
@@ -219,6 +304,16 @@ if grep -Eq '@import\("src/compiler/ir"\)|@import\("(buffer|custom_call|device|p
   fail "MLX Metal execution.zig must not import backend internals only needed by colocated tests"
 fi
 
+execution_facade_backedges="$(
+  find src/backend/mlx_metal -name 'execution_*.zig' ! -name 'execution_integration.zig' -print0 \
+    | grep -zv 'execution_integration_.*_tests\.zig' \
+    | xargs -0 grep -En '@import\("execution\.zig"\)' || true
+)"
+if [[ -n "${execution_facade_backedges}" ]]; then
+  echo "${execution_facade_backedges}" >&2
+  fail "MLX Metal execution owner modules must not import the execution facade"
+fi
+
 if grep -Eq '^const (ExecuteCall|ValueBindings|ScheduleDispatch|OutputBindings|ProgramNodeDispatch|ControlFlowDispatch|LivenessRelease|MaterializationBoundaryEval|CustomCallDispatch)\b|^fn (executeExecutable|executeCompiledProgram|donatedProgramInputIndices|maybeCreateInitialArgumentCapturedProgram|executeArgumentCapturedProgram|updateArgumentCaptureState|traceScheduleFailure|writeExecuteProfile|writeScheduleProfile)\(' src/backend/mlx_metal/execution.zig; then
   fail "MLX Metal execution.zig must stay a facade; execution implementation belongs in execution_* owner modules"
 fi
@@ -229,6 +324,10 @@ fi
 
 if grep -Eq 'handles: \[\]\?BufferHandle|owned: \[\]bool|storeOwnedValueHandle|storeBorrowedValueHandle|destroyOwnedValueHandles' src/backend/mlx_metal/execution.zig; then
   fail "MLX Metal execution value binding ownership must stay in execution_values.zig"
+fi
+
+if grep -Eq '@import\("executable\.zig"\)' src/backend/mlx_metal/execution_values.zig; then
+  fail "MLX Metal execution value bindings must depend on executable plans, not resident executable ownership"
 fi
 
 if grep -Eq '^const (ProgramNodeDispatch|ControlFlowDispatch|LivenessRelease|MaterializationBoundaryEval|CustomCallDispatch)\b' src/backend/mlx_metal/execution.zig; then
@@ -263,7 +362,16 @@ if find src/runtime src/plugin src/compiler -name '*.zig' -print0 | xargs -0 gre
   fail "MLX Metal execution-node family modules are backend-internal and must not be imported by runtime, plugin, or compiler"
 fi
 
-if find src/runtime src/plugin src/compiler -name '*.zig' -print0 | xargs -0 grep -Eq 'buffer_(encoding|lifecycle|elementwise|indexing|linalg|reduction|generation|control_flow|custom_call)\.zig'; then
+buffer_facade_backedges="$(
+  find src/backend/mlx_metal -name 'buffer_*.zig' -print0 \
+    | xargs -0 grep -En '@import\("buffer\.zig"\)' || true
+)"
+if [[ -n "${buffer_facade_backedges}" ]]; then
+  echo "${buffer_facade_backedges}" >&2
+  fail "MLX Metal buffer owner modules must depend on buffer_handle.zig, not import the buffer facade"
+fi
+
+if find src/runtime src/plugin src/compiler -name '*.zig' -print0 | xargs -0 grep -Eq 'buffer_(encoding|handle|lifecycle|elementwise|indexing|linalg|reduction|generation|control_flow|custom_call)\.zig'; then
   fail "MLX Metal buffer owner modules are backend-internal and must not be imported by runtime, plugin, or compiler"
 fi
 
@@ -319,6 +427,10 @@ if grep -Eq '^fn (validateValues|validateNodes|validateControlFlows|validateSubp
   fail "MLX Metal backend program validation and liveness bodies must stay in program_validation/program_liveness owners"
 fi
 
+if grep -Eq '@import\("program\.zig"\)' src/backend/mlx_metal/program_validation.zig src/backend/mlx_metal/program_liveness.zig; then
+  fail "MLX Metal program validation/liveness owners must not import the program facade"
+fi
+
 if grep -Eq '^fn (countPlanSubprograms|countPlanControlFlows|buildNodeSubprograms|buildNodeControlFlow|cloneProgramSubprogram|cloneDescriptorList|cloneRegionValueList|cloneRegionInstructionList|deinitProgramSubprograms|deinitProgramControlFlows)\b' src/backend/mlx_metal/program_build.zig; then
   fail "MLX Metal backend region cloning and control-flow metadata must stay in program_region.zig"
 fi
@@ -335,8 +447,49 @@ if grep -Eq '^test "' src/backend/mlx_metal/program_build.zig; then
   fail "MLX Metal program_build.zig must stay a build router; tests belong with the owner module"
 fi
 
+if grep -Eq '@import\("program_build\.zig"\)' src/backend/mlx_metal/program_fusion.zig src/backend/mlx_metal/program_region.zig src/backend/mlx_metal/program_schedule_build.zig; then
+  fail "MLX Metal program build owners must not import the program_build facade back upward"
+fi
+
+if grep -Eq '^fn (record|record[A-Za-z0-9_]*|outputCompatible|inputCompatible|predicateOutputCompatible|expression|storeExpression|storeSource|storeComputedSource|inputHandles|writeMsl)\b' src/backend/mlx_metal/executable_metal_graph_graph_request.zig src/backend/mlx_metal/executable_metal_graph_fusion_request.zig; then
+  fail "Metal graph request facades must keep request logic in graph/fusion request owner modules"
+fi
+
+if grep -Eq '\banytype\b' src/backend/mlx_metal/executable_metal_graph_graph_request*.zig src/backend/mlx_metal/executable_metal_graph_fusion_request*.zig src/backend/mlx_metal/executable_metal_graph_program_request.zig; then
+  fail "Metal graph request code must use explicit request/input-source contracts instead of broad anytype plumbing"
+fi
+
+if grep -Eq '\.add, \.subtract|\.negate, \.exp' src/backend/mlx_metal/executable_metal_graph_step.zig src/backend/mlx_metal/executable_metal_graph_lowering_fusion.zig src/backend/mlx_metal/executable_metal_graph_map.zig src/backend/mlx_metal/executable_metal_graph_graph_request_record.zig src/backend/mlx_metal/executable_metal_graph_fusion_request_record.zig src/backend/mlx_metal/metalcpp_fusion_runner.zig; then
+  fail "Metal graph map-op legality must stay in executable_metal_graph_map_rules.zig instead of duplicated switches"
+fi
+
+if find src/runtime src/plugin src/compiler -name '*.zig' -print0 | xargs -0 grep -Eq 'executable_metal_graph_(graph_request|fusion_request)_(build|record|inputs|storage|writer)\.zig|executable_metal_graph_(map_rules|resident_inputs)\.zig'; then
+  fail "Metal graph request owner modules are backend-internal and must not be imported by runtime, plugin, or compiler"
+fi
+
 if find src/runtime src/plugin src/compiler -name '*.zig' -print0 | xargs -0 grep -Eq '@import\("src/backend/mlx_metal/|@import\("[^"]*backend/mlx_metal/'; then
   fail "runtime, plugin, and compiler must import the MLX Metal backend package facade, not backend internals"
+fi
+
+runtime_backend_imports="$(
+  find src/runtime -name '*.zig' ! -name 'backend_selection.zig' -print0 \
+    | xargs -0 grep -En '@import\("src/backend/(mlx_metal|metalcpp)"\)' || true
+)"
+if [[ -n "${runtime_backend_imports}" ]]; then
+  echo "${runtime_backend_imports}" >&2
+  fail "runtime concrete backend selection must stay centralized in backend_selection.zig"
+fi
+
+if find src/plugin src/compiler -name '*.zig' -print0 | xargs -0 grep -Eq '@import\("src/backend/(mlx_metal|metalcpp)"\)'; then
+  fail "plugin and compiler must not import concrete backend packages"
+fi
+
+if find src/backend/metalcpp -name '*.zig' -print0 | xargs -0 grep -Eq '@import\("src/backend/mlx_metal/|@import\("[^"]*backend/mlx_metal/'; then
+  fail "MetalCpp backend code may depend on the MLX Metal package facade during the transition, not MLX backend internals"
+fi
+
+if find src/backend/metalcpp -name '*.zig' -print0 | xargs -0 grep -Eq '@import\("c"\)|pjrtx_mlx_metal_'; then
+  fail "MetalCpp backend package must not call raw MLX/Metal shims directly"
 fi
 
 if grep -Eq 'fn (mlxMetalBackendForTest|initMlxMetalClientForTest|testShardingPlan|addU8ExecutablePlanForTest|constantU8ExecutablePlanForTest)\(' src/runtime/execution.zig; then
@@ -464,12 +617,12 @@ if [[ -e src/backend/synthetic ]]; then
 fi
 
 mlx_c_violations="$(
-  find src/backend/mlx_metal -name '*.zig' ! -name 'mlx_call.zig' -print0 \
-    | xargs -0 grep -En '@import\("c"\)|extern "c"|pjrtx_mlx_metal_' || true
+  find src/backend/mlx_metal -name '*.zig' ! -name 'mlx_call*.zig' ! -name 'metalcpp_call.zig' -print0 \
+    | xargs -0 grep -En '@import\("c"\)|extern "c"|pjrtx_mlx_metal_|pjrtx_metalcpp_buffer_' || true
 )"
 if [[ -n "${mlx_c_violations}" ]]; then
   echo "${mlx_c_violations}" >&2
-  fail "only src/backend/mlx_metal/mlx_call.zig may import translated C or call MLX/Metal C shims"
+  fail "only the src/backend/mlx_metal/mlx_call raw-boundary family and metalcpp_call.zig may import translated C or call backend C shims"
 fi
 
 if find src/backend/mlx_metal -name '*.zig' -print0 | xargs -0 grep -Eq 'fallbackDevice|synthetic backend'; then

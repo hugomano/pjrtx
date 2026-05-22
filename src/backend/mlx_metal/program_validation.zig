@@ -1,10 +1,14 @@
 const std = @import("std");
 const ir = @import("src/compiler/ir");
 
-const program_mod = @import("program.zig");
+const schedule = @import("program_validation_schedule.zig");
+const diagnostic = @import("program_validation_diagnostic.zig");
+
+pub const Error = diagnostic.Error;
+pub const invalidProgram = diagnostic.invalidProgram;
 
 /// Verifies backend-program structural invariants and writes diagnostics on failure.
-pub fn validate(program: *const program_mod.Program, writer: ?*std.Io.Writer) (program_mod.Error || std.Io.Writer.Error)!void {
+pub fn validate(program: anytype, writer: ?*std.Io.Writer) (Error || std.Io.Writer.Error)!void {
     if (program.fusion_group_count != program.fusion_groups.len) {
         return invalidProgram(writer, "fusion_group_count={} does not match fusion_groups.len={}", .{ program.fusion_group_count, program.fusion_groups.len });
     }
@@ -16,10 +20,10 @@ pub fn validate(program: *const program_mod.Program, writer: ?*std.Io.Writer) (p
     try validateEdges(program, writer);
     try validateFusionGroups(program, writer);
     try validateMaterializationBoundaries(program, writer);
-    try validateSchedule(program, writer);
+    try schedule.validate(program, writer);
 }
 
-fn validateValues(program: *const program_mod.Program, writer: ?*std.Io.Writer) (program_mod.Error || std.Io.Writer.Error)!void {
+fn validateValues(program: anytype, writer: ?*std.Io.Writer) (Error || std.Io.Writer.Error)!void {
     for (program.values, 0..) |value, value_index| {
         if (value.value_id.index != value_index) {
             return invalidProgram(writer, "value table slot {} contains value_id={}", .{ value_index, value.value_id.index });
@@ -42,7 +46,7 @@ fn validateValues(program: *const program_mod.Program, writer: ?*std.Io.Writer) 
     }
 }
 
-fn validateNodes(program: *const program_mod.Program, writer: ?*std.Io.Writer) (program_mod.Error || std.Io.Writer.Error)!void {
+fn validateNodes(program: anytype, writer: ?*std.Io.Writer) (Error || std.Io.Writer.Error)!void {
     for (program.nodes, 0..) |node, node_index| {
         for (node.inputs) |input| {
             if (input.index >= program.values.len) {
@@ -84,7 +88,7 @@ fn validateNodes(program: *const program_mod.Program, writer: ?*std.Io.Writer) (
     }
 }
 
-fn validateControlFlows(program: *const program_mod.Program, writer: ?*std.Io.Writer) (program_mod.Error || std.Io.Writer.Error)!void {
+fn validateControlFlows(program: anytype, writer: ?*std.Io.Writer) (Error || std.Io.Writer.Error)!void {
     for (program.control_flows, 0..) |control_flow, control_flow_index| {
         if (control_flow.id != control_flow_index) {
             return invalidProgram(writer, "control_flow slot {} contains id={}", .{ control_flow_index, control_flow.id });
@@ -139,7 +143,7 @@ fn validateControlFlows(program: *const program_mod.Program, writer: ?*std.Io.Wr
     }
 }
 
-fn validateSubprograms(program: *const program_mod.Program, writer: ?*std.Io.Writer) (program_mod.Error || std.Io.Writer.Error)!void {
+fn validateSubprograms(program: anytype, writer: ?*std.Io.Writer) (Error || std.Io.Writer.Error)!void {
     for (program.subprograms, 0..) |subprogram, subprogram_index| {
         if (subprogram.id != subprogram_index) {
             return invalidProgram(writer, "subprogram slot {} contains id={}", .{ subprogram_index, subprogram.id });
@@ -205,7 +209,7 @@ fn validateSubprograms(program: *const program_mod.Program, writer: ?*std.Io.Wri
     }
 }
 
-fn validateEdges(program: *const program_mod.Program, writer: ?*std.Io.Writer) (program_mod.Error || std.Io.Writer.Error)!void {
+fn validateEdges(program: anytype, writer: ?*std.Io.Writer) (Error || std.Io.Writer.Error)!void {
     const computed_producers = try program.allocator.alloc(?usize, program.values.len);
     defer program.allocator.free(computed_producers);
     @memset(computed_producers, null);
@@ -262,7 +266,7 @@ fn validateEdges(program: *const program_mod.Program, writer: ?*std.Io.Writer) (
     }
 }
 
-fn validateFusionGroups(program: *const program_mod.Program, writer: ?*std.Io.Writer) (program_mod.Error || std.Io.Writer.Error)!void {
+fn validateFusionGroups(program: anytype, writer: ?*std.Io.Writer) (Error || std.Io.Writer.Error)!void {
     for (program.fusion_groups, 0..) |group, group_index| {
         if (group.id != group_index) {
             return invalidProgram(writer, "fusion group slot {} contains id={}", .{ group_index, group.id });
@@ -358,7 +362,7 @@ fn validateFusionGroups(program: *const program_mod.Program, writer: ?*std.Io.Wr
     }
 }
 
-fn validateMaterializationBoundaries(program: *const program_mod.Program, writer: ?*std.Io.Writer) (program_mod.Error || std.Io.Writer.Error)!void {
+fn validateMaterializationBoundaries(program: anytype, writer: ?*std.Io.Writer) (Error || std.Io.Writer.Error)!void {
     for (program.materialization_boundaries, 0..) |boundary, boundary_index| {
         if (boundary.value_id.index >= program.values.len) {
             return invalidProgram(writer, "materialization boundary {} value_id={} is outside values.len={}", .{ boundary_index, boundary.value_id.index, program.values.len });
@@ -381,108 +385,7 @@ fn validateMaterializationBoundaries(program: *const program_mod.Program, writer
     }
 }
 
-fn validateSchedule(program: *const program_mod.Program, writer: ?*std.Io.Writer) (program_mod.Error || std.Io.Writer.Error)!void {
-    const scheduled_nodes = try program.allocator.alloc(bool, program.nodes.len);
-    defer program.allocator.free(scheduled_nodes);
-    @memset(scheduled_nodes, false);
-    const schedule_ranks = try program.allocator.alloc(usize, program.nodes.len);
-    defer program.allocator.free(schedule_ranks);
-    @memset(schedule_ranks, std.math.maxInt(usize));
-    const scheduled_boundaries = try program.allocator.alloc(bool, program.materialization_boundaries.len);
-    defer program.allocator.free(scheduled_boundaries);
-    @memset(scheduled_boundaries, false);
-    const boundary_schedule_ranks = try program.allocator.alloc(usize, program.materialization_boundaries.len);
-    defer program.allocator.free(boundary_schedule_ranks);
-    @memset(boundary_schedule_ranks, std.math.maxInt(usize));
-    var next_schedule_rank: usize = 0;
-
-    for (program.schedule, 0..) |item, schedule_index| {
-        if (item.count == 0) {
-            return invalidProgram(writer, "schedule item {} has count=0", .{schedule_index});
-        }
-        switch (item.kind) {
-            .node => {
-                if (item.index >= program.nodes.len or item.count != 1) {
-                    return invalidProgram(writer, "schedule item {} invalid node index={} count={} nodes.len={}", .{ schedule_index, item.index, item.count, program.nodes.len });
-                }
-                if (program.nodes[item.index].fusion_group != null) {
-                    return invalidProgram(writer, "schedule item {} directly schedules fused node {}", .{ schedule_index, item.index });
-                }
-                if (scheduled_nodes[item.index]) {
-                    return invalidProgram(writer, "schedule item {} schedules node {} more than once", .{ schedule_index, item.index });
-                }
-                scheduled_nodes[item.index] = true;
-                schedule_ranks[item.index] = next_schedule_rank;
-                next_schedule_rank += 1;
-            },
-            .fusion_group => {
-                if (item.index >= program.fusion_groups.len) {
-                    return invalidProgram(writer, "schedule item {} fusion_group={} is outside fusion_groups.len={}", .{ schedule_index, item.index, program.fusion_groups.len });
-                }
-                if (item.count != program.fusion_groups[item.index].node_indices.len) {
-                    return invalidProgram(writer, "schedule item {} fusion_group={} count={} does not match node_indices.len={}", .{ schedule_index, item.index, item.count, program.fusion_groups[item.index].node_indices.len });
-                }
-                for (program.fusion_groups[item.index].node_indices) |node_index| {
-                    if (scheduled_nodes[node_index]) {
-                        return invalidProgram(writer, "schedule item {} schedules fusion group {} node {} more than once", .{ schedule_index, item.index, node_index });
-                    }
-                    scheduled_nodes[node_index] = true;
-                    schedule_ranks[node_index] = next_schedule_rank;
-                    next_schedule_rank += 1;
-                }
-            },
-            .materialization_boundary => {
-                if (item.index > program.materialization_boundaries.len) {
-                    return invalidProgram(writer, "schedule item {} materialization index={} is outside materialization_boundaries.len={}", .{ schedule_index, item.index, program.materialization_boundaries.len });
-                }
-                if (item.count > program.materialization_boundaries.len - item.index) {
-                    return invalidProgram(writer, "schedule item {} materialization range index={} count={} exceeds materialization_boundaries.len={}", .{ schedule_index, item.index, item.count, program.materialization_boundaries.len });
-                }
-                for (item.index..item.index + item.count) |boundary_index| {
-                    if (scheduled_boundaries[boundary_index]) {
-                        return invalidProgram(writer, "schedule item {} schedules materialization boundary {} more than once", .{ schedule_index, boundary_index });
-                    }
-                    scheduled_boundaries[boundary_index] = true;
-                    boundary_schedule_ranks[boundary_index] = next_schedule_rank;
-                    next_schedule_rank += 1;
-                }
-            },
-        }
-    }
-
-    for (scheduled_nodes, 0..) |scheduled, node_index| {
-        if (!scheduled) {
-            return invalidProgram(writer, "node {} is not covered by schedule", .{node_index});
-        }
-    }
-
-    for (scheduled_boundaries, 0..) |scheduled, boundary_index| {
-        if (!scheduled) {
-            return invalidProgram(writer, "materialization boundary {} is not covered by schedule", .{boundary_index});
-        }
-        const value_id = program.materialization_boundaries[boundary_index].value_id;
-        if (program.values[value_id.index].producer_node) |producer_node| {
-            if (schedule_ranks[producer_node] >= boundary_schedule_ranks[boundary_index]) {
-                return invalidProgram(writer, "materialization boundary {} value_id={} is scheduled before producer node {}", .{ boundary_index, value_id.index, producer_node });
-            }
-        }
-    }
-
-    for (program.edges, 0..) |edge, edge_index| {
-        if (schedule_ranks[edge.from_node] >= schedule_ranks[edge.to_node]) {
-            return invalidProgram(writer, "edge {} value_id={} violates schedule order: producer node {} rank {} must run before consumer node {} rank {}", .{
-                edge_index,
-                edge.value_id.index,
-                edge.from_node,
-                schedule_ranks[edge.from_node],
-                edge.to_node,
-                schedule_ranks[edge.to_node],
-            });
-        }
-    }
-}
-
-fn hasEdge(program: *const program_mod.Program, value_id: ir.ValueId, from_node: usize, to_node: usize) bool {
+fn hasEdge(program: anytype, value_id: ir.ValueId, from_node: usize, to_node: usize) bool {
     for (program.edges) |edge| {
         if (edge.value_id.index == value_id.index and edge.from_node == from_node and edge.to_node == to_node) return true;
     }
@@ -512,9 +415,9 @@ fn validateMarkedValueSet(
     comptime label: []const u8,
     group_index: usize,
     declared: []const ir.ValueId,
-    values: []const program_mod.Value,
+    values: anytype,
     marks: []const bool,
-) (program_mod.Error || std.Io.Writer.Error)!void {
+) (Error || std.Io.Writer.Error)!void {
     var marked_count: usize = 0;
     for (marks) |mark| {
         if (mark) marked_count += 1;
@@ -533,13 +436,4 @@ fn validateMarkedValueSet(
             return invalidProgram(writer, "fusion group {} {s} is missing value_id={}", .{ group_index, label, value.value_id.index });
         }
     }
-}
-
-fn invalidProgram(writer: ?*std.Io.Writer, comptime detail_fmt: []const u8, args: anytype) (program_mod.Error || std.Io.Writer.Error)!void {
-    if (writer) |w| {
-        try w.writeAll("invalid backend program: pass=backend-program-verify feature=backend-program detail=\"");
-        try w.print(detail_fmt, args);
-        try w.writeAll("\"");
-    }
-    return error.InvalidProgram;
 }

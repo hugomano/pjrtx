@@ -77,7 +77,8 @@ pub fn build(allocator: std.mem.Allocator, plan: *const ir.ExecutablePlan, diagn
             if (output_id.index < value_producers.len) value_producers[output_id.index] = instruction_index;
         }
         const node_kind = programNodeKind(instruction.kind);
-        const fusion_group = if (programNodeFusible(node_kind)) group: {
+        const node_materializes = instructionMaterializes(instruction.kind);
+        const fusion_group = if (programNodeFusible(instruction.kind, node_kind, node_materializes)) group: {
             if (current_fusion_group == null) {
                 current_fusion_group = fusion_group_count;
                 max_fusion_groups[fusion_group_count] = .{
@@ -121,7 +122,7 @@ pub fn build(allocator: std.mem.Allocator, plan: *const ir.ExecutablePlan, diagn
             .outputs = node_outputs,
             .subprograms = node_subprograms,
             .control_flow = node_control_flow,
-            .materializes = instructionMaterializes(instruction.kind),
+            .materializes = node_materializes,
             .fusion_group = fusion_group,
         };
         node_inputs_owned = false;
@@ -242,9 +243,21 @@ fn instructionMaterializes(instruction_kind: ir.PlanInstructionKind) bool {
     };
 }
 
-fn programNodeFusible(node_kind: program_mod.NodeKind) bool {
+fn programNodeFusible(instruction_kind: ir.PlanInstructionKind, node_kind: program_mod.NodeKind, materializes: bool) bool {
     return switch (node_kind) {
         .view, .elementwise => true,
+        .structural => !materializes,
+        else => instructionFusesWithViewElementwiseChain(instruction_kind),
+    };
+}
+
+fn instructionFusesWithViewElementwiseChain(instruction_kind: ir.PlanInstructionKind) bool {
+    return switch (instruction_kind) {
+        .copy_arg0,
+        .convert,
+        .bitcast_convert,
+        .reduce_precision,
+        => true,
         else => false,
     };
 }

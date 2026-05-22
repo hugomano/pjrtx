@@ -255,7 +255,7 @@ pub const Program = struct {
 
     /// Computes planned release counts and peak live value/byte counts for the schedule.
     pub fn livenessStats(self: *const Program) Error!LivenessStats {
-        return program_liveness.compute(self);
+        return program_liveness.compute(LivenessStats, self);
     }
 
     /// Verifies structural invariants and writes a backend-program diagnostic on failure.

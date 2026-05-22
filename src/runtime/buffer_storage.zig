@@ -1,4 +1,4 @@
-const backend_api = @import("src/backend/mlx_metal");
+const backend_api = @import("backend_selection.zig");
 
 const device_memory = @import("device_memory.zig");
 

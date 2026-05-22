@@ -6,7 +6,7 @@ const runtime = @import("src/runtime");
 const abi = @import("pjrt_abi.zig");
 const errors = @import("errors.zig");
 const handles = @import("pjrt_handles.zig");
-const plugin = @import("plugin.zig");
+const plugin_process = @import("plugin_process.zig");
 
 const PjrtError = errors.Error;
 const DeviceAttributesHandle = handles.DeviceAttributes(DeviceAttributes);
@@ -40,7 +40,7 @@ pub const DeviceDescription = struct {
     }
 
     fn kind(_: DeviceDescription) []const u8 {
-        return plugin.Platform.device_kind;
+        return plugin_process.Platform.device_kind;
     }
 
     fn debugString(self: DeviceDescription) []const u8 {
@@ -100,7 +100,7 @@ pub const Device = struct {
     }
 
     fn writeAttributes(self: Device, args: anytype) ?*c.PJRT_Error {
-        const owned = plugin.allocator().create(DeviceAttributes) catch {
+        const owned = plugin_process.allocator().create(DeviceAttributes) catch {
             return PjrtError.internal("failed to allocate device attributes");
         };
         owned.* = DeviceAttributes.init(self.ptr);
@@ -178,30 +178,30 @@ const DeviceAttributes = struct {
     }
 
     fn delete(raw: ?*c.PJRT_Device_Attributes) callconv(.c) void {
-        if (raw) |opaque_attrs| plugin.allocator().destroy(DeviceAttributesHandle.ref(opaque_attrs));
+        if (raw) |opaque_attrs| plugin_process.allocator().destroy(DeviceAttributesHandle.ref(opaque_attrs));
     }
 };
 
 const DeviceAttributesCache = struct {
     fn get(device: *const runtime.Device) !*DeviceAttributes {
         const key = @intFromPtr(device);
-        description_attributes_mutex.lockUncancelable(plugin.io());
-        defer description_attributes_mutex.unlock(plugin.io());
+        description_attributes_mutex.lockUncancelable(plugin_process.io());
+        defer description_attributes_mutex.unlock(plugin_process.io());
 
         if (description_attributes.get(key)) |attrs| return attrs;
-        const attrs = try plugin.allocator().create(DeviceAttributes);
-        errdefer plugin.allocator().destroy(attrs);
+        const attrs = try plugin_process.allocator().create(DeviceAttributes);
+        errdefer plugin_process.allocator().destroy(attrs);
         attrs.* = DeviceAttributes.init(device);
-        try description_attributes.put(plugin.allocator(), key, attrs);
+        try description_attributes.put(plugin_process.allocator(), key, attrs);
         return attrs;
     }
 
     fn forget(device: *const runtime.Device) void {
         const key = @intFromPtr(device);
-        description_attributes_mutex.lockUncancelable(plugin.io());
-        defer description_attributes_mutex.unlock(plugin.io());
+        description_attributes_mutex.lockUncancelable(plugin_process.io());
+        defer description_attributes_mutex.unlock(plugin_process.io());
 
-        if (description_attributes.fetchRemove(key)) |entry| plugin.allocator().destroy(entry.value);
+        if (description_attributes.fetchRemove(key)) |entry| plugin_process.allocator().destroy(entry.value);
     }
 
     fn releaseClient(client: *const runtime.Client) void {

@@ -91,17 +91,12 @@ pub const ProgramNodeDispatch = struct {
 
     fn indexing(self: ProgramNodeDispatch) indexing_mod.Context {
         return .{
-            .allocator = self.allocator,
-            .plan = self.executable.plan,
-            .values = self.values,
+            .allocator = self.allocator, .plan = self.executable.plan, .values = self.values,
         };
     }
 
     fn reduction(self: ProgramNodeDispatch) reduction_mod.Context {
-        return .{
-            .plan = self.executable.plan,
-            .values = self.values,
-        };
+        return .{ .plan = self.executable.plan, .values = self.values };
     }
 
     fn generation(self: ProgramNodeDispatch) generation_mod.Context {

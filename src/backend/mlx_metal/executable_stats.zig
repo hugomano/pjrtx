@@ -24,6 +24,9 @@ pub const Stats = struct {
     execute_count: usize = 0,
     compiled_program_execute_count: usize = 0,
     compiled_program_output_count: usize = 0,
+    metal_graph_compile_count: usize = 0,
+    metal_graph_execute_count: usize = 0,
+    metal_graph_output_count: usize = 0,
     captured_program_execute_count: usize = 0,
     captured_program_dynamic_input_count: usize = 0,
     captured_program_captured_input_count: usize = 0,
@@ -48,6 +51,8 @@ pub const Stats = struct {
     output_clone_us_peak: u64 = 0,
     compiled_program_us_total: u64 = 0,
     compiled_program_us_peak: u64 = 0,
+    metal_graph_us_total: u64 = 0,
+    metal_graph_us_peak: u64 = 0,
 };
 
 /// Builds the initial stats snapshot for a newly resident executable.
@@ -100,6 +105,21 @@ pub fn recordCompiledProgramExecute(executable: anytype, output_count: usize) vo
     defer unlock(executable);
     executable.stats.compiled_program_execute_count += 1;
     executable.stats.compiled_program_output_count += output_count;
+}
+
+/// Records resident executable-level generated Metal graph compilation.
+pub fn recordMetalGraphCompile(executable: anytype, compiled_device_count: usize) void {
+    lock(executable);
+    defer unlock(executable);
+    executable.stats.metal_graph_compile_count += compiled_device_count;
+}
+
+/// Records one executable-level generated Metal graph execution and its output count.
+pub fn recordMetalGraphExecute(executable: anytype, output_count: usize) void {
+    lock(executable);
+    defer unlock(executable);
+    executable.stats.metal_graph_execute_count += 1;
+    executable.stats.metal_graph_output_count += output_count;
 }
 
 /// Records one argument-captured MLX program execution.

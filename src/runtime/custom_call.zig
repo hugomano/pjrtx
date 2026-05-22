@@ -1,4 +1,4 @@
-const backend_api = @import("src/backend/mlx_metal");
+const backend_api = @import("backend_selection.zig");
 
 /// Public custom-call registration kind accepted by the Metal/MLX runtime.
 pub const CustomCallKind = backend_api.CustomCallKind;

@@ -1,4 +1,4 @@
-const backend_api = @import("src/backend/mlx_metal");
+const backend_api = @import("backend_selection.zig");
 const ir = @import("src/compiler/ir");
 
 const buffer_mod = @import("buffer.zig");
@@ -9,6 +9,14 @@ const event_mod = @import("event.zig");
 const execution_mod = @import("execution.zig");
 const executable_mod = @import("executable.zig");
 const executable_cache = @import("executable_cache.zig");
+
+comptime {
+    if (@import("builtin").is_test) {
+        _ = @import("buffer_tests.zig");
+        _ = @import("client_residency_tests.zig");
+        _ = @import("executable_tests.zig");
+    }
+}
 
 /// Compiler-owned element type vocabulary exposed for PJRT buffer metadata.
 pub const BufferType = ir.BufferType;

@@ -1,4 +1,5 @@
 #include "src/backend/mlx_metal/api.h"
+#include "src/backend/mlx_metal/api_internal.h"
 
 #include <algorithm>
 #include <atomic>
@@ -33,61 +34,15 @@
 #include "mlx/transforms.h"
 #include "mlx/version.h"
 
-struct PjrtxMlxMetalBuffer {
-  std::unique_ptr<mlx::core::array> array;
-  uint64_t byte_size;
-  int dtype;
-  std::vector<int64_t> dims;
-  int device_ordinal;
-
-  PjrtxMlxMetalBuffer(std::unique_ptr<mlx::core::array> array_,
-                      uint64_t byte_size_, int dtype_,
-                      std::vector<int64_t> dims_, int device_ordinal_)
-      : array(std::move(array_)),
-        byte_size(byte_size_),
-        dtype(dtype_),
-        dims(std::move(dims_)),
-        device_ordinal(device_ordinal_) {}
-};
-
-struct PjrtxMlxMetalProgram {
-  void* user_data;
-  uint64_t input_count;
-  uint64_t full_input_count;
-  uint64_t output_count;
-  PjrtxMlxMetalProgramBuildFn build_fn;
-  std::vector<std::unique_ptr<PjrtxMlxMetalBuffer>> captured_inputs;
-  std::vector<uint64_t> dynamic_indices;
-  std::vector<int64_t> full_to_dynamic_input;
-  std::function<std::vector<mlx::core::array>(
-      const std::vector<mlx::core::array>&)>
-      compiled;
-  std::mutex mutex;
-  int active_device_ordinal = 0;
-  uint64_t execute_count = 0;
-};
-
-struct PjrtxMlxMetalAsyncHostToDeviceTransfer {
-  mlx::core::allocator::Buffer staging;
-  uint64_t byte_size;
-  int dtype;
-  std::vector<int64_t> dims;
-  int device_ordinal;
-  bool finished = false;
-
-  PjrtxMlxMetalAsyncHostToDeviceTransfer(
-      mlx::core::allocator::Buffer staging_, uint64_t byte_size_, int dtype_,
-      std::vector<int64_t> dims_, int device_ordinal_)
-      : staging(staging_),
-        byte_size(byte_size_),
-        dtype(dtype_),
-        dims(std::move(dims_)),
-        device_ordinal(device_ordinal_) {}
-};
-
 namespace {
 
 std::atomic<uint64_t> g_eval_capture_index{0};
+std::atomic<uint64_t> g_program_capture_index{0};
+std::atomic<uint64_t> g_dot_canonical_count{0};
+std::atomic<uint64_t> g_dot_rhs_transposed_count{0};
+std::atomic<uint64_t> g_dot_normalized_count{0};
+std::atomic<uint64_t> g_dot_shape_sample_count{0};
+std::atomic<uint64_t> g_attention_shape_sample_count{0};
 
 bool env_flag_enabled(const char* name) {
   const char* value = std::getenv(name);
@@ -98,10 +53,25 @@ bool env_flag_enabled(const char* name) {
          std::strcmp(value, "FALSE") != 0;
 }
 
+bool env_flag_default_enabled(const char* name) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return true;
+  }
+  return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+         std::strcmp(value, "FALSE") != 0;
+}
+
 bool profile_enabled() { return env_flag_enabled("PJRTX_PROFILE"); }
 
 bool device_sync_profile_enabled() {
   return env_flag_enabled("PJRTX_PROFILE_DEVICE_SYNC");
+}
+
+bool dot_profile_enabled() { return env_flag_enabled("PJRTX_PROFILE_DOT"); }
+
+bool attention_profile_enabled() {
+  return env_flag_enabled("PJRTX_PROFILE_ATTENTION");
 }
 
 bool compile_eval_enabled() { return env_flag_enabled("PJRTX_MLX_COMPILE_EVAL"); }
@@ -114,7 +84,31 @@ bool program_compile_no_fuse_enabled() {
   return env_flag_enabled("PJRTX_MLX_PROGRAM_COMPILE_NO_FUSE");
 }
 
-std::optional<std::string> next_eval_capture_path() {
+bool dot_tensordot_enabled() {
+  return env_flag_default_enabled("PJRTX_MLX_DOT_TENSORDOT");
+}
+
+bool program_async_eval_enabled() {
+  return env_flag_enabled("PJRTX_MLX_PROGRAM_ASYNC_EVAL");
+}
+
+std::optional<uint64_t> program_async_eval_max_output_bytes() {
+  const char* value = std::getenv("PJRTX_MLX_PROGRAM_ASYNC_EVAL_MAX_OUTPUT_BYTES");
+  if (value == nullptr || value[0] == '\0') {
+    return std::nullopt;
+  }
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(value, &end, 10);
+  if (end == value || (end != nullptr && *end != '\0')) {
+    return std::nullopt;
+  }
+  return static_cast<uint64_t>(parsed);
+}
+
+bool msl_execute_enabled() { return env_flag_enabled("PJRTX_MSL_EXECUTE"); }
+
+std::optional<std::string> next_metal_capture_path(const char* prefix,
+                                                   uint64_t index) {
   const char* dir = std::getenv("PJRTX_METAL_CAPTURE_DIR");
   if (dir == nullptr || dir[0] == '\0') {
     return std::nullopt;
@@ -127,15 +121,32 @@ std::optional<std::string> next_eval_capture_path() {
     }
     return std::nullopt;
   }
-  const uint64_t index = g_eval_capture_index.fetch_add(1);
   std::string path(dir);
   if (!path.empty() && path.back() != '/') {
     path.push_back('/');
   }
-  path += "pjrtx_mlx_eval_";
+  path += prefix;
   path += std::to_string(index);
   path += ".gputrace";
   return path;
+}
+
+std::optional<std::string> next_eval_capture_path() {
+  const uint64_t index = g_eval_capture_index.fetch_add(1);
+  return next_metal_capture_path("pjrtx_mlx_eval_", index);
+}
+
+std::optional<std::string> next_program_capture_path() {
+  const uint64_t index = g_program_capture_index.fetch_add(1);
+  return next_metal_capture_path("pjrtx_mlx_program_", index);
+}
+
+const char* metal_capture_hint(const char* error) {
+  if (error != nullptr &&
+      std::strstr(error, "Capture layer is not inserted") != nullptr) {
+    return " set MTL_CAPTURE_ENABLED=1 when launching the process";
+  }
+  return "";
 }
 
 uint64_t now_micros() {
@@ -923,6 +934,21 @@ mlx::core::array mlx_astype_array(const mlx::core::array& src, int dtype,
   }
 }
 
+mlx::core::array attention_allowed_mask(PjrtxMlxMetalBuffer* token_index,
+                                        int64_t queries, int64_t kv_len,
+                                        const mlx::core::Device& device) {
+  auto key_positions = mlx::core::reshape(
+      mlx::core::arange(0, static_cast<int>(kv_len), device),
+      mlx::core::Shape{1, 1, 1, static_cast<int>(kv_len)}, device);
+  auto query_offsets = mlx::core::reshape(
+      mlx::core::arange(0, static_cast<int>(queries), device),
+      mlx::core::Shape{1, 1, static_cast<int>(queries), 1}, device);
+  auto token = mlx_astype_array(*token_index->array, PJRTX_MLX_METAL_DTYPE_S32,
+                                device);
+  token = mlx::core::reshape(token, mlx::core::Shape{1, 1, 1, 1}, device);
+  return mlx::core::less_equal(key_positions, token + query_offsets, device);
+}
+
 int launch_element_count(const mlx::core::array& src) {
   if (src.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
     throw std::invalid_argument("custom Metal unary launch grid is too large");
@@ -936,6 +962,112 @@ mlx::core::array metal_kernel_input_array(const mlx::core::array& src,
     return src;
   }
   return mlx::core::reshape(src, mlx::core::Shape{1}, device);
+}
+
+bool msl_elementwise_dtype_supported(int dtype) {
+  switch (dtype) {
+    case PJRTX_MLX_METAL_DTYPE_F32:
+    case PJRTX_MLX_METAL_DTYPE_F16:
+    case PJRTX_MLX_METAL_DTYPE_BF16:
+      return true;
+    default:
+      return false;
+  }
+}
+
+const char* msl_binary_kernel_name(int op) {
+  switch (op) {
+    case PJRTX_MLX_METAL_U8_BINARY_ADD:
+      return "pjrtx_msl_binary_add";
+    case PJRTX_MLX_METAL_U8_BINARY_SUBTRACT:
+      return "pjrtx_msl_binary_subtract";
+    case PJRTX_MLX_METAL_U8_BINARY_MULTIPLY:
+      return "pjrtx_msl_binary_multiply";
+    case PJRTX_MLX_METAL_U8_BINARY_DIVIDE:
+      return "pjrtx_msl_binary_divide";
+    case PJRTX_MLX_METAL_BINARY_MAXIMUM:
+      return "pjrtx_msl_binary_maximum";
+    case PJRTX_MLX_METAL_BINARY_MINIMUM:
+      return "pjrtx_msl_binary_minimum";
+    default:
+      return nullptr;
+  }
+}
+
+const char* msl_binary_source(int op) {
+  switch (op) {
+    case PJRTX_MLX_METAL_U8_BINARY_ADD:
+      return R"(
+        uint elem = thread_position_in_grid.x;
+        out[elem] = lhs[elem] + rhs[elem];
+      )";
+    case PJRTX_MLX_METAL_U8_BINARY_SUBTRACT:
+      return R"(
+        uint elem = thread_position_in_grid.x;
+        out[elem] = lhs[elem] - rhs[elem];
+      )";
+    case PJRTX_MLX_METAL_U8_BINARY_MULTIPLY:
+      return R"(
+        uint elem = thread_position_in_grid.x;
+        out[elem] = lhs[elem] * rhs[elem];
+      )";
+    case PJRTX_MLX_METAL_U8_BINARY_DIVIDE:
+      return R"(
+        uint elem = thread_position_in_grid.x;
+        out[elem] = lhs[elem] / rhs[elem];
+      )";
+    case PJRTX_MLX_METAL_BINARY_MAXIMUM:
+      return R"(
+        uint elem = thread_position_in_grid.x;
+        out[elem] = max(lhs[elem], rhs[elem]);
+      )";
+    case PJRTX_MLX_METAL_BINARY_MINIMUM:
+      return R"(
+        uint elem = thread_position_in_grid.x;
+        out[elem] = min(lhs[elem], rhs[elem]);
+      )";
+    default:
+      return nullptr;
+  }
+}
+
+std::optional<mlx::core::array> try_msl_binary_array(
+    const mlx::core::array& lhs, const mlx::core::array& rhs, int op,
+    int dtype, const mlx::core::Shape& output_shape, uint64_t output_elements,
+    const mlx::core::Device& device) {
+  if (!msl_execute_enabled() || !msl_elementwise_dtype_supported(dtype)) {
+    return std::nullopt;
+  }
+  const char* name = msl_binary_kernel_name(op);
+  const char* source = msl_binary_source(op);
+  const mlx::core::Dtype* mlx_dtype = mlx_dtype_from_code(dtype);
+  if (name == nullptr || source == nullptr || mlx_dtype == nullptr) {
+    return std::nullopt;
+  }
+  if (output_elements > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+    return std::nullopt;
+  }
+  if (lhs.data_size() < output_elements || rhs.data_size() < output_elements) {
+    return std::nullopt;
+  }
+  const auto lhs_input = metal_kernel_input_array(lhs, device);
+  const auto rhs_input = metal_kernel_input_array(rhs, device);
+  const auto kernel = mlx::core::fast::metal_kernel(
+      name, {"lhs", "rhs"}, {"out"}, source);
+  auto outputs = kernel(
+      {lhs_input, rhs_input},
+      {output_shape},
+      {*mlx_dtype},
+      {static_cast<int>(output_elements), 1, 1},
+      {256, 1, 1},
+      {},
+      std::nullopt,
+      false,
+      device);
+  if (outputs.size() != 1) {
+    throw std::runtime_error("MSL binary custom kernel did not return one output");
+  }
+  return std::move(outputs[0]);
 }
 
 size_t xla_threefry_split_dim(const std::vector<int64_t>& dims) {
@@ -1446,6 +1578,127 @@ bool dot_general_is_matmul_like(const std::vector<int64_t>& lhs_dims,
     return false;
   }
   return true;
+}
+
+bool dot_general_is_canonical_matmul(const std::vector<int64_t>& lhs_dims,
+                                     const std::vector<int64_t>& rhs_dims,
+                                     const std::vector<int64_t>& lhs_batch,
+                                     const std::vector<int64_t>& rhs_batch,
+                                     const std::vector<int64_t>& lhs_contract,
+                                     const std::vector<int64_t>& rhs_contract,
+                                     const std::vector<int64_t>& output_dims) {
+  if (lhs_contract.size() != 1 || rhs_contract.size() != 1 ||
+      lhs_batch.size() != rhs_batch.size() || lhs_dims.size() < 2) {
+    return false;
+  }
+  const size_t batch_rank = lhs_batch.size();
+  if (lhs_dims.size() < batch_rank + 2 ||
+      rhs_dims.size() != batch_rank + 2 ||
+      output_dims.size() != lhs_dims.size()) {
+    return false;
+  }
+  if (batch_rank != 0 && lhs_dims.size() != batch_rank + 2) {
+    return false;
+  }
+  for (size_t axis = 0; axis < batch_rank; ++axis) {
+    if (lhs_batch[axis] != static_cast<int64_t>(axis) ||
+        rhs_batch[axis] != static_cast<int64_t>(axis) ||
+        lhs_dims[axis] != rhs_dims[axis] ||
+        output_dims[axis] != lhs_dims[axis]) {
+      return false;
+      }
+  }
+  if (lhs_contract[0] != static_cast<int64_t>(lhs_dims.size() - 1) ||
+      rhs_contract[0] != static_cast<int64_t>(batch_rank) ||
+      lhs_dims.back() != rhs_dims[batch_rank]) {
+    return false;
+  }
+  for (size_t axis = batch_rank; axis + 1 < lhs_dims.size(); ++axis) {
+    if (output_dims[axis] != lhs_dims[axis]) return false;
+  }
+  if (output_dims.back() != rhs_dims[batch_rank + 1]) return false;
+  return true;
+}
+
+bool dot_general_is_rhs_transposed_matmul(
+    const std::vector<int64_t>& lhs_dims, const std::vector<int64_t>& rhs_dims,
+    const std::vector<int64_t>& lhs_batch,
+    const std::vector<int64_t>& rhs_batch,
+    const std::vector<int64_t>& lhs_contract,
+    const std::vector<int64_t>& rhs_contract,
+    const std::vector<int64_t>& output_dims) {
+  if (!lhs_batch.empty() || !rhs_batch.empty() ||
+      lhs_contract.size() != 1 || rhs_contract.size() != 1 ||
+      lhs_dims.size() < 2 || rhs_dims.size() != 2 ||
+      output_dims.size() != lhs_dims.size()) {
+    return false;
+  }
+  if (lhs_contract[0] != static_cast<int64_t>(lhs_dims.size() - 1) ||
+      rhs_contract[0] != 1 || lhs_dims.back() != rhs_dims[1]) {
+    return false;
+  }
+  for (size_t axis = 0; axis + 1 < lhs_dims.size(); ++axis) {
+    if (output_dims[axis] != lhs_dims[axis]) return false;
+  }
+  if (output_dims.back() != rhs_dims[0]) return false;
+  return true;
+}
+
+void record_dot_general_path(const char* path) {
+  if (!dot_profile_enabled()) return;
+  uint64_t canonical = g_dot_canonical_count.load(std::memory_order_relaxed);
+  uint64_t rhs_transposed =
+      g_dot_rhs_transposed_count.load(std::memory_order_relaxed);
+  uint64_t normalized = g_dot_normalized_count.load(std::memory_order_relaxed);
+  if (std::strcmp(path, "canonical") == 0) {
+    canonical = g_dot_canonical_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  } else if (std::strcmp(path, "rhs_transposed") == 0) {
+    rhs_transposed =
+        g_dot_rhs_transposed_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  } else {
+    normalized = g_dot_normalized_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  }
+  const uint64_t total = canonical + rhs_transposed + normalized;
+  if ((total % 64) == 0) {
+    std::fprintf(stderr,
+                 "pjrtx_profile event=dot_general_paths total=%llu canonical=%llu rhs_transposed=%llu normalized=%llu\n",
+                 static_cast<unsigned long long>(total),
+                 static_cast<unsigned long long>(canonical),
+                 static_cast<unsigned long long>(rhs_transposed),
+                 static_cast<unsigned long long>(normalized));
+  }
+}
+
+std::string i64_vector_string(const std::vector<int64_t>& values) {
+  std::string out = "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i != 0) out += ",";
+    out += std::to_string(values[i]);
+  }
+  out += "]";
+  return out;
+}
+
+void record_dot_general_shape(const std::vector<int64_t>& lhs_dims,
+                              const std::vector<int64_t>& rhs_dims,
+                              const std::vector<int64_t>& lhs_batch,
+                              const std::vector<int64_t>& rhs_batch,
+                              const std::vector<int64_t>& lhs_contract,
+                              const std::vector<int64_t>& rhs_contract,
+                              const std::vector<int64_t>& output_dims) {
+  if (!dot_profile_enabled()) return;
+  const uint64_t sample =
+      g_dot_shape_sample_count.fetch_add(1, std::memory_order_relaxed);
+  if (sample >= 32) return;
+  std::fprintf(
+      stderr,
+      "pjrtx_profile event=dot_general_shape sample=%llu lhs=%s rhs=%s lhs_batch=%s rhs_batch=%s lhs_contract=%s rhs_contract=%s output=%s\n",
+      static_cast<unsigned long long>(sample),
+      i64_vector_string(lhs_dims).c_str(), i64_vector_string(rhs_dims).c_str(),
+      i64_vector_string(lhs_batch).c_str(), i64_vector_string(rhs_batch).c_str(),
+      i64_vector_string(lhs_contract).c_str(),
+      i64_vector_string(rhs_contract).c_str(),
+      i64_vector_string(output_dims).c_str());
 }
 
 mlx::core::array mlx_compare_array(const mlx::core::array& lhs,
@@ -2112,7 +2365,13 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_binary_out(
     if (rhs_array.shape() != output_shape) {
       rhs_array = mlx::core::broadcast_to(rhs_array, output_shape, device);
     }
-    auto out = mlx_binary_array(lhs_array, rhs_array, op, lhs->dtype, device);
+    const uint64_t output_elements = element_count_for_shape(out_dims);
+    auto msl_out = try_msl_binary_array(lhs_array, rhs_array, op, lhs->dtype,
+                                        output_shape, output_elements, device);
+    auto out = msl_out.has_value()
+                   ? std::move(*msl_out)
+                   : mlx_binary_array(lhs_array, rhs_array, op, lhs->dtype,
+                                      device);
     auto array = std::make_unique<mlx::core::array>(std::move(out));
     return new PjrtxMlxMetalBuffer(std::move(array), byte_size,
                                    lhs->dtype, std::move(out_dims),
@@ -3130,6 +3389,45 @@ PjrtxMlxMetalBuffer* pjrtx_mlx_metal_buffer_dot_general(
     return nullptr;
   }
   try {
+    record_dot_general_shape(lhs->dims, rhs->dims, lhs_batch, rhs_batch,
+                             lhs_contract, rhs_contract, out_dims);
+    if (dot_general_is_canonical_matmul(lhs->dims, rhs->dims, lhs_batch,
+                                        rhs_batch, lhs_contract, rhs_contract,
+                                        out_dims)) {
+      record_dot_general_path("canonical");
+      auto out = mlx::core::matmul(*lhs->array, *rhs->array, device);
+      if (out.shape() != mlx_shape(out_dims)) {
+        return nullptr;
+      }
+      auto array = std::make_unique<mlx::core::array>(std::move(out));
+      return new PjrtxMlxMetalBuffer(std::move(array), byte_size, lhs->dtype,
+                                     std::move(out_dims),
+                                     lhs->device_ordinal);
+    }
+    if (dot_general_is_rhs_transposed_matmul(lhs->dims, rhs->dims, lhs_batch,
+                                             rhs_batch, lhs_contract,
+                                             rhs_contract, out_dims)) {
+      record_dot_general_path("rhs_transposed");
+      auto out = dot_tensordot_enabled()
+                     ? mlx::core::tensordot(*lhs->array, *rhs->array,
+                                            std::vector<int>{1},
+                                            std::vector<int>{1}, device)
+                     : mlx::core::matmul(
+                           *lhs->array,
+                           mlx::core::transpose(*rhs->array,
+                                                std::vector<int>{1, 0},
+                                                device),
+                           device);
+      if (out.shape() != mlx_shape(out_dims)) {
+        return nullptr;
+      }
+      auto array = std::make_unique<mlx::core::array>(std::move(out));
+      return new PjrtxMlxMetalBuffer(std::move(array), byte_size, lhs->dtype,
+                                     std::move(out_dims),
+                                     lhs->device_ordinal);
+    }
+    record_dot_general_path("normalized");
+
     std::vector<bool> lhs_used(lhs->dims.size(), false);
     std::vector<bool> rhs_used(rhs->dims.size(), false);
     std::vector<int> lhs_order;
@@ -4666,6 +4964,24 @@ pjrtx_mlx_metal_custom_call_scaled_dot_product_attention(
     return nullptr;
   }
 
+  if (attention_profile_enabled()) {
+    const uint64_t sample = g_attention_shape_sample_count.fetch_add(1);
+    if (sample < 128) {
+      std::fprintf(stderr,
+                   "pjrtx_profile event=attention_shape sample=%llu rank=%llu batch=%lld queries=%lld q_heads=%lld kv_len=%lld kv_heads=%lld head_dim=%lld dtype=%d token_rank=%llu token_dtype=%d\n",
+                   static_cast<unsigned long long>(sample),
+                   static_cast<unsigned long long>(q->dims.size()),
+                   static_cast<long long>(batch),
+                   static_cast<long long>(queries),
+                   static_cast<long long>(q_heads),
+                   static_cast<long long>(kv_len),
+                   static_cast<long long>(kv_heads),
+                   static_cast<long long>(head_dim), q->dtype,
+                   static_cast<unsigned long long>(token_index->dims.size()),
+                   token_index->dtype);
+    }
+  }
+
   const mlx::core::Device device(mlx::core::Device::gpu, q->device_ordinal);
   if (!mlx::core::is_available(device)) {
     return nullptr;
@@ -4702,17 +5018,7 @@ pjrtx_mlx_metal_custom_call_scaled_dot_product_attention(
                                          static_cast<int>(kv_len),
                                          static_cast<int>(head_dim)},
                         device);
-    auto key_positions = mlx::core::reshape(
-        mlx::core::arange(0, static_cast<int>(kv_len), device),
-        mlx::core::Shape{1, 1, 1, static_cast<int>(kv_len)}, device);
-    auto query_offsets = mlx::core::reshape(
-        mlx::core::arange(0, static_cast<int>(queries), device),
-        mlx::core::Shape{1, 1, static_cast<int>(queries), 1}, device);
-    auto token = mlx_astype_array(*token_index->array, PJRTX_MLX_METAL_DTYPE_S32,
-                                  device);
-    token = mlx::core::reshape(token, mlx::core::Shape{1, 1, 1, 1}, device);
-    auto allowed = mlx::core::less_equal(key_positions, token + query_offsets,
-                                         device);
+    auto allowed = attention_allowed_mask(token_index, queries, kv_len, device);
 
     const float scale =
         1.0f / std::sqrt(static_cast<float>(head_dim));
@@ -4830,13 +5136,14 @@ int pjrtx_mlx_metal_buffer_eval_many(PjrtxMlxMetalBuffer* const* buffers,
       } catch (const std::exception& e) {
         if (profile) {
           std::fprintf(stderr,
-                       "pjrtx_profile event=metal_capture_reject reason=start_failed path=\"%s\" error=\"%s\"\n",
-                       capture_path->c_str(), e.what());
+                       "pjrtx_profile event=metal_capture_reject reason=start_failed path=\"%s\" error=\"%s\" hint=\"%s\"\n",
+                       capture_path->c_str(), e.what(),
+                       metal_capture_hint(e.what()));
         }
       } catch (...) {
         if (profile) {
           std::fprintf(stderr,
-                       "pjrtx_profile event=metal_capture_reject reason=start_failed path=\"%s\" error=\"unknown\"\n",
+                       "pjrtx_profile event=metal_capture_reject reason=start_failed path=\"%s\" error=\"unknown\" hint=\"\"\n",
                        capture_path->c_str());
         }
       }
@@ -4982,7 +5289,6 @@ PjrtxMlxMetalProgram* pjrtx_mlx_metal_program_create_with_captures(
     }
     program->full_to_dynamic_input.assign(static_cast<size_t>(full_input_count),
                                           -1);
-
     for (uint64_t dynamic_index = 0; dynamic_index < dynamic_count;
          ++dynamic_index) {
       const uint64_t full_index = dynamic_indices[dynamic_index];
@@ -5112,14 +5418,16 @@ int pjrtx_mlx_metal_program_execute(
     uint64_t input_count, PjrtxMlxMetalBuffer*** out_outputs,
     uint64_t* out_output_count) {
   return pjrtx_mlx_metal_program_execute_with_donation(
-      program, inputs, input_count, nullptr, 0, out_outputs, out_output_count);
+      program, inputs, input_count, nullptr, 0, out_outputs, out_output_count,
+      nullptr);
 }
 
 int pjrtx_mlx_metal_program_execute_with_donation(
     PjrtxMlxMetalProgram* program, PjrtxMlxMetalBuffer* const* inputs,
     uint64_t input_count, const uint64_t* donated_input_indices,
     uint64_t donated_input_count, PjrtxMlxMetalBuffer*** out_outputs,
-    uint64_t* out_output_count) {
+    uint64_t* out_output_count,
+    PjrtxMlxMetalProgramExecuteProfile* out_profile) {
   if (program == nullptr || out_outputs == nullptr ||
       out_output_count == nullptr || input_count != program->input_count ||
       (input_count != 0 && inputs == nullptr) ||
@@ -5128,22 +5436,30 @@ int pjrtx_mlx_metal_program_execute_with_donation(
   }
   *out_outputs = nullptr;
   *out_output_count = 0;
-  std::vector<uint8_t> donated(static_cast<size_t>(input_count), 0);
+  if (out_profile != nullptr) {
+    *out_profile = {};
+  }
   for (uint64_t i = 0; i < donated_input_count; ++i) {
     const uint64_t input_index = donated_input_indices[i];
     if (input_index >= input_count) {
       return 0;
     }
-    donated[static_cast<size_t>(input_index)] = 1;
   }
 
   const bool profile = profile_enabled();
+  const bool sync_profile = device_sync_profile_enabled();
   const bool no_fuse = program_compile_no_fuse_enabled();
   const uint64_t start_us = profile ? now_micros() : 0;
+  std::optional<std::string> capture_path;
+  bool capture_started = false;
   std::lock_guard<std::mutex> lock(program->mutex);
   try {
     std::vector<mlx::core::array> arrays;
     arrays.reserve(static_cast<size_t>(input_count));
+    std::vector<uint8_t> donated(static_cast<size_t>(input_count), 0);
+    for (uint64_t i = 0; i < donated_input_count; ++i) {
+      donated[static_cast<size_t>(donated_input_indices[i])] = 1;
+    }
     int device_ordinal = -1;
     for (uint64_t i = 0; i < input_count; ++i) {
       PjrtxMlxMetalBuffer* input = inputs[i];
@@ -5176,6 +5492,38 @@ int pjrtx_mlx_metal_program_execute_with_donation(
     if (!mlx::core::is_available(device)) {
       return 0;
     }
+    capture_path = next_program_capture_path();
+    if (capture_path.has_value()) {
+      try {
+        mlx::core::metal::start_capture(*capture_path);
+        capture_started = true;
+        if (profile) {
+          std::fprintf(
+              stderr,
+              "pjrtx_profile event=metal_capture_start path=\"%s\" device=%d program=0x%llx inputs=%llu full_inputs=%llu captured_inputs=%llu\n",
+              capture_path->c_str(), device_ordinal,
+              static_cast<unsigned long long>(
+                  reinterpret_cast<std::uintptr_t>(program)),
+              static_cast<unsigned long long>(input_count),
+              static_cast<unsigned long long>(program->full_input_count),
+              static_cast<unsigned long long>(
+                  program->full_input_count - program->input_count));
+        }
+      } catch (const std::exception& e) {
+        if (profile) {
+          std::fprintf(stderr,
+                       "pjrtx_profile event=metal_capture_reject reason=start_failed path=\"%s\" error=\"%s\" hint=\"%s\"\n",
+                       capture_path->c_str(), e.what(),
+                       metal_capture_hint(e.what()));
+        }
+      } catch (...) {
+        if (profile) {
+          std::fprintf(stderr,
+                       "pjrtx_profile event=metal_capture_reject reason=start_failed path=\"%s\" error=\"unknown\" hint=\"\"\n",
+                       capture_path->c_str());
+        }
+      }
+    }
 
     program->active_device_ordinal = device_ordinal;
     mlx::core::set_compile_mode(no_fuse ? mlx::core::CompileMode::no_fuse
@@ -5188,7 +5536,57 @@ int pjrtx_mlx_metal_program_execute_with_donation(
       }
     }
     mlx::core::set_compile_mode(mlx::core::CompileMode::enabled);
-    mlx::core::async_eval(compiled_outputs);
+    if (program_async_eval_enabled()) {
+      if (auto max_output_bytes = program_async_eval_max_output_bytes()) {
+        std::vector<mlx::core::array> eval_outputs;
+        eval_outputs.reserve(compiled_outputs.size());
+        for (const auto& output : compiled_outputs) {
+          if (static_cast<uint64_t>(output.nbytes()) <= *max_output_bytes) {
+            eval_outputs.push_back(output);
+          }
+        }
+        if (!eval_outputs.empty()) {
+          mlx::core::async_eval(eval_outputs);
+        }
+      } else {
+        mlx::core::async_eval(compiled_outputs);
+      }
+    }
+    const uint64_t host_enqueue_us =
+        profile ? elapsed_micros_since(start_us) : 0;
+
+    uint64_t device_sync_wait_us = 0;
+    if (sync_profile || capture_started) {
+      const uint64_t sync_start_us = now_micros();
+      mlx::core::synchronize(mlx::core::default_stream(device));
+      device_sync_wait_us = elapsed_micros_since(sync_start_us);
+    }
+
+    if (capture_started) {
+      try {
+        mlx::core::metal::stop_capture();
+        if (profile) {
+          std::fprintf(
+              stderr,
+              "pjrtx_profile event=metal_capture_stop path=\"%s\" device=%d program=0x%llx\n",
+              capture_path->c_str(), device_ordinal,
+              static_cast<unsigned long long>(
+                  reinterpret_cast<std::uintptr_t>(program)));
+        }
+      } catch (const std::exception& e) {
+        if (profile) {
+          std::fprintf(stderr,
+                       "pjrtx_profile event=metal_capture_stop_failed path=\"%s\" error=\"%s\"\n",
+                       capture_path->c_str(), e.what());
+        }
+      } catch (...) {
+        if (profile) {
+          std::fprintf(stderr,
+                       "pjrtx_profile event=metal_capture_stop_failed path=\"%s\" error=\"unknown\"\n",
+                       capture_path->c_str());
+        }
+      }
+    }
 
     auto** result = new PjrtxMlxMetalBuffer*[compiled_outputs.size()];
     uint64_t initialized = 0;
@@ -5213,9 +5611,18 @@ int pjrtx_mlx_metal_program_execute_with_donation(
     program->execute_count += 1;
     *out_outputs = result;
     *out_output_count = static_cast<uint64_t>(compiled_outputs.size());
+    if (out_profile != nullptr) {
+      out_profile->host_enqueue_us = host_enqueue_us;
+      out_profile->device_sync_wait_us = device_sync_wait_us;
+      out_profile->output_count = *out_output_count;
+      out_profile->donated_input_count = donated_input_count;
+      out_profile->measured_device_sync =
+          (sync_profile || capture_started) ? 1 : 0;
+      out_profile->first_execute = first_execute ? 1 : 0;
+    }
     if (profile) {
       std::fprintf(stderr,
-                   "pjrtx_profile event=mlx_program_execute program=0x%llx inputs=%llu full_inputs=%llu captured_inputs=%llu donated_inputs=%llu outputs=%llu first_execute=%d compile_mode=%s host_enqueue_us=%llu\n",
+                   "pjrtx_profile event=mlx_program_execute program=0x%llx inputs=%llu full_inputs=%llu captured_inputs=%llu donated_inputs=%llu outputs=%llu first_execute=%d compile_mode=%s host_enqueue_us=%llu device_sync_wait_us=%llu measurement=%s capture_path=\"%s\"\n",
                    static_cast<unsigned long long>(
                        reinterpret_cast<std::uintptr_t>(program)),
                    static_cast<unsigned long long>(input_count),
@@ -5225,11 +5632,20 @@ int pjrtx_mlx_metal_program_execute_with_donation(
                    static_cast<unsigned long long>(donated_input_count),
                    static_cast<unsigned long long>(*out_output_count),
                    first_execute ? 1 : 0, no_fuse ? "no_fuse" : "enabled",
-                   static_cast<unsigned long long>(
-                       elapsed_micros_since(start_us)));
+                   static_cast<unsigned long long>(host_enqueue_us),
+                   static_cast<unsigned long long>(device_sync_wait_us),
+                   (sync_profile || capture_started) ? "device_sync_wall"
+                                                     : "enqueue",
+                   capture_started ? capture_path->c_str() : "");
     }
     return 1;
   } catch (const std::exception& e) {
+    if (capture_started) {
+      try {
+        mlx::core::metal::stop_capture();
+      } catch (...) {
+      }
+    }
     mlx::core::set_compile_mode(mlx::core::CompileMode::enabled);
     if (profile_enabled()) {
       std::fprintf(stderr,
@@ -5240,6 +5656,12 @@ int pjrtx_mlx_metal_program_execute_with_donation(
     }
     return 0;
   } catch (...) {
+    if (capture_started) {
+      try {
+        mlx::core::metal::stop_capture();
+      } catch (...) {
+      }
+    }
     mlx::core::set_compile_mode(mlx::core::CompileMode::enabled);
     if (profile_enabled()) {
       std::fprintf(stderr,

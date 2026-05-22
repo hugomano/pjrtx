@@ -117,6 +117,40 @@ pub const Spec = struct {
     binary_op: ?ir.ElementwiseBinaryOp = null,
 };
 
+/// Names the generic scaled-dot-product attention custom-call ABI.
+/// Callers pass q, k, v, and token_index device buffers in this order; lowering
+/// owns shape and dtype legality while execution owns dispatch to the MLX shim.
+pub const ScaledDotProductAttention = struct {
+    /// Stable custom-call target accepted by the MLX/Metal backend.
+    pub const Target = "pjrtx.mlx_metal.scaled_dot_product_attention";
+    /// Number of device-buffer operands required by this custom call.
+    pub const InputCount = 4;
+    /// Number of device-buffer outputs produced by this custom call.
+    pub const OutputCount = 1;
+
+    /// Operand positions in the executable-plan custom-call input list.
+    pub const Input = enum(usize) {
+        /// Query tensor with shape [q,h,hd] or [b,q,h,hd].
+        q,
+        /// Key-cache tensor with shape [k,kv_h,hd] or [b,k,kv_h,hd].
+        k,
+        /// Value-cache tensor with the same shape as the key cache.
+        v,
+        /// Scalar or length-1 integer tensor naming the first query position.
+        token_index,
+
+        /// Returns the executable-plan input index for this operand.
+        pub fn index(input: @This()) usize {
+            return @intFromEnum(input);
+        }
+    };
+
+    /// Reports whether a target name selects the built-in attention contract.
+    pub fn matches(target: []const u8) bool {
+        return std.mem.eql(u8, target, Target);
+    }
+};
+
 const Entry = struct {
     target: []const u8,
     spec: Spec,
@@ -126,7 +160,7 @@ const Entry = struct {
 pub const BuiltinBinaryAddF32Target = "pjrtx.mlx_metal.custom_binary_add_f32";
 
 /// Built-in target implemented by the MLX/Metal attention shim.
-pub const ScaledDotProductAttentionTarget = "pjrtx.mlx_metal.scaled_dot_product_attention";
+pub const ScaledDotProductAttentionTarget = ScaledDotProductAttention.Target;
 
 var mutex: std.Io.Mutex = .init;
 var registry: std.StringHashMapUnmanaged(Entry) = .empty;
@@ -205,7 +239,7 @@ pub fn version() u64 {
 pub fn lookup(target: []const u8) ?Spec {
     if (std.mem.eql(u8, target, "annotate_device_placement")) return .{ .kind = .identity };
     if (std.mem.eql(u8, target, BuiltinBinaryAddF32Target)) return .{ .kind = .metal_kernel_binary_add_f32 };
-    if (std.mem.eql(u8, target, ScaledDotProductAttentionTarget)) return .{ .kind = .scaled_dot_product_attention };
+    if (ScaledDotProductAttention.matches(target)) return .{ .kind = .scaled_dot_product_attention };
 
     lock();
     defer unlock();

@@ -6,7 +6,7 @@ const runtime = @import("src/runtime");
 const abi = @import("pjrt_abi.zig");
 const errors = @import("errors.zig");
 const handles = @import("pjrt_handles.zig");
-const plugin = @import("plugin.zig");
+const plugin_process = @import("plugin_process.zig");
 
 const LoadedExecutableHandle = handles.LoadedExecutable(Executable);
 const ExecutableHandle = handles.Executable(ExecutableMetadata);
@@ -31,8 +31,8 @@ pub const Executable = opaque {
         const device_count = compiled.executableDeviceCount();
         const partition_count: usize = @intCast(compiled.numPartitions());
 
-        const logical_ids = try plugin.allocator().alloc(c.PJRT_LogicalDeviceIds, device_count);
-        errdefer plugin.allocator().free(logical_ids);
+        const logical_ids = try plugin_process.allocator().alloc(c.PJRT_LogicalDeviceIds, device_count);
+        errdefer plugin_process.allocator().free(logical_ids);
         for (logical_ids, 0..) |*id, index| {
             id.* = .{
                 .replica = @intCast(index / partition_count),
@@ -40,19 +40,19 @@ pub const Executable = opaque {
             };
         }
 
-        const parameter_memory_kinds = try plugin.allocator().alloc([*c]const u8, compiled.parameterCount());
-        errdefer plugin.allocator().free(parameter_memory_kinds);
-        const parameter_memory_kind_sizes = try plugin.allocator().alloc(usize, compiled.parameterCount());
-        errdefer plugin.allocator().free(parameter_memory_kind_sizes);
+        const parameter_memory_kinds = try plugin_process.allocator().alloc([*c]const u8, compiled.parameterCount());
+        errdefer plugin_process.allocator().free(parameter_memory_kinds);
+        const parameter_memory_kind_sizes = try plugin_process.allocator().alloc(usize, compiled.parameterCount());
+        errdefer plugin_process.allocator().free(parameter_memory_kind_sizes);
         MemoryKinds.fillDefault(parameter_memory_kinds, parameter_memory_kind_sizes);
 
-        const output_memory_kinds = try plugin.allocator().alloc([*c]const u8, compiled.outputCount());
-        errdefer plugin.allocator().free(output_memory_kinds);
-        const output_memory_kind_sizes = try plugin.allocator().alloc(usize, compiled.outputCount());
-        errdefer plugin.allocator().free(output_memory_kind_sizes);
+        const output_memory_kinds = try plugin_process.allocator().alloc([*c]const u8, compiled.outputCount());
+        errdefer plugin_process.allocator().free(output_memory_kinds);
+        const output_memory_kind_sizes = try plugin_process.allocator().alloc(usize, compiled.outputCount());
+        errdefer plugin_process.allocator().free(output_memory_kind_sizes);
         MemoryKinds.fillDefault(output_memory_kinds, output_memory_kind_sizes);
 
-        const executable = try plugin.allocator().create(ExecutableOwned);
+        const executable = try plugin_process.allocator().create(ExecutableOwned);
         executable.* = .{
             .client = client,
             .compiled = compiled.*,
@@ -68,39 +68,29 @@ pub const Executable = opaque {
     /// Releases the runtime plan, backend residency, and PJRT-owned metadata.
     pub fn deinit(self: *Executable) void {
         const executable = self.owned();
-        plugin.allocator().free(executable.output_memory_kind_sizes);
-        plugin.allocator().free(executable.output_memory_kinds);
-        plugin.allocator().free(executable.parameter_memory_kind_sizes);
-        plugin.allocator().free(executable.parameter_memory_kinds);
-        plugin.allocator().free(executable.logical_ids);
-        executable.compiled.deinit(plugin.allocator());
-        plugin.allocator().destroy(executable);
+        plugin_process.allocator().free(executable.output_memory_kind_sizes);
+        plugin_process.allocator().free(executable.output_memory_kinds);
+        plugin_process.allocator().free(executable.parameter_memory_kind_sizes);
+        plugin_process.allocator().free(executable.parameter_memory_kinds);
+        plugin_process.allocator().free(executable.logical_ids);
+        executable.compiled.deinit(plugin_process.allocator());
+        plugin_process.allocator().destroy(executable);
     }
 
     /// Releases backend residency while keeping PJRT metadata queryable.
-    pub fn releaseResidentStorage(self: *Executable) void {
-        self.owned().compiled.releaseResidentStorage();
-    }
+    pub fn releaseResidentStorage(self: *Executable) void { self.owned().compiled.releaseResidentStorage(); }
 
     /// Returns whether PJRT callers may still execute this loaded executable.
-    pub fn isDeleted(self: *const Executable) bool {
-        return self.ownedConst().deleted;
-    }
+    pub fn isDeleted(self: *const Executable) bool { return self.ownedConst().deleted; }
 
     /// Returns the number of PJRT parameters expected on each execution device.
-    pub fn parameterCount(self: *const Executable) usize {
-        return self.ownedConst().compiled.parameterCount();
-    }
+    pub fn parameterCount(self: *const Executable) usize { return self.ownedConst().compiled.parameterCount(); }
 
     /// Returns the number of PJRT outputs produced on each execution device.
-    pub fn outputCount(self: *const Executable) usize {
-        return self.ownedConst().compiled.outputCount();
-    }
+    pub fn outputCount(self: *const Executable) usize { return self.ownedConst().compiled.outputCount(); }
 
     /// Returns the number of per-device execution slots embedded in this executable.
-    pub fn deviceCount(self: *const Executable) usize {
-        return self.ownedConst().compiled.deviceCount();
-    }
+    pub fn deviceCount(self: *const Executable) usize { return self.ownedConst().compiled.deviceCount(); }
 
     /// Returns the number of addressable devices this executable may run on.
     pub fn addressableDeviceCount(self: *const Executable) usize {
@@ -115,14 +105,10 @@ pub const Executable = opaque {
     }
 
     /// Returns logical device ids in addressable-device order.
-    pub fn logicalDeviceIds(self: *Executable) []c.PJRT_LogicalDeviceIds {
-        return self.owned().logical_ids;
-    }
+    pub fn logicalDeviceIds(self: *Executable) []c.PJRT_LogicalDeviceIds { return self.owned().logical_ids; }
 
     /// Returns the stable executable fingerprint string owned by this handle.
-    pub fn fingerprint(self: *const Executable) []const u8 {
-        return self.ownedConst().compiled.fingerprintText();
-    }
+    pub fn fingerprint(self: *const Executable) []const u8 { return self.ownedConst().compiled.fingerprintText(); }
 
     /// Marks the loaded executable deleted and releases resident backend storage.
     pub fn markDeleted(self: *Executable) void {
@@ -131,14 +117,12 @@ pub const Executable = opaque {
     }
 
     /// Returns whether executing may consume ownership of a parameter buffer.
-    pub fn donatesParameter(self: *const Executable, parameter_index: usize) bool {
-        return self.ownedConst().compiled.donatesParameter(parameter_index);
-    }
+    pub fn donatesParameter(self: *const Executable, parameter_index: usize) bool { return self.ownedConst().compiled.donatesParameter(parameter_index); }
 
     /// Executes the resident backend program for one logical device.
     pub fn executeDevice(self: *Executable, device_index: usize, arguments: []const *runtime.Buffer) runtime.ExecutionError!runtime.ExecutionResult {
         const executable = self.owned();
-        return runtime.executeCompiledExecutable(&executable.compiled, plugin.allocator(), executable.client.executableContext(), device_index, arguments);
+        return runtime.executeCompiledExecutable(&executable.compiled, plugin_process.allocator(), executable.client.executableContext(), device_index, arguments);
     }
 
     /// Narrow test access for executable invariants that are not PJRT API surface.
@@ -159,13 +143,9 @@ pub const Executable = opaque {
         }
     };
 
-    fn owned(self: *Executable) *ExecutableOwned {
-        return @ptrCast(@alignCast(self));
-    }
+    fn owned(self: *Executable) *ExecutableOwned { return @ptrCast(@alignCast(self)); }
 
-    fn ownedConst(self: *const Executable) *const ExecutableOwned {
-        return @ptrCast(@alignCast(self));
-    }
+    fn ownedConst(self: *const Executable) *const ExecutableOwned { return @ptrCast(@alignCast(self)); }
 };
 
 /// Owns PJRT_Executable metadata snapshots created from loaded executables.
@@ -196,24 +176,24 @@ pub const ExecutableMetadata = struct {
     /// Copies queryable executable metadata into a separately owned PJRT handle.
     fn create(source: *const Executable) !*ExecutableMetadata {
         const executable = source.ownedConst();
-        const metadata = try plugin.allocator().create(ExecutableMetadata);
-        errdefer plugin.allocator().destroy(metadata);
+        const metadata = try plugin_process.allocator().create(ExecutableMetadata);
+        errdefer plugin_process.allocator().destroy(metadata);
 
-        const name = try plugin.allocator().dupe(u8, executable.name);
-        errdefer plugin.allocator().free(name);
-        const fingerprint = try plugin.allocator().dupe(u8, executable.compiled.fingerprintText());
-        errdefer plugin.allocator().free(fingerprint);
-        const optimized_program = try plugin.allocator().dupe(u8, executable.compiled.optimizedProgramText());
-        errdefer plugin.allocator().free(optimized_program);
+        const name = try plugin_process.allocator().dupe(u8, executable.name);
+        errdefer plugin_process.allocator().free(name);
+        const fingerprint = try plugin_process.allocator().dupe(u8, executable.compiled.fingerprintText());
+        errdefer plugin_process.allocator().free(fingerprint);
+        const optimized_program = try plugin_process.allocator().dupe(u8, executable.compiled.optimizedProgramText());
+        errdefer plugin_process.allocator().free(optimized_program);
 
-        const parameter_memory_kinds = try plugin.allocator().dupe([*c]const u8, executable.parameter_memory_kinds);
-        errdefer plugin.allocator().free(parameter_memory_kinds);
-        const parameter_memory_kind_sizes = try plugin.allocator().dupe(usize, executable.parameter_memory_kind_sizes);
-        errdefer plugin.allocator().free(parameter_memory_kind_sizes);
-        const output_memory_kinds = try plugin.allocator().dupe([*c]const u8, executable.output_memory_kinds);
-        errdefer plugin.allocator().free(output_memory_kinds);
-        const output_memory_kind_sizes = try plugin.allocator().dupe(usize, executable.output_memory_kind_sizes);
-        errdefer plugin.allocator().free(output_memory_kind_sizes);
+        const parameter_memory_kinds = try plugin_process.allocator().dupe([*c]const u8, executable.parameter_memory_kinds);
+        errdefer plugin_process.allocator().free(parameter_memory_kinds);
+        const parameter_memory_kind_sizes = try plugin_process.allocator().dupe(usize, executable.parameter_memory_kind_sizes);
+        errdefer plugin_process.allocator().free(parameter_memory_kind_sizes);
+        const output_memory_kinds = try plugin_process.allocator().dupe([*c]const u8, executable.output_memory_kinds);
+        errdefer plugin_process.allocator().free(output_memory_kinds);
+        const output_memory_kind_sizes = try plugin_process.allocator().dupe(usize, executable.output_memory_kind_sizes);
+        errdefer plugin_process.allocator().free(output_memory_kind_sizes);
 
         metadata.* = .{
             .name = name,
@@ -232,14 +212,14 @@ pub const ExecutableMetadata = struct {
 
     /// Releases the copied PJRT executable metadata.
     fn deinit(self: *ExecutableMetadata) void {
-        plugin.allocator().free(self.output_memory_kind_sizes);
-        plugin.allocator().free(self.output_memory_kinds);
-        plugin.allocator().free(self.parameter_memory_kind_sizes);
-        plugin.allocator().free(self.parameter_memory_kinds);
-        plugin.allocator().free(self.optimized_program);
-        plugin.allocator().free(self.fingerprint);
-        plugin.allocator().free(self.name);
-        plugin.allocator().destroy(self);
+        plugin_process.allocator().free(self.output_memory_kind_sizes);
+        plugin_process.allocator().free(self.output_memory_kinds);
+        plugin_process.allocator().free(self.parameter_memory_kind_sizes);
+        plugin_process.allocator().free(self.parameter_memory_kinds);
+        plugin_process.allocator().free(self.optimized_program);
+        plugin_process.allocator().free(self.fingerprint);
+        plugin_process.allocator().free(self.name);
+        plugin_process.allocator().destroy(self);
     }
 };
 
@@ -424,8 +404,8 @@ const MemoryKinds = struct {
     /// Writes the default plugin memory kind into parallel PJRT output arrays.
     fn fillDefault(kinds: [][*c]const u8, sizes: []usize) void {
         for (kinds, sizes) |*kind, *size| {
-            kind.* = plugin.MemoryKinds.device.ptr;
-            size.* = plugin.MemoryKinds.device.len;
+            kind.* = plugin_process.MemoryKinds.device.ptr;
+            size.* = plugin_process.MemoryKinds.device.len;
         }
     }
 };

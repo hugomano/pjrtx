@@ -1,5 +1,5 @@
 const std = @import("std");
-const backend_api = @import("src/backend/mlx_metal");
+const backend_api = @import("backend_selection.zig");
 const ir = @import("src/compiler/ir");
 
 const executable_cache = @import("executable_cache.zig");
@@ -42,44 +42,7 @@ pub const Residency = struct {
 
     /// Acquires backend executable residency for a scheduled executable plan.
     pub fn init(context: Context, plan: *const ir.ExecutablePlan, schedule: *const Schedule, options: CompileOptions) !Residency {
-        var backend_executable_cache_lease: ?ExecutableCacheLease = null;
-        var cache_reused = false;
-        var last_compile_cache_trim = ExecutableCacheTrim{};
-        const backend_executable = if (options.cache_fingerprint) |fingerprint| blk: {
-            const cached = try context.acquireCachedExecutable(schedule.allocator, fingerprint, plan, schedule.device_local_hardware_ids);
-            if (cached) |entry| {
-                backend_executable_cache_lease = entry.lease;
-                cache_reused = entry.reused;
-                last_compile_cache_trim = entry.compile_trim;
-                break :blk entry.handle;
-            }
-            break :blk null;
-        } else context.compileBackendExecutable(schedule.allocator, plan, schedule.device_local_hardware_ids) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => null,
-        };
-        errdefer if (backend_executable) |handle| {
-            if (backend_executable_cache_lease) |lease| context.releaseCachedExecutable(lease) else context.destroyBackendExecutable(handle);
-        };
-        if (backend_executable == null) {
-            if (options.diagnostic_writer) |writer| {
-                context.writeBackendLoweringDiagnostic(plan, schedule.device_local_hardware_ids, writer);
-            }
-            return error.UnsupportedRuntimeFeature;
-        }
-
-        return .{
-            .backend = context.backendForExecutableResidency(),
-            .context = context,
-            .backend_executable = backend_executable,
-            .backend_executable_cache_lease = backend_executable_cache_lease,
-            .backend_state = .{
-                .resident = true,
-                .cache_reused = cache_reused,
-                .program_instruction_count = plan.instructions.len,
-            },
-            .last_compile_cache_trim = last_compile_cache_trim,
-        };
+        return ResidencyAcquisition.init(context, plan, schedule, options);
     }
 
     /// Releases backend executable residency or the cache lease retaining it.
@@ -158,5 +121,54 @@ pub const Residency = struct {
     pub fn rollbackDonationAlias(self: *Residency, output_count: usize, output_bytes: usize) void {
         self.donation_alias_stats.output_count -|= output_count;
         self.donation_alias_stats.output_bytes -|= output_bytes;
+    }
+};
+
+const ResidencyAcquisition = struct {
+    fn init(context: Context, plan: *const ir.ExecutablePlan, schedule: *const Schedule, options: CompileOptions) !Residency {
+        var lease: ?ExecutableCacheLease = null;
+        var cache_reused = false;
+        var compile_trim = ExecutableCacheTrim{};
+        const backend_executable = try acquire(context, plan, schedule, options, &lease, &cache_reused, &compile_trim);
+        errdefer if (backend_executable) |handle| {
+            if (lease) |cached| context.releaseCachedExecutable(cached) else context.destroyBackendExecutable(handle);
+        };
+        if (backend_executable == null) {
+            if (options.diagnostic_writer) |writer| context.writeBackendLoweringDiagnostic(plan, schedule.device_local_hardware_ids, writer);
+            return error.UnsupportedRuntimeFeature;
+        }
+        return .{
+            .backend = context.backendForExecutableResidency(),
+            .context = context,
+            .backend_executable = backend_executable,
+            .backend_executable_cache_lease = lease,
+            .backend_state = .{ .resident = true, .cache_reused = cache_reused, .program_instruction_count = plan.instructions.len },
+            .last_compile_cache_trim = compile_trim,
+        };
+    }
+
+    fn acquire(
+        context: Context,
+        plan: *const ir.ExecutablePlan,
+        schedule: *const Schedule,
+        options: CompileOptions,
+        lease: *?ExecutableCacheLease,
+        cache_reused: *bool,
+        compile_trim: *ExecutableCacheTrim,
+    ) !?backend_api.ExecutableHandle {
+        if (options.cache_fingerprint) |fingerprint| {
+            const cached = try context.acquireCachedExecutable(schedule.allocator, fingerprint, plan, schedule.device_local_hardware_ids);
+            if (cached) |entry| {
+                lease.* = entry.lease;
+                cache_reused.* = entry.reused;
+                compile_trim.* = entry.compile_trim;
+                return entry.handle;
+            }
+            return null;
+        }
+        return context.compileBackendExecutable(schedule.allocator, plan, schedule.device_local_hardware_ids) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => null,
+        };
     }
 };

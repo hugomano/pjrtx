@@ -11,7 +11,7 @@ const errors_mod = @import("errors.zig");
 const events_mod = @import("events.zig");
 const executable_mod = @import("executable.zig");
 const execute_mod = @import("execute.zig");
-const plugin = @import("plugin.zig");
+const plugin_process = @import("plugin_process.zig");
 const topology_mod = @import("topology.zig");
 const trace_mod = @import("trace.zig");
 
@@ -39,7 +39,7 @@ fn installScope(api: *c.PJRT_Api, comptime prefix: []const u8, comptime scopes: 
 
 fn installApi(api: *c.PJRT_Api) void {
     installScope(api, "PJRT_Error_", errors_mod.Error.Api);
-    installScope(api, "PJRT_Plugin_", plugin.Api);
+    installScope(api, "PJRT_Plugin_", plugin_process.Api);
     installScope(api, "PJRT_Event_", events_mod.Event.Api);
     installScope(api, "PJRT_Client_", client_mod.Client.Api);
     installScope(api, "PJRT_AsyncHostToDeviceTransferManager_", async_h2d_mod.TransferManager.Api);
@@ -56,9 +56,9 @@ fn installApi(api: *c.PJRT_Api) void {
 }
 
 fn initApi() void {
-    plugin.initialize();
-    api_mutex.lockUncancelable(plugin.io());
-    defer api_mutex.unlock(plugin.io());
+    plugin_process.initialize();
+    api_mutex.lockUncancelable(plugin_process.io());
+    defer api_mutex.unlock(plugin_process.io());
 
     if (api_state == .ready) return;
     api_storage = std.mem.zeroes(c.PJRT_Api);

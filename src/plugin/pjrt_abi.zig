@@ -45,6 +45,24 @@ pub fn Opaque(comptime Owner: type, comptime CHandle: type) type {
 
 const pjrt_abi = @This();
 
+/// PJRT named-value discriminant used by compile options and plugin attributes.
+pub const NamedValueKind = enum(c.PJRT_NamedValue_Type) {
+    string = c.PJRT_NamedValue_kString,
+    int64 = c.PJRT_NamedValue_kInt64,
+    int64list = c.PJRT_NamedValue_kInt64List,
+    float = c.PJRT_NamedValue_kFloat,
+    bool = c.PJRT_NamedValue_kBool,
+};
+
+/// Zig view of the tagged value carried by a PJRT named value.
+pub const NamedValuePayload = union(NamedValueKind) {
+    string: []const u8,
+    int64: i64,
+    int64list: []const i64,
+    float: f32,
+    bool: bool,
+};
+
 /// Typed wrapper over PJRT named values used for options and plugin attributes.
 pub const NamedValue = extern struct {
     comptime {
@@ -53,22 +71,10 @@ pub const NamedValue = extern struct {
 
     raw: c.PJRT_NamedValue,
 
-    pub const Kind = enum(c.PJRT_NamedValue_Type) {
-        string = c.PJRT_NamedValue_kString,
-        int64 = c.PJRT_NamedValue_kInt64,
-        int64list = c.PJRT_NamedValue_kInt64List,
-        float = c.PJRT_NamedValue_kFloat,
-        bool = c.PJRT_NamedValue_kBool,
-    };
-
-    /// Zig view of the tagged value carried by a PJRT named value.
-    pub const Value = union(Kind) {
-        string: []const u8,
-        int64: i64,
-        int64list: []const i64,
-        float: f32,
-        bool: bool,
-    };
+    /// PJRT named-value discriminant used by this wrapper.
+    pub const Kind = NamedValueKind;
+    /// Tagged payload exposed through the wrapper.
+    pub const Value = NamedValuePayload;
 
     /// Builds a PJRT named value that borrows its name and payload.
     pub fn init(comptime kind_: Kind, name_: []const u8, value_: std.meta.fieldInfo(Value, kind_).type) NamedValue {
